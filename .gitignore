@@ -1,0 +1,6 @@
+dist/
+*.exe
+vibesync
+vibesync-server
+coverage.out
+.DS_Store
