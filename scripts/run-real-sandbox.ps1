@@ -1,4 +1,4 @@
-# Exécute le test réel double-VLC dans une Windows Sandbox jetable (VS-006).
+﻿# Exécute le test réel double-VLC dans une Windows Sandbox jetable (VS-006).
 # Tout tourne dans la sandbox : serveur + 2 moteurs + 2 vrais VLC (mappé du host,
 # lecture seule). Réseau désactivé (loopback uniquement). Résultat récupéré via un
 # dossier mappé en écriture, la sandbox s'éteint elle-même à la fin.
