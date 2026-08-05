@@ -28,7 +28,10 @@ const (
 	// les reports (qui arrivent chaque seconde et par membre).
 	usersThrottle = time.Second
 
-	maxNameLen     = 32
+	maxNameLen = 32
+	// maxSessionLen borne le jeton de reprise de session (16 octets hex = 32
+	// caractères ; on laisse de la marge sans accepter n'importe quoi).
+	maxSessionLen  = 128
 	maxRoomLen     = 64
 	maxChatLen     = 500
 	maxPositionSec = 1e7 // ~115 jours, garde-fou contre les valeurs absurdes
@@ -44,11 +47,18 @@ var errNameTaken = errors.New("server: pseudo déjà utilisé dans la salle")
 // et sûre en concurrence (le WebSocket sérialise via une goroutine d'écriture).
 type sink interface {
 	send(msgType string, data any)
+	// evict ferme la connexion remplacée par une reprise de session
+	// (§Comportements serveur, point 6). Appelée hors des verrous du hub et de
+	// la salle.
+	evict()
 }
 
 // member est l'état serveur d'un utilisateur connecté à une salle.
 type member struct {
-	id          string
+	id string
+	// session est le jeton opaque du client (vide si le client ne le gère pas) ;
+	// il autorise le remplacement d'une connexion zombie par le même client.
+	session     string
 	name        string
 	ready       bool
 	file        *protocol.FileInfo
@@ -59,6 +69,9 @@ type member struct {
 	// lateSince : instant depuis lequel le membre est en retard (zéro sinon).
 	lateSince time.Time
 	out       sink
+	// evicted marque un membre remplacé par une reprise de session : sa
+	// connexion agonise peut-être encore, mais elle ne doit plus rien changer.
+	evicted bool
 }
 
 func (m *member) snapshot() protocol.User {
@@ -134,19 +147,36 @@ func (r *Room) Users() []protocol.User {
 
 // join ajoute un membre et lui envoie son welcome. Renvoie errNameTaken si le
 // pseudo est déjà utilisé dans cette salle (comparaison insensible à la casse).
-func (r *Room) join(name string, latencyMs int64, out sink) (*member, error) {
+//
+// Reprise de session (§Comportements serveur, point 6) : si le pseudo est pris
+// mais que le jeton `session` est le même que celui du détenteur, ce dernier est
+// une connexion zombie (coupure silencieuse). Il est retiré sans toast de départ
+// ni pause automatique, et son sink est renvoyé pour que l'appelant ferme la
+// connexion **hors verrou**.
+func (r *Room) join(name, session string, latencyMs int64, out sink) (*member, sink, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	for _, m := range r.members {
-		if strings.EqualFold(m.name, name) {
-			return nil, errNameTaken
+	var replaced sink
+	for i, m := range r.members {
+		if !strings.EqualFold(m.name, name) {
+			continue
 		}
+		if session == "" || m.session != session {
+			return nil, nil, errNameTaken
+		}
+		// Même client : on évince le zombie et on prend sa place.
+		m.evicted = true
+		replaced = m.out
+		r.members = append(r.members[:i:i], r.members[i+1:]...)
+		r.log.Info("reprise de session", "room", r.name, "remplace", m.id, "name", m.name)
+		break
 	}
 
 	r.nextID++
 	m := &member{
 		id:        fmt.Sprintf("u%d", r.nextID),
+		session:   session,
 		name:      name,
 		latencyMs: latencyMs,
 		out:       out,
@@ -160,17 +190,37 @@ func (r *Room) join(name string, latencyMs int64, out sink) (*member, error) {
 		State:  r.state,
 		Users:  r.usersLocked(),
 	})
+	text := fmt.Sprintf("%s a rejoint la salle", m.name)
+	if replaced != nil {
+		// Ni départ ni arrivée : le membre n'a jamais vraiment quitté la salle.
+		text = fmt.Sprintf("%s a repris sa session", m.name)
+	}
 	for _, other := range r.members {
 		if other != m {
-			other.out.send(protocol.TypeToast, protocol.Toast{
-				Level: protocol.LevelInfo,
-				Text:  fmt.Sprintf("%s a rejoint la salle", m.name),
-			})
+			other.out.send(protocol.TypeToast, protocol.Toast{Level: protocol.LevelInfo, Text: text})
 		}
 	}
 	r.broadcastUsersLocked(now)
-	r.log.Info("membre rejoint", "room", r.name, "user", m.id, "name", m.name)
-	return m, nil
+	r.log.Info("membre rejoint", "room", r.name, "user", m.id, "name", m.name, "reprise", replaced != nil)
+	return m, replaced, nil
+}
+
+// canResume dit si ce couple (pseudo, jeton) remplacerait un membre existant.
+// Sert au hub à ne pas opposer le plafond de la salle à une simple reprise (la
+// taille de la salle ne change pas). À appeler sous le verrou du hub, qui
+// sérialise les arrivées.
+func (r *Room) canResume(name, session string) bool {
+	if session == "" {
+		return false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, m := range r.members {
+		if strings.EqualFold(m.name, name) && m.session == session {
+			return true
+		}
+	}
+	return false
 }
 
 // leave retire un membre ; renvoie true si la salle est désormais vide.
@@ -187,6 +237,8 @@ func (r *Room) leave(m *member) bool {
 		}
 	}
 	if idx < 0 {
+		// Membre déjà retiré : reprise de session (le zombie ne provoque ni
+		// toast de départ ni pause automatique) ou double leave.
 		return len(r.members) == 0
 	}
 	r.members = append(r.members[:idx:idx], r.members[idx+1:]...)
@@ -208,6 +260,11 @@ func (r *Room) leave(m *member) bool {
 
 // handlePing répond immédiatement au ping applicatif (offset d'horloge client).
 func (r *Room) handlePing(m *member, p protocol.Ping) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if m.evicted {
+		return
+	}
 	m.out.send(protocol.TypePong, protocol.Pong{T: p.T, ServerMs: msOf(r.clock.Now())})
 }
 
@@ -216,6 +273,9 @@ func (r *Room) handlePing(m *member, p protocol.Ping) {
 func (r *Room) observeRTT(m *member, rtt time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if m.evicted {
+		return
+	}
 
 	ms := rtt.Milliseconds()
 	if ms < 0 {
@@ -236,6 +296,9 @@ func (r *Room) observeRTT(m *member, rtt time.Duration) {
 func (r *Room) handleSetReady(m *member, msg protocol.SetReady) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if m.evicted {
+		return
+	}
 	if m.ready == msg.Ready {
 		return
 	}
@@ -246,6 +309,9 @@ func (r *Room) handleSetReady(m *member, msg protocol.SetReady) {
 func (r *Room) handleSetFile(m *member, msg protocol.SetFile) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if m.evicted {
+		return
+	}
 
 	name := strings.TrimSpace(msg.Name)
 	if name == "" {
@@ -281,6 +347,10 @@ func (r *Room) handleSetFile(m *member, msg protocol.SetFile) {
 func (r *Room) handleControl(m *member, msg protocol.Control) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// Un membre remplacé par une reprise de session ne pilote plus la salle.
+	if m.evicted {
+		return
+	}
 
 	now := r.clock.Now()
 	nowMs := msOf(now)
@@ -341,6 +411,9 @@ func (r *Room) handleControl(m *member, msg protocol.Control) {
 func (r *Room) handleReport(m *member, msg protocol.Report) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if m.evicted {
+		return
+	}
 
 	now := r.clock.Now()
 	m.positionSec = sanitizeFloat(msg.PositionSec)
@@ -382,6 +455,9 @@ func (r *Room) handleChat(m *member, msg protocol.Chat) {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if m.evicted {
+		return
+	}
 	r.broadcastLocked(protocol.TypeChatEvent, protocol.ChatEvent{
 		From:     m.name,
 		Text:     text,

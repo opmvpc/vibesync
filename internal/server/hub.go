@@ -42,8 +42,12 @@ func newHub(clock Clock, log *slog.Logger, maxRooms, maxRoomSize int) *Hub {
 
 // join place un membre dans la salle demandée (créée si besoin). Le verrou du
 // hub est tenu pendant l'insertion pour qu'une salle ne puisse pas être
-// détruite (vide) au moment précis où quelqu'un la rejoint.
-func (h *Hub) join(roomName, userName string, latencyMs int64, out sink) (*Room, *member, error) {
+// détruite (vide) au moment précis où quelqu'un la rejoint — et pour qu'une
+// reprise de session ne puisse pas s'entrelacer avec une autre arrivée.
+//
+// Le troisième retour est la connexion zombie remplacée par une reprise de
+// session, à fermer par l'appelant une fois les verrous relâchés.
+func (h *Hub) join(roomName, userName, session string, latencyMs int64, out sink) (*Room, *member, sink, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -51,25 +55,27 @@ func (h *Hub) join(roomName, userName string, latencyMs int64, out sink) (*Room,
 	if !ok {
 		if len(h.rooms) >= h.maxRooms {
 			h.log.Warn("plafond de salles atteint", "max", h.maxRooms, "room", roomName)
-			return nil, nil, errTooManyRooms
+			return nil, nil, nil, errTooManyRooms
 		}
 		room = newRoom(roomName, h.clock, h.log)
 		h.rooms[roomName] = room
 		h.log.Info("salle créée", "room", roomName)
-	} else if room.size() >= h.maxRoomSize {
+	} else if room.size() >= h.maxRoomSize && !room.canResume(userName, session) {
+		// Une reprise de session ne fait pas grossir la salle : le plafond ne
+		// doit pas empêcher un membre déjà compté de récupérer sa place.
 		h.log.Warn("plafond de membres atteint", "max", h.maxRoomSize, "room", roomName)
-		return nil, nil, errRoomFull
+		return nil, nil, nil, errRoomFull
 	}
-	m, err := room.join(userName, latencyMs, out)
+	m, replaced, err := room.join(userName, session, latencyMs, out)
 	if err != nil {
 		if !ok {
 			// La salle venait d'être créée pour rien.
 			delete(h.rooms, roomName)
 			h.log.Info("salle détruite", "room", roomName)
 		}
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return room, m, nil
+	return room, m, replaced, nil
 }
 
 // leave retire le membre et détruit la salle si elle est vide.

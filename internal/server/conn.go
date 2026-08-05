@@ -53,6 +53,9 @@ type wsClient struct {
 	pingSentAt time.Time
 	rtts       []time.Duration
 	latencyMs  int64
+	// closeCode/closeReason : trame Close à émettre (défaut : clôture normale).
+	closeCode   uint16
+	closeReason string
 
 	// room/member ne sont manipulés que par la goroutine readPump.
 	room   *Room
@@ -101,6 +104,28 @@ func (c *wsClient) close() {
 	c.once.Do(func() { close(c.done) })
 }
 
+// evict ferme cette connexion parce qu'un autre hello, porteur du même jeton de
+// session, vient de reprendre le pseudo (§Comportements serveur, point 6).
+// Aucun message d'erreur n'est envoyé : ce n'est pas un refus, et un client qui
+// le prendrait pour tel se reconnecterait pour rien.
+func (c *wsClient) evict() {
+	c.mu.Lock()
+	c.closeCode, c.closeReason = ws.CloseGoingAway, "session reprise sur une nouvelle connexion"
+	c.mu.Unlock()
+	c.rlog.Info("connexion remplacée par une reprise de session")
+	c.close()
+}
+
+// closeFrame donne le code et la raison à émettre dans la trame Close.
+func (c *wsClient) closeFrame() (uint16, string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closeCode == 0 {
+		return ws.CloseNormalClosure, ""
+	}
+	return c.closeCode, c.closeReason
+}
+
 // --- Boucle d'écriture ---
 
 func (c *wsClient) writePump() {
@@ -128,8 +153,9 @@ func (c *wsClient) writePump() {
 			}
 		case <-c.done:
 			c.drain()
+			code, reason := c.closeFrame()
 			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-			_ = c.conn.WriteClose(ws.CloseNormalClosure, "")
+			_ = c.conn.WriteClose(code, reason)
 			// On laisse la boucle de lecture se terminer (échange des trames
 			// Close) avant de couper la socket : sinon le dernier message écrit
 			// peut être perdu par une fermeture abrupte.
@@ -374,7 +400,13 @@ func (c *wsClient) handleHello(env protocol.Envelope) bool {
 		return false
 	}
 
-	room, m, err := c.srv.hub.join(roomName, name, c.currentLatencyMs(), c)
+	session := strings.TrimSpace(hello.Session)
+	if len(session) > maxSessionLen {
+		c.fail(protocol.ErrProtocol, "jeton de session invalide")
+		return false
+	}
+
+	room, m, replaced, err := c.srv.hub.join(roomName, name, session, c.currentLatencyMs(), c)
 	if err != nil {
 		switch {
 		case errors.Is(err, errNameTaken):
@@ -389,6 +421,11 @@ func (c *wsClient) handleHello(env protocol.Envelope) bool {
 			c.fail(protocol.ErrProtocol, "impossible de rejoindre la salle")
 		}
 		return false
+	}
+	// Reprise de session : la connexion zombie est fermée maintenant, hors des
+	// verrous du hub et de la salle.
+	if replaced != nil {
+		replaced.evict()
 	}
 	c.room, c.member = room, m
 	c.rlog = c.rlog.With("room", roomName, "user", m.id)

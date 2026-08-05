@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/thibsix/vibesync/internal/client"
+	"github.com/thibsix/vibesync/internal/protocol"
 	"github.com/thibsix/vibesync/internal/vlc"
 	"github.com/thibsix/vibesync/internal/vlc/vlctest"
 )
@@ -135,23 +136,17 @@ func (d *halfOpenDialer) cleanup() {
 	}
 }
 
-// TestRejoinApresCoupureSilencieuse documente un bug confirmé pendant l'e2e :
-// après une coupure réseau silencieuse, le serveur tient encore l'ancien membre
-// (jusqu'à 60 s, son deadline de lecture). La reconnexion automatique renvoie
-// le même pseudo, le serveur répond `name_taken` et le client traite ce code
-// comme FATAL : il abandonne définitivement au lieu de réessayer, alors que le
-// fantôme aurait disparu quelques dizaines de secondes plus tard.
+// TestRejoinApresCoupureSilencieuse valide la reprise de session
+// (docs/protocol.md §Comportements serveur, point 6) : après une coupure réseau
+// silencieuse, le serveur tient encore l'ancien membre (jusqu'à 60 s, son
+// deadline de lecture). Le client se reconnecte avec le même pseudo ET le même
+// jeton `session` : le serveur ferme la connexion zombie et lui rend sa place,
+// sans attendre l'expiration et sans `name_taken`.
 //
-// Repro et analyse : docs/research/2026-08-05-rapport-e2e.md §Bug 1.
-// Correctif attendu (hors périmètre de VS-006) : côté client
-// internal/client/conn.go, `name_taken` ne doit être fatal que pour une
-// connexion initiale, pas pour une reconnexion — ou côté serveur, remplacer le
-// membre fantôme quand le même pseudo se représente.
-//
-// TODO(VS-006 / bug 1) : retirer ce t.Skip une fois le comportement corrigé.
+// Historique : ce scénario a d'abord servi de reproduction au bug 1 découvert
+// pendant l'e2e (name_taken fatal, abandon définitif) ; voir
+// docs/research/2026-08-05-rapport-e2e.md §Fix reprise de session.
 func TestRejoinApresCoupureSilencieuse(t *testing.T) {
-	t.Skip("bug connu : name_taken fatal après coupure silencieuse — voir docs/research/2026-08-05-rapport-e2e.md §Bug 1")
-
 	f := newFixture(t)
 	a := f.newPeer("alice", filmDuration)
 
@@ -206,9 +201,22 @@ func TestRejoinApresCoupureSilencieuse(t *testing.T) {
 
 	f.waitFor("bob a retenté une connexion", func() bool { return dialer.count() > dialsBefore })
 
-	// Comportement attendu : bob réessaie jusqu'à ce que le fantôme expire.
-	// Comportement observé : phase idle définitive sur `name_taken`.
-	f.waitFor("bob finit par retrouver la salle", func() bool {
+	// Reprise de session : bob retrouve sa place tout de suite, sans attendre
+	// l'expiration du fantôme (60 s) et sans erreur fatale.
+	f.waitFor("bob retrouve la salle par reprise de session", func() bool {
 		return b.snap().Phase == client.PhaseConnected
 	})
+	if err := b.snap().LastError; err != "" {
+		t.Fatalf("erreur remontée alors que la reprise doit être transparente: %q\n%s", err, f.dump())
+	}
+	f.waitFor("la salle ne compte toujours que deux membres", func() bool {
+		return len(a.snap().Users) == 2 && len(b.snap().Users) == 2
+	})
+	// Le fantôme a bien été remplacé, pas dupliqué : alice n'a jamais vu bob partir.
+	if a.hasToast(protocol.LevelInfo, "a quitté la salle") {
+		t.Fatalf("toast de départ émis alors que bob a repris sa session\n%s", f.dump())
+	}
+	// Et bob est de nouveau pilotable : il commande la salle.
+	b.eng.Pause()
+	f.waitFor("le control de bob est pris en compte", func() bool { return a.snap().Paused })
 }

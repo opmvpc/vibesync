@@ -55,10 +55,10 @@ func TestJoinPseudoDejaPris(t *testing.T) {
 	room, _ := newTestRoom()
 	joinTest(t, room, "Alice")
 
-	if _, err := room.join("alice", 0, &recorder{}); err != errNameTaken {
+	if _, _, err := room.join("alice", "", 0, &recorder{}); err != errNameTaken {
 		t.Fatalf("errNameTaken attendu (comparaison insensible à la casse), obtenu %v", err)
 	}
-	if _, err := room.join("Bob", 0, &recorder{}); err != nil {
+	if _, _, err := room.join("Bob", "", 0, &recorder{}); err != nil {
 		t.Fatalf("Bob doit pouvoir rejoindre: %v", err)
 	}
 }

@@ -183,7 +183,15 @@ func (c *wsTestClient) sync() {
 
 func (c *wsTestClient) hello(name, room string) protocol.Welcome {
 	c.t.Helper()
-	c.send(protocol.TypeHello, protocol.Hello{Version: protocol.Version, Name: name, Room: room})
+	return c.helloSession(name, room, "")
+}
+
+// helloSession envoie un hello portant un jeton de reprise de session.
+func (c *wsTestClient) helloSession(name, room, session string) protocol.Welcome {
+	c.t.Helper()
+	c.send(protocol.TypeHello, protocol.Hello{
+		Version: protocol.Version, Name: name, Room: room, Session: session,
+	})
 	return mustData[protocol.Welcome](c.t, c.waitFor(protocol.TypeWelcome))
 }
 

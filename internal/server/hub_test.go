@@ -20,7 +20,7 @@ func TestHubCreeEtDetruitLesSallesALaVolee(t *testing.T) {
 		t.Fatal("aucune salle attendue au démarrage")
 	}
 
-	room, alice, err := hub.join("salon", "Alice", 0, &recorder{})
+	room, alice, _, err := hub.join("salon", "Alice", "", 0, &recorder{})
 	if err != nil {
 		t.Fatalf("join: %v", err)
 	}
@@ -28,7 +28,7 @@ func TestHubCreeEtDetruitLesSallesALaVolee(t *testing.T) {
 		t.Fatal("la salle doit être créée à la volée")
 	}
 
-	_, bob, err := hub.join("salon", "Bob", 0, &recorder{})
+	_, bob, _, err := hub.join("salon", "Bob", "", 0, &recorder{})
 	if err != nil {
 		t.Fatalf("join Bob: %v", err)
 	}
@@ -48,11 +48,11 @@ func TestHubCreeEtDetruitLesSallesALaVolee(t *testing.T) {
 
 func TestHubPseudoDejaPrisNeLaissePasDeSalleFantome(t *testing.T) {
 	hub := newTestHub()
-	room, alice, err := hub.join("salon", "Alice", 0, &recorder{})
+	room, alice, _, err := hub.join("salon", "Alice", "", 0, &recorder{})
 	if err != nil {
 		t.Fatalf("join: %v", err)
 	}
-	if _, _, err := hub.join("salon", "Alice", 0, &recorder{}); err != errNameTaken {
+	if _, _, _, err := hub.join("salon", "Alice", "", 0, &recorder{}); err != errNameTaken {
 		t.Fatalf("errNameTaken attendu, obtenu %v", err)
 	}
 	if hub.roomCount() != 1 {
@@ -60,7 +60,7 @@ func TestHubPseudoDejaPrisNeLaissePasDeSalleFantome(t *testing.T) {
 	}
 
 	// Une salle créée pour un join qui échoue ne doit pas subsister.
-	other, zoe, err := hub.join("autre", "Zoe", 0, &recorder{})
+	other, zoe, _, err := hub.join("autre", "Zoe", "", 0, &recorder{})
 	if err != nil {
 		t.Fatalf("join: %v", err)
 	}
@@ -78,8 +78,8 @@ func TestHubSallesIsolees(t *testing.T) {
 	hub := newTestHub()
 	recA := &recorder{}
 	recB := &recorder{}
-	room1, alice, _ := hub.join("salon", "Alice", 0, recA)
-	_, _, _ = hub.join("cave", "Bob", 0, recB)
+	room1, alice, _, _ := hub.join("salon", "Alice", "", 0, recA)
+	_, _, _, _ = hub.join("cave", "Bob", "", 0, recB)
 	room1.handleSetReady(alice, protocol.SetReady{Ready: true})
 	recB.reset()
 
@@ -96,36 +96,36 @@ func TestHubSallesIsolees(t *testing.T) {
 
 func TestHubPlafondDeSalles(t *testing.T) {
 	hub := newTestHubWith(2, defaultMaxRoomSize)
-	if _, _, err := hub.join("salon", "Alice", 0, &recorder{}); err != nil {
+	if _, _, _, err := hub.join("salon", "Alice", "", 0, &recorder{}); err != nil {
 		t.Fatalf("join: %v", err)
 	}
-	if _, _, err := hub.join("cave", "Bob", 0, &recorder{}); err != nil {
+	if _, _, _, err := hub.join("cave", "Bob", "", 0, &recorder{}); err != nil {
 		t.Fatalf("join: %v", err)
 	}
-	if _, _, err := hub.join("grenier", "Carol", 0, &recorder{}); !errors.Is(err, errTooManyRooms) {
+	if _, _, _, err := hub.join("grenier", "Carol", "", 0, &recorder{}); !errors.Is(err, errTooManyRooms) {
 		t.Fatalf("errTooManyRooms attendu, obtenu %v", err)
 	}
 	if hub.roomCount() != 2 {
 		t.Fatalf("2 salles attendues, %d obtenues", hub.roomCount())
 	}
 	// Rejoindre une salle existante reste possible.
-	if _, _, err := hub.join("salon", "Carol", 0, &recorder{}); err != nil {
+	if _, _, _, err := hub.join("salon", "Carol", "", 0, &recorder{}); err != nil {
 		t.Fatalf("join dans une salle existante: %v", err)
 	}
 }
 
 func TestHubPlafondDeMembresParSalle(t *testing.T) {
 	hub := newTestHubWith(defaultMaxRooms, 2)
-	room, alice, _ := hub.join("salon", "Alice", 0, &recorder{})
-	if _, _, err := hub.join("salon", "Bob", 0, &recorder{}); err != nil {
+	room, alice, _, _ := hub.join("salon", "Alice", "", 0, &recorder{})
+	if _, _, _, err := hub.join("salon", "Bob", "", 0, &recorder{}); err != nil {
 		t.Fatalf("join Bob: %v", err)
 	}
-	if _, _, err := hub.join("salon", "Carol", 0, &recorder{}); !errors.Is(err, errRoomFull) {
+	if _, _, _, err := hub.join("salon", "Carol", "", 0, &recorder{}); !errors.Is(err, errRoomFull) {
 		t.Fatalf("errRoomFull attendu, obtenu %v", err)
 	}
 	// Une place se libère → le refus disparaît.
 	hub.leave(room, alice)
-	if _, _, err := hub.join("salon", "Carol", 0, &recorder{}); err != nil {
+	if _, _, _, err := hub.join("salon", "Carol", "", 0, &recorder{}); err != nil {
 		t.Fatalf("join après libération d'une place: %v", err)
 	}
 }
@@ -135,7 +135,7 @@ func TestHubPlafondDeMembresParSalle(t *testing.T) {
 func TestHubJoinConcurrentAvecDestructionDeLaDerniereSession(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		hub := newTestHub()
-		room, alice, err := hub.join("salon", "Alice", 0, &recorder{})
+		room, alice, _, err := hub.join("salon", "Alice", "", 0, &recorder{})
 		if err != nil {
 			t.Fatalf("préparation: %v", err)
 		}
@@ -145,7 +145,7 @@ func TestHubJoinConcurrentAvecDestructionDeLaDerniereSession(t *testing.T) {
 		go func() { defer wg.Done(); hub.leave(room, alice) }()
 		go func() {
 			defer wg.Done()
-			if _, _, err := hub.join("salon", "Bob", 0, &recorder{}); err != nil {
+			if _, _, _, err := hub.join("salon", "Bob", "", 0, &recorder{}); err != nil {
 				t.Errorf("join concurrent: %v", err)
 			}
 		}()
@@ -173,7 +173,7 @@ func TestHubJoinConcurrent(t *testing.T) {
 		wg.Add(1)
 		go func(name string) {
 			defer wg.Done()
-			room, m, err := hub.join("salon", name, 0, &recorder{})
+			room, m, _, err := hub.join("salon", name, "", 0, &recorder{})
 			if err != nil {
 				t.Errorf("join %s: %v", name, err)
 				return

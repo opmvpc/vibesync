@@ -41,14 +41,29 @@ type recMsg struct {
 }
 
 type recorder struct {
-	mu   sync.Mutex
-	msgs []recMsg
+	mu      sync.Mutex
+	msgs    []recMsg
+	evicted int
 }
 
 func (r *recorder) send(msgType string, data any) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.msgs = append(r.msgs, recMsg{Type: msgType, Data: data})
+}
+
+// evict enregistre la fermeture demandée par une reprise de session.
+func (r *recorder) evict() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.evicted++
+}
+
+// evictions compte les fermetures pour reprise de session.
+func (r *recorder) evictions() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.evicted
 }
 
 func (r *recorder) all() []recMsg {
@@ -135,10 +150,21 @@ func newTestRoom() (*Room, *fakeClock) {
 // joinTest ajoute un membre à la salle et renvoie son enregistreur.
 func joinTest(t *testing.T, r *Room, name string) (*member, *recorder) {
 	t.Helper()
+	m, rec, replaced := joinSession(t, r, name, "")
+	if replaced != nil {
+		t.Fatalf("join(%q) a évincé une connexion sans jeton de session", name)
+	}
+	return m, rec
+}
+
+// joinSession ajoute un membre avec un jeton de reprise de session et rend
+// aussi la connexion éventuellement remplacée.
+func joinSession(t *testing.T, r *Room, name, session string) (*member, *recorder, sink) {
+	t.Helper()
 	rec := &recorder{}
-	m, err := r.join(name, 0, rec)
+	m, replaced, err := r.join(name, session, 0, rec)
 	if err != nil {
 		t.Fatalf("join(%q): %v", name, err)
 	}
-	return m, rec
+	return m, rec, replaced
 }

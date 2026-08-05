@@ -7,6 +7,8 @@ package client
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -113,6 +115,10 @@ type action struct {
 type Engine struct {
 	cfg Config
 	log *slog.Logger
+	// sessionToken est le jeton opaque de reprise de session (docs/protocol.md
+	// §Messages client → serveur) : généré une fois, conservé pour toute la vie
+	// du processus, envoyé dans chaque hello. Immuable après New.
+	sessionToken string
 
 	rootCtx  context.Context
 	rootStop context.CancelFunc
@@ -196,9 +202,29 @@ func New(cfg Config) *Engine {
 		subs:       map[chan Event]struct{}{},
 	}
 	e.roomState = protocol.RoomState{Paused: true, Rate: 1}
+	if token, err := newSessionToken(); err == nil {
+		e.sessionToken = token
+	} else {
+		// Sans jeton, on reste fonctionnel : la reprise de session après une
+		// coupure silencieuse est simplement indisponible (name_taken possible).
+		e.log.Error("jeton de session non généré, reprise de session indisponible", "err", err)
+	}
 	e.refreshVLCBinary()
 	return e
 }
+
+// newSessionToken tire le jeton de reprise de session (16 octets aléatoires
+// en hexadécimal, cf. docs/protocol.md).
+func newSessionToken() (string, error) {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("client: génération du jeton de session: %w", err)
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+// Session est le jeton de reprise envoyé dans chaque hello (diagnostic, tests).
+func (e *Engine) Session() string { return e.sessionToken }
 
 // refreshVLCBinary met à jour la disponibilité de l'exécutable VLC.
 func (e *Engine) refreshVLCBinary() {

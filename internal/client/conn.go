@@ -103,6 +103,9 @@ func (e *Engine) session(ctx context.Context, conn Conn, req ConnectRequest, gen
 		Name:     req.Name,
 		Room:     req.Room,
 		Password: req.Password,
+		// Même jeton à chaque hello : il autorise le serveur à remplacer notre
+		// connexion zombie après une coupure silencieuse.
+		Session: e.sessionToken,
 	})
 	if err != nil {
 		e.setError(gen, err.Error())
