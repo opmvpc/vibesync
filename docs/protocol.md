@@ -80,9 +80,22 @@ Source de vérité du protocole client↔serveur. Les types Go correspondants vi
   uniquement, et seulement si `|drift| ≥ 0,6 s` (le seek HTTP de VLC est arrondi à
   la seconde ; sous ce seuil il serait un no-op ou une oscillation).
 - **Hold post-action** : après l'envoi d'un `control` issu d'une action utilisateur
-  locale, le moteur suspend toute correction (nudge/seek) pendant 2 s, le temps que
-  l'écho `roomState` du serveur devienne la nouvelle référence. Sans ce hold, le
-  moteur « corrige » immédiatement l'action que l'utilisateur vient de faire.
+  locale, le moteur suspend toute correction (nudge/seek) pendant 2 s. Le hold n'est
+  levé que par l'**écho** du serveur (`roomState` avec `setBy` = soi) ou par
+  l'expiration des 2 s. Les `roomState` d'autrui reçus pendant le hold ne sont PAS
+  appliqués immédiatement (le transport étant ordonné, ils précèdent forcément le
+  traitement de notre `control` côté serveur) : le dernier est mémorisé et ne
+  s'applique qu'à l'expiration du hold si aucun écho n'est arrivé (control perdu).
+- **Conditions de correction** : aucune correction (nudge ou seek) tant que le
+  premier `pong` n'a pas fourni une mesure d'offset, ni hors de l'état connecté —
+  pendant une reconnexion, toute correction est suspendue et l'état de référence
+  est invalidé jusqu'au `welcome` suivant. Hystérésis du nudge : engagé quand
+  `|drift| > 0,1 s`, il ne se désengage que quand `|drift| < 0,03 s`.
+- **Assainissement** : toute donnée entrante est validée — valeurs non finies
+  rejetées ; fraction VLC bornée à [0,1] ; positions bornées à [0, durée] (durée
+  connue) ; `rate` serveur hors [0,25, 4] rejeté ; seek utilisateur borné à
+  [0, durée]. Une erreur d'écriture vers le serveur ferme la connexion et
+  déclenche la reconnexion (pas de perte silencieuse de `control`).
 - **Détection d'action utilisateur** : le client garde la dernière commande qu'il a
   lui-même envoyée à VLC (avec tolérance) ; tout changement observé non provoqué par
   lui (pause/play, saut de position > 3 s) = action utilisateur → `control` au serveur.
