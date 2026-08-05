@@ -20,6 +20,9 @@ Assemblage par l'orchestrateur : review croisée du code des agents, test e2e
 - [ ] Test e2e simulé : play/pause/seek propagés < 500 ms, drift final < 0,5 s, ready-gate, rejoin
 - [ ] `go test ./...` + `go vet` + `staticcheck` verts sur tout le repo
 - [ ] Test manuel réel : 2 VLC locaux synchronisés (play/pause/seek dans les 2 sens)
+- [ ] Vecteurs de test du moteur de sync exportés dans `test/vectors/*.json` depuis
+      l'implémentation Go de référence (scénarios : offset médian, nudge, seek dur,
+      grâce anti-boucle, détection d'action) — consommés ensuite par VS-014/VS-015
 
 ## Journal du ticket
 

@@ -13,16 +13,20 @@ use case Syncplay — serveur ET client custom, tout en Go.
 
 ## Architecture (résumé — détails dans les ADR)
 
-- **Mono-repo**, cœur Go (module `github.com/thibsix/vibesync`) + UIs natives :
-  - `cmd/vibesync-server` — serveur de salles, WebSocket+JSON, état autoritatif
-  - `cmd/vibesync` — cœur client headless (Windows + macOS arm64) : lance VLC avec
-    son interface HTTP locale, moteur de sync, canal local `/ui` pour les façades
-    natives (web UI embarquée = mode debug uniquement)
-  - `ui/windows/` — app WPF .NET Framework 4.8 ; `ui/macos/` — app SwiftUI
-    (pattern core headless + façades natives, ADR-006/007)
-- **Budget : chaque client (UI + core) < 10 Mo** — garde-fou `scripts/check-size.ps1`
-- Protocoles maison versionnés : `docs/protocol.md` (client↔serveur) et
-  `docs/ui-protocol.md` (UI native↔core), types Go dans `internal/protocol/`
+- **Philosophie handmade (ADR-008) : 0 dépendance tierce, partout.**
+  - `cmd/vibesync-server` — serveur de salles Go **stdlib pur** (WebSocket maison
+    `internal/ws`), WebSocket+JSON, état autoritatif. Docker → Coolify.
+  - `ui/win32/` — client Windows : **un exe C pur + Win32** (GDI immediate-mode,
+    WinHTTP pour wss, Winsock pour VLC, JSON maison, arènes). < 500 Ko.
+  - `ui/macos/` — client macOS : **un binaire Swift** (AppKit/SwiftUI,
+    URLSessionWebSocketTask), aucune dépendance SPM. Build sur le Mac de Thibault.
+  - `cmd/vibesync` + `internal/client|vlc|webui` — client Go = **implémentation de
+    référence et harnais de test** (pas un livrable) ; génère les vecteurs
+    `test/vectors/*.json` que les moteurs C et Swift doivent rejouer.
+- Le moteur de sync (drift, offset horloge, ready) est spécifié dans
+  `docs/protocol.md` §Comportements client et gelé par les vecteurs de test.
+- Budget : client < 10 Mo (`scripts/check-size.ps1`) — trivial depuis ADR-008.
+- Protocole client↔serveur versionné : `docs/protocol.md`, types Go `internal/protocol/`
 - Déploiement : image Docker multi-stage → Coolify, TLS/wss via Traefik
 
 ## Règles de travail

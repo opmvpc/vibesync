@@ -22,9 +22,12 @@ Opus en parallèle.
 | VS-007 | Docker + Coolify + CI (lint, tests, releases win/mac) | ouvert |
 | VS-008 | Doc utilisateur (README pour les amis) | ouvert |
 | VS-009 | Coquille native Wails | abandonné (ADR-006) |
-| VS-010 | Cœur headless + spec canal /ui | ouvert |
-| VS-011 | App Windows WPF net48 | ouvert |
-| VS-012 | App macOS SwiftUI | ouvert (Mac dispo 06-08) |
+| VS-010 | Cœur headless + canal /ui | abandonné (ADR-008) |
+| VS-011 | App Windows WPF net48 | abandonné (ADR-008) |
+| VS-012 | App macOS SwiftUI (façade) | abandonné (ADR-008) |
+| VS-013 | WebSocket handmade Go stdlib (vire gorilla) | ouvert |
+| VS-014 | Client Windows C pur + Win32 (un exe) | ouvert |
+| VS-015 | Client macOS Swift autonome | ouvert (Mac dispo 06-08) |
 
 ## Recherches
 
@@ -37,7 +40,9 @@ Opus en parallèle.
 2. VS-009 : coquille Wails Windows + script/doc de build macOS pour le Mac de demain
 3. VS-007 (Docker/Coolify/CI) puis VS-008 (doc amis)
 
-Pivots du jour (dans l'ordre) : client graphique natif Win+mac ; QA renforcée
-(tests partout + analyse statique) ; **pas de webview** → UIs 100 % natives
-SwiftUI/WPF sur cœur Go headless (ADR-006) ; **budget client < 10 Mo** → Windows
-en WPF net48 plutôt que WinUI 3 (ADR-007). SDK .NET 8 installé sur la machine.
+Pivots du jour (dans l'ordre) : client graphique natif Win+mac ; QA renforcée ;
+pas de webview (ADR-006) ; budget < 10 Mo (ADR-007) ; **philosophie handmade
+0 dépendance (ADR-008, l'état final)** : clients mono-exe autonomes (C+Win32 /
+Swift), serveur Go stdlib pur, moteur de sync porté avec vecteurs de test partagés.
+Le client Go devient référence + harnais de test. Installés sur la machine : Go,
+staticcheck, SDK .NET 8 (devenu inutile), WinLibs GCC.
