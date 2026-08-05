@@ -46,7 +46,7 @@ Source de vérité du protocole client↔serveur. Les types Go correspondants vi
 | `pong` | `{t, serverMs}` | echo du `t` client ; sert à l'offset d'horloge |
 | `roomState` | `{paused, positionSec, rate, refServerMs, setBy}` | broadcast à chaque changement |
 | `users` | `{users: [{id, name, ready, file?, positionSec, latencyMs}]}` | broadcast à chaque changement |
-| `chat` | `{from, text, serverMs}` | |
+| `chatEvent` | `{from, text, serverMs}` | |
 | `toast` | `{level: "info"\|"warn"\|"error", text}` | notifications (« X a rejoint », « fichiers différents », « pause auto : Y bufferise ») |
 | `error` | `{code, text}` | codes : `version_mismatch`, `bad_password`, `name_taken`, `protocol` |
 
@@ -59,7 +59,13 @@ Source de vérité du protocole client↔serveur. Les types Go correspondants vi
    référence pendant > 2 s → **pause automatique** de la salle + `toast` warn.
 3. Déconnexion d'un membre en lecture → pause automatique + `toast`.
 4. Un nouvel arrivant reçoit `welcome` avec l'état courant → son client se cale dessus.
-5. Fichiers : si `durationSec` diffère de > 2 s entre membres → `toast` warn (pas de blocage).
+5. Fichiers : si `durationSec` diffère de > 2 s entre membres → `toast` warn (pas de
+   blocage). Une durée ≤ 0 signifie « inconnue » et est exclue de la comparaison.
+6. Anti-abus : rate limit par connexion (budget global ~20 msg/s en rafale de 40,
+   chat limité à ~5 msg/s), plafonds raisonnables (membres par salle, salles,
+   connexions) → dépassement : `error` code `protocol` + fermeture (flood) ou
+   `toast` warn (plafonds). Les pseudos/salles rejettent les caractères de
+   contrôle ET de format Unicode (zero-width, bidi…).
 
 ## Comportements client (moteur de sync)
 
