@@ -67,6 +67,9 @@ type Hello struct {
 	Name     string `json:"name"`
 	Room     string `json:"room"`
 	Password string `json:"password,omitempty"`
+	// Session est un jeton opaque conservé toute la vie du client ; il permet la
+	// reprise après coupure silencieuse (remplacement de la connexion zombie).
+	Session string `json:"session,omitempty"`
 }
 
 type Ping struct {

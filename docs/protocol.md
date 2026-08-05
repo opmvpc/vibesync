@@ -30,7 +30,7 @@ Source de vérité du protocole client↔serveur. Les types Go correspondants vi
 
 | type | data | notes |
 |---|---|---|
-| `hello` | `{version, name, room, password?}` | premier message obligatoire |
+| `hello` | `{version, name, room, password?, session?}` | premier message obligatoire ; `session` = jeton opaque aléatoire (≥ 16 octets hex) généré par le client à son premier hello et conservé pour toute la vie du processus |
 | `ping` | `{t}` | `t` = clientMs ; toutes les 2 s |
 | `setReady` | `{ready}` | |
 | `setFile` | `{name, durationSec, sizeBytes}` | à l'ouverture d'un fichier dans VLC |
@@ -61,7 +61,13 @@ Source de vérité du protocole client↔serveur. Les types Go correspondants vi
 4. Un nouvel arrivant reçoit `welcome` avec l'état courant → son client se cale dessus.
 5. Fichiers : si `durationSec` diffère de > 2 s entre membres → `toast` warn (pas de
    blocage). Une durée ≤ 0 signifie « inconnue » et est exclue de la comparaison.
-6. Anti-abus : rate limit par connexion (budget global ~20 msg/s en rafale de 40,
+6. Reprise de session : si un `hello` porte un pseudo déjà présent dans la salle ET
+   le même jeton `session` que le détenteur, l'ancienne connexion (zombie après une
+   coupure silencieuse) est fermée et remplacée — l'arrivant récupère le pseudo,
+   `welcome` normal, pas de toast de départ pour le zombie. Pseudo pris avec un
+   jeton absent ou différent → `name_taken` (anti-usurpation au niveau bonne foi :
+   pas une authentification).
+7. Anti-abus : rate limit par connexion (budget global ~20 msg/s en rafale de 40,
    chat limité à ~5 msg/s), plafonds raisonnables (membres par salle, salles,
    connexions) → dépassement : `error` code `protocol` + fermeture (flood) ou
    `toast` warn (plafonds). Les pseudos/salles rejettent les caractères de
