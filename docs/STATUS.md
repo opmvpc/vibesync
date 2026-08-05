@@ -13,14 +13,15 @@ Opus en parallèle.
 
 | Ticket | Titre | Statut |
 |---|---|---|
-| VS-001 | Bureaucratie + recherche + spec protocole | en-cours |
-| VS-002 | Package `internal/protocol` | ouvert |
-| VS-003 | Serveur (salles, WS, état autoritatif) | ouvert |
-| VS-004 | Client : driver VLC + moteur de sync | ouvert |
-| VS-005 | Client : web UI locale (GUI) | ouvert |
+| VS-001 | Bureaucratie + recherche + spec protocole | terminé |
+| VS-002 | Package `internal/protocol` | terminé |
+| VS-003 | Serveur (salles, WS, état autoritatif) | en-cours (agent Opus A) |
+| VS-004 | Client : driver VLC + moteur de sync | en-cours (agent Opus B) |
+| VS-005 | Client : web UI (GUI) | en-cours (agent Opus B) |
 | VS-006 | Intégration + tests e2e simulés | ouvert |
 | VS-007 | Docker + Coolify + CI (lint, tests, releases win/mac) | ouvert |
 | VS-008 | Doc utilisateur (README pour les amis) | ouvert |
+| VS-009 | Coquille native Wails (Win ici, mac demain) | ouvert |
 
 ## Recherches
 
@@ -29,6 +30,9 @@ Opus en parallèle.
 
 ## Prochaine action
 
-1. Finir VS-002 (protocole Go) — orchestrateur
-2. Lancer les agents Opus sur VS-003 et VS-004/005 en parallèle
-3. Review croisée, intégration, VS-006
+1. Attendre les agents Opus (VS-003, VS-004/005), review croisée, intégration (VS-006)
+2. VS-009 : coquille Wails Windows + script/doc de build macOS pour le Mac de demain
+3. VS-007 (Docker/Coolify/CI) puis VS-008 (doc amis)
+
+Pivots du jour : client natif exigé (ADR-005 remplace ADR-004) ; QA renforcée
+(tests partout + `go vet` + `staticcheck`) ; cibles client = Windows + macOS arm64.

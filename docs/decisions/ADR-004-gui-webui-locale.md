@@ -1,7 +1,7 @@
 ---
 id: ADR-004
 titre: GUI du client = web UI locale embarquée dans le binaire
-statut: accepté
+statut: remplacé-par ADR-005
 date: 2026-08-05
 ---
 
