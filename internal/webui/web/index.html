@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vibesync</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<div id="toasts"></div>
+
+<section id="screen-connect" class="screen">
+  <div class="card">
+    <h1><span class="dot"></span>vibesync</h1>
+    <p class="sub">Regardez la même vidéo, en même temps, chacun chez soi.</p>
+    <form id="form-connect">
+      <label>Serveur
+        <input id="f-server" placeholder="vibesync.exemple.fr" autocomplete="off" required>
+      </label>
+      <label>Pseudo
+        <input id="f-name" placeholder="thib" autocomplete="off" required>
+      </label>
+      <label>Salle
+        <input id="f-room" placeholder="soirée-film" autocomplete="off" required>
+      </label>
+      <label>Mot de passe <span class="opt">(optionnel)</span>
+        <input id="f-password" type="password" autocomplete="off">
+      </label>
+      <button class="primary" type="submit">Rejoindre la salle</button>
+    </form>
+    <p id="connect-status" class="status"></p>
+    <div id="vlc-missing" class="banner hidden">
+      <strong>VLC introuvable.</strong>
+      Installez VLC, ou lancez vibesync avec la variable d'environnement
+      <code>VIBESYNC_VLC</code> pointant sur l'exécutable
+      (ex. <code>C:\Program Files\VideoLAN\VLC\vlc.exe</code>).
+    </div>
+  </div>
+</section>
+
+<section id="screen-room" class="screen hidden">
+  <header>
+    <div class="room-id">
+      <span class="dot"></span>
+      <strong id="room-name">—</strong>
+      <span id="conn-badge" class="badge">…</span>
+    </div>
+    <div class="right">
+      <span id="drift" class="badge sync">—</span>
+      <button id="btn-quit" class="ghost">Quitter</button>
+    </div>
+  </header>
+
+  <main>
+    <div class="col">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Votre fichier</h2>
+          <button id="btn-pick" class="ghost small">Choisir…</button>
+        </div>
+        <div id="file-info" class="file-info">Aucun fichier ouvert.</div>
+        <div class="progress" id="progress">
+          <div class="bar" id="bar"></div>
+        </div>
+        <div class="times"><span id="t-cur">0:00</span><span id="t-tot">0:00</span></div>
+        <div class="controls">
+          <button id="btn-playpause" class="primary wide">Lecture</button>
+          <button id="btn-ready" class="ready">Je suis prêt</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Participants</h2>
+        <ul id="users" class="users"></ul>
+      </div>
+    </div>
+
+    <div class="col chat-col">
+      <div class="panel chat-panel">
+        <h2>Chat</h2>
+        <div id="chat" class="chat"></div>
+        <form id="form-chat">
+          <input id="f-chat" placeholder="Message…" autocomplete="off">
+          <button class="primary small" type="submit">Envoyer</button>
+        </form>
+      </div>
+    </div>
+  </main>
+</section>
+
+<div id="browser" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head">
+      <strong>Choisir une vidéo</strong>
+      <button id="browser-close" class="ghost small">Fermer</button>
+    </div>
+    <div id="browser-path" class="path"></div>
+    <div class="browser-body">
+      <ul id="browser-roots" class="roots"></ul>
+      <ul id="browser-list" class="entries"></ul>
+    </div>
+  </div>
+</div>
+
+<script>window.VIBESYNC_TOKEN = "__UI_TOKEN__";</script>
+<script src="/static/app.js"></script>
+</body>
+</html>

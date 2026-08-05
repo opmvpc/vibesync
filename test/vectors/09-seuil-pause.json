@@ -1,0 +1,139 @@
+{
+  "_doc": "Vecteur de conformité du moteur de sync vibesync (golden file, régénéré par `go test ./internal/client -run TestVectors -update`). Horloge simulée : tous les temps sont en millisecondes depuis le début du scénario. `initialVLC` = état complet de VLC au départ ; `events` = entrées injectées (messages serveur, actions de l'utilisateur dans VLC, coupure de session) ; `trace` = une entrée par poll de 200 ms avec l'état observé de VLC, la position attendue calculée, le drift, les commandes envoyées à VLC et les messages envoyés au serveur. Une réimplémentation est conforme si, pour le même `initialVLC` et les mêmes `events`, elle produit les mêmes `vlcCommands` et `toServer` aux mêmes instants.",
+  "name": "09-seuil-pause",
+  "description": "En pause : drift de 0,98 s corrigé par seek (seuil 0,6 s), puis drift résiduel \u003c 0,6 s laissé tel quel.",
+  "pollIntervalMs": 200,
+  "initialVLC": {
+    "fileName": "ep1.mkv",
+    "durationSec": 1200,
+    "state": "paused",
+    "positionSec": 10.51,
+    "rate": 1
+  },
+  "events": [
+    {
+      "atMs": 0,
+      "type": "welcome",
+      "data": {
+        "selfId": "u1",
+        "room": "salon",
+        "state": {
+          "paused": true,
+          "positionSec": 11.49,
+          "rate": 1,
+          "refServerMs": 1785960000000,
+          "setBy": "u2"
+        },
+        "users": [
+          {
+            "id": "u1",
+            "name": "thib",
+            "ready": false,
+            "positionSec": 0,
+            "latencyMs": 0
+          }
+        ]
+      }
+    },
+    {
+      "atMs": 0,
+      "type": "pong",
+      "data": {
+        "t": 1785960000000,
+        "serverMs": 1785960000000
+      }
+    }
+  ],
+  "trace": [
+    {
+      "atMs": 200,
+      "vlcState": "paused",
+      "vlcPositionSec": 10.51,
+      "expectedPositionSec": 11.49,
+      "driftSec": -0.98,
+      "vlcCommands": [
+        {
+          "cmd": "seek",
+          "value": 11
+        }
+      ],
+      "toServer": [
+        {
+          "type": "setFile",
+          "data": {
+            "name": "ep1.mkv",
+            "durationSec": 1200,
+            "sizeBytes": 15
+          }
+        },
+        {
+          "type": "report",
+          "data": {
+            "positionSec": 10.51,
+            "paused": true,
+            "buffering": false
+          }
+        }
+      ]
+    },
+    {
+      "atMs": 400,
+      "vlcState": "paused",
+      "vlcPositionSec": 11,
+      "expectedPositionSec": 11.49,
+      "driftSec": -0.49
+    },
+    {
+      "atMs": 600,
+      "vlcState": "paused",
+      "vlcPositionSec": 11,
+      "expectedPositionSec": 11.49,
+      "driftSec": -0.49
+    },
+    {
+      "atMs": 800,
+      "vlcState": "paused",
+      "vlcPositionSec": 11,
+      "expectedPositionSec": 11.49,
+      "driftSec": -0.49
+    },
+    {
+      "atMs": 1000,
+      "vlcState": "paused",
+      "vlcPositionSec": 11,
+      "expectedPositionSec": 11.49,
+      "driftSec": -0.49
+    },
+    {
+      "atMs": 1200,
+      "vlcState": "paused",
+      "vlcPositionSec": 11,
+      "expectedPositionSec": 11.49,
+      "driftSec": -0.49,
+      "toServer": [
+        {
+          "type": "report",
+          "data": {
+            "positionSec": 11,
+            "paused": true,
+            "buffering": false
+          }
+        }
+      ]
+    },
+    {
+      "atMs": 1400,
+      "vlcState": "paused",
+      "vlcPositionSec": 11,
+      "expectedPositionSec": 11.49,
+      "driftSec": -0.49
+    },
+    {
+      "atMs": 1600,
+      "vlcState": "paused",
+      "vlcPositionSec": 11,
+      "expectedPositionSec": 11.49,
+      "driftSec": -0.49
+    }
+  ]
+}
