@@ -15,17 +15,17 @@ Opus en parallèle.
 |---|---|---|
 | VS-001 | Bureaucratie + recherche + spec protocole | terminé |
 | VS-002 | Package `internal/protocol` | terminé |
-| VS-003 | Serveur (salles, WS, état autoritatif) | en-cours (agent Opus A) |
-| VS-004 | Client : driver VLC + moteur de sync | en-cours (agent Opus B) |
-| VS-005 | Client : web UI (GUI) | en-cours (agent Opus B) |
-| VS-006 | Intégration + tests e2e simulés | ouvert |
+| VS-003 | Serveur (salles, WS, état autoritatif) | terminé (review terra) |
+| VS-004 | Client réf. : driver VLC + moteur de sync | terminé (review sol, 12 vecteurs) |
+| VS-005 | Client réf. : web UI (debug) | terminé |
+| VS-006 | Intégration + tests e2e simulés | en-cours (agent Opus B) |
 | VS-007 | Docker + Coolify + CI (lint, tests, releases win/mac) | ouvert |
 | VS-008 | Doc utilisateur (README pour les amis) | ouvert |
 | VS-009 | Coquille native Wails | abandonné (ADR-006) |
 | VS-010 | Cœur headless + canal /ui | abandonné (ADR-008) |
 | VS-011 | App Windows WPF net48 | abandonné (ADR-008) |
 | VS-012 | App macOS SwiftUI (façade) | abandonné (ADR-008) |
-| VS-013 | WebSocket handmade Go stdlib (vire gorilla) | ouvert |
+| VS-013 | WebSocket handmade Go stdlib (vire gorilla) | terminé (review sol) — **go.mod : 0 require** |
 | VS-014 | Client Windows C pur + Win32 (un exe) | ouvert |
 | VS-015 | Client macOS Swift autonome | ouvert (Mac dispo 06-08) |
 
