@@ -6,9 +6,9 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/thibsix/vibesync/internal/client"
 	"github.com/thibsix/vibesync/internal/protocol"
+	"github.com/thibsix/vibesync/internal/ws"
 )
 
 // Types de messages du canal /ui (UI → moteur).
@@ -88,7 +88,7 @@ type ErrorMsg struct {
 }
 
 type uiConn struct {
-	ws  *websocket.Conn
+	ws  *ws.Conn
 	out chan []byte
 }
 
@@ -108,11 +108,21 @@ func (s *Server) handleUI(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "token invalide", http.StatusUnauthorized)
 		return
 	}
-	ws, err := s.upgrader.Upgrade(w, r, nil)
+	// Contrôle d'origine : internal/ws le laisse à l'appelant (une UI native
+	// n'envoie pas d'Origin ; un navigateur doit venir de la boucle locale).
+	if !checkLocalOrigin(r) {
+		http.Error(w, "origine non autorisée", http.StatusForbidden)
+		return
+	}
+	conn, err := ws.Upgrade(w, r)
 	if err != nil {
 		return
 	}
-	u := &uiConn{ws: ws, out: make(chan []byte, 64)}
+	// Le pong de réponse à un ping de l'UI est émis depuis la boucle de
+	// lecture : il lui faut sa propre échéance d'écriture, celle posée par la
+	// pompe d'écriture pouvant être expirée.
+	conn.AutoWriteTimeout = 10 * time.Second
+	u := &uiConn{ws: conn, out: make(chan []byte, 64)}
 	events, cancel := s.eng.Subscribe()
 	defer cancel()
 
@@ -121,7 +131,7 @@ func (s *Server) handleUI(w http.ResponseWriter, r *http.Request) {
 
 	// Pompe d'écriture : un seul écrivain sur la connexion.
 	go func() {
-		defer func() { _ = ws.Close() }()
+		defer func() { _ = conn.CloseNow() }()
 		for {
 			select {
 			case <-ctx.Done():
@@ -130,8 +140,8 @@ func (s *Server) handleUI(w http.ResponseWriter, r *http.Request) {
 				if !ok {
 					return
 				}
-				_ = ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
-				if err := ws.WriteMessage(websocket.TextMessage, raw); err != nil {
+				_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				if err := conn.WriteMessage(ws.TextMessage, raw); err != nil {
 					return
 				}
 			}
@@ -158,7 +168,7 @@ func (s *Server) handleUI(w http.ResponseWriter, r *http.Request) {
 	u.send(MsgState, &snap)
 
 	for {
-		_, raw, err := ws.ReadMessage()
+		_, raw, err := conn.ReadMessage()
 		if err != nil {
 			return
 		}

@@ -70,3 +70,40 @@ octet fautif). Contrôle d'`Origin` laissé à l'appelant. `-race` non exécutab
 Coût : lecture de messages > taille du tampon bufio = 2 allocations au lieu
 d'une (compromis assumé contre l'amplification mémoire). Écriture toujours
 0 alloc. Couverture 87,0 %.
+
+## Migration (VS-013 partie 2) — gorilla retiré du repo
+
+`go.mod` ne contient plus aucun `require`. `go.sum` est vide mais conservé : le
+Dockerfile fait `COPY go.mod go.sum ./` (hors périmètre).
+
+Correspondances : `Upgrader.Upgrade`→`ws.Upgrade`, `Dialer.DialContext`→
+`ws.Dial`/`DialWithConfig`, `WriteMessage(PingMessage)`→`WritePing`,
+`WriteMessage(CloseMessage, FormatCloseMessage(...))`→`WriteClose`,
+`SetPongHandler`→`OnPong`, `Conn.Close()`→`CloseNow()` (fermeture brutale ;
+`ws.Conn.Close` fait, lui, le close handshake complet). Deadlines, `SetReadLimit`
+(64 Kio serveur), périodes de ping (30 s) et fenêtre de silence (60 s serveur,
+70 s client) inchangées ; moteur de reconnexion non touché.
+
+**API `ws` étendue (2 ajouts, testés)** :
+- `Conn.OnPing` — le client se sert du ping serveur pour repousser son échéance
+  de lecture ; sans hook, une salle silencieuse aurait coupé au bout de 70 s.
+- `Conn.AutoWriteTimeout` — les trames émises *depuis la boucle de lecture*
+  (pong automatique, écho de close) héritaient de la dernière échéance posée
+  par la pompe d'écriture, expirée entre deux pings : un simple ping du pair
+  aurait tué la connexion. gorilla posait une échéance propre, c'est restauré.
+
+**Écarts de comportement assumés** (aucune assertion de test modifiée) :
+- `ws.Dial` ne rend pas la `*http.Response` du refus ; le harnais serveur la
+  reconstruit depuis `HandshakeError.Status` (le test 503 est intact).
+- `internal/webui` : le contrôle d'origine était porté par `Upgrader.CheckOrigin` ;
+  `ws` le laisse à l'appelant, `handleUI` appelle donc `checkLocalOrigin` et
+  répond 403 avant l'upgrade — même effet.
+- Limite de lecture par défaut de 1 Mio là où gorilla était illimité (webui et
+  client) ; le serveur garde ses 64 Kio explicites.
+- À réception d'un close du pair, `ws` ferme le transport après l'écho : les
+  messages encore en file d'écriture ne partent plus (gorilla les écrivait
+  dans le vide, le pair étant déjà en fermeture).
+
+Mentions restantes de « gorilla » : uniquement dans `docs/` (ADR-005, ADR-008,
+ticket VS-013, STATUS, rapports) — traces historiques volontairement
+conservées, et hors périmètre d'un sous-agent.

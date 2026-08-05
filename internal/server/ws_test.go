@@ -1,6 +1,8 @@
 package server
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -8,9 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
-
 	"github.com/thibsix/vibesync/internal/protocol"
+	"github.com/thibsix/vibesync/internal/ws"
 )
 
 // --- Harnais d'intégration ---
@@ -62,32 +63,45 @@ func (r *testRig) wsURL() string {
 	return "ws" + strings.TrimPrefix(r.http.URL, "http") + "/ws"
 }
 
+// testConn adapte ws.Conn au harnais : Close() sans argument coupe la socket
+// sans close handshake, comme le faisait le dialer historique.
+type testConn struct{ *ws.Conn }
+
+func (c *testConn) Close() error { return c.CloseNow() }
+
 type wsTestClient struct {
 	t    *testing.T
-	conn *websocket.Conn
+	conn *testConn
 }
 
 var pingToken atomic.Int64
 
 func (r *testRig) dial(t *testing.T) *wsTestClient {
 	t.Helper()
-	conn, _, err := websocket.DefaultDialer.Dial(r.wsURL(), nil)
+	c, _, err := r.tryDial(t)
 	if err != nil {
 		t.Fatalf("dial %s: %v", r.wsURL(), err)
 	}
-	t.Cleanup(func() { _ = conn.Close() })
-	return &wsTestClient{t: t, conn: conn}
+	return c
 }
 
-// tryDial ne fait pas échouer le test : sert à observer un refus HTTP.
+// tryDial ne fait pas échouer le test : sert à observer un refus HTTP. La
+// réponse est reconstruite depuis *ws.HandshakeError, qui porte le statut
+// renvoyé par le serveur (le dialer ne rend pas la réponse HTTP elle-même).
 func (r *testRig) tryDial(t *testing.T) (*wsTestClient, *http.Response, error) {
 	t.Helper()
-	conn, resp, err := websocket.DefaultDialer.Dial(r.wsURL(), nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := ws.Dial(ctx, r.wsURL())
 	if err != nil {
-		return nil, resp, err
+		var he *ws.HandshakeError
+		if errors.As(err, &he) {
+			return nil, &http.Response{StatusCode: he.Status, Status: http.StatusText(he.Status)}, err
+		}
+		return nil, nil, err
 	}
-	t.Cleanup(func() { _ = conn.Close() })
-	return &wsTestClient{t: t, conn: conn}, resp, nil
+	t.Cleanup(func() { _ = conn.CloseNow() })
+	return &wsTestClient{t: t, conn: &testConn{conn}}, nil, nil
 }
 
 func (c *wsTestClient) send(msgType string, data any) {
@@ -97,7 +111,7 @@ func (c *wsTestClient) send(msgType string, data any) {
 		c.t.Fatalf("encode %s: %v", msgType, err)
 	}
 	_ = c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	if err := c.conn.WriteMessage(websocket.TextMessage, raw); err != nil {
+	if err := c.conn.WriteMessage(ws.TextMessage, raw); err != nil {
 		c.t.Fatalf("write %s: %v", msgType, err)
 	}
 }
@@ -109,13 +123,13 @@ func (c *wsTestClient) trySend(msgType string, data any) error {
 		c.t.Fatalf("encode %s: %v", msgType, err)
 	}
 	_ = c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	return c.conn.WriteMessage(websocket.TextMessage, raw)
+	return c.conn.WriteMessage(ws.TextMessage, raw)
 }
 
 func (c *wsTestClient) sendRaw(raw string) {
 	c.t.Helper()
 	_ = c.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	if err := c.conn.WriteMessage(websocket.TextMessage, []byte(raw)); err != nil {
+	if err := c.conn.WriteMessage(ws.TextMessage, []byte(raw)); err != nil {
 		c.t.Fatalf("write brut: %v", err)
 	}
 }

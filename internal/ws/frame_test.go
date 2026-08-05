@@ -201,6 +201,59 @@ func TestReadFragmentedWithInterleavedControl(t *testing.T) {
 	}
 }
 
+func TestOnPingCallback(t *testing.T) {
+	wire := append(buildFrame(true, 0, opPing, true, []byte("salut")),
+		buildFrame(true, 0, opText, true, []byte("ok"))...)
+	c, _ := newMemConn(true, wire)
+	var seen []string
+	c.OnPing = func(p []byte) { seen = append(seen, string(p)) }
+
+	if _, data, err := c.ReadMessage(); err != nil || string(data) != "ok" {
+		t.Fatalf("lu (%q, %v)", data, err)
+	}
+	if len(seen) != 1 || seen[0] != "salut" {
+		t.Fatalf("OnPing = %q", seen)
+	}
+}
+
+// deadlineConn note les échéances d'écriture posées sur le transport.
+type deadlineConn struct {
+	memConn
+	writeDeadlines []time.Time
+}
+
+func (d *deadlineConn) SetWriteDeadline(t time.Time) error {
+	d.writeDeadlines = append(d.writeDeadlines, t)
+	return nil
+}
+
+func TestAutoWriteTimeoutRefreshesDeadline(t *testing.T) {
+	m := &deadlineConn{memConn: memConn{r: bytes.NewReader(buildFrame(true, 0, opPing, true, nil))}}
+	c := newConn(m, nil, nil, true)
+	c.AutoWriteTimeout = 3 * time.Second
+
+	start := time.Now()
+	if _, _, err := c.ReadMessage(); err == nil {
+		t.Fatal("EOF attendu après le ping")
+	}
+	if len(m.writeDeadlines) != 1 {
+		t.Fatalf("%d échéance(s) posée(s), attendu 1 avant le pong automatique", len(m.writeDeadlines))
+	}
+	if d := m.writeDeadlines[0].Sub(start); d < 2*time.Second || d > 4*time.Second {
+		t.Fatalf("échéance à +%v, attendu ~+3s", d)
+	}
+
+	// Sans AutoWriteTimeout, aucune échéance n'est touchée.
+	m2 := &deadlineConn{memConn: memConn{r: bytes.NewReader(buildFrame(true, 0, opPing, true, nil))}}
+	c2 := newConn(m2, nil, nil, true)
+	if _, _, err := c2.ReadMessage(); err == nil {
+		t.Fatal("EOF attendu")
+	}
+	if len(m2.writeDeadlines) != 0 {
+		t.Fatalf("%d échéance(s) posée(s) sans AutoWriteTimeout", len(m2.writeDeadlines))
+	}
+}
+
 func TestEmptyMessageIsNonNil(t *testing.T) {
 	c, _ := newMemConn(true, buildFrame(true, 0, opBinary, true, nil))
 	_, got, err := c.ReadMessage()

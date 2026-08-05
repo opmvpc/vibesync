@@ -45,6 +45,21 @@ type Conn struct {
 	// À positionner avant la première lecture.
 	OnPong func(payload []byte)
 
+	// OnPing, s'il est non nil, est appelé depuis [Conn.ReadMessage] à chaque
+	// ping reçu, après l'envoi du pong automatique. Mêmes règles que
+	// [Conn.OnPong]. Sert typiquement à repousser l'échéance de lecture : un
+	// pair silencieux qui ne fait que pinguer garde ainsi la connexion vivante.
+	OnPing func(payload []byte)
+
+	// AutoWriteTimeout, s'il est > 0, borne les écritures **automatiques**
+	// émises depuis [Conn.ReadMessage] (pong de réponse à un ping, écho de
+	// close) : leur échéance d'écriture est repositionnée à
+	// time.Now()+AutoWriteTimeout. Sans cela, ces trames héritent de la
+	// dernière échéance posée par [Conn.SetWriteDeadline], potentiellement
+	// déjà expirée, et la connexion tomberait sur un simple ping du pair.
+	// À positionner avant la première lecture.
+	AutoWriteTimeout time.Duration
+
 	// --- écriture (protégée par wmu) ---
 	wmu       sync.Mutex
 	whdr      [14]byte // en-tête de trame réutilisé
@@ -466,6 +481,15 @@ func (c *Conn) readPayload(dst []byte, h frameHeader) ([]byte, error) {
 	return dst, nil
 }
 
+// refreshAutoWriteDeadline repositionne l'échéance d'écriture avant une trame
+// émise automatiquement par la boucle de lecture. No-op si l'appelant n'a pas
+// réglé [Conn.AutoWriteTimeout].
+func (c *Conn) refreshAutoWriteDeadline() {
+	if c.AutoWriteTimeout > 0 {
+		_ = c.nc.SetWriteDeadline(time.Now().Add(c.AutoWriteTimeout))
+	}
+}
+
 func (c *Conn) handleControl(h frameHeader) error {
 	buf := c.ctrl[:h.length]
 	if h.length > 0 {
@@ -480,8 +504,12 @@ func (c *Conn) handleControl(h frameHeader) error {
 	case opPing:
 		// Après notre propre close, on ne répond plus : on attend juste
 		// l'écho du pair, sans casser la lecture pour autant.
+		c.refreshAutoWriteDeadline()
 		if err := c.WritePong(buf); err != nil && !errors.Is(err, ErrClosed) {
 			return err
+		}
+		if c.OnPing != nil {
+			c.OnPing(buf)
 		}
 		return nil
 	case opPong:
@@ -518,6 +546,7 @@ func (c *Conn) handleClose(payload []byte) error {
 	if echo == CloseNoStatusReceived {
 		echo = CloseNormalClosure
 	}
+	c.refreshAutoWriteDeadline()
 	_ = c.WriteClose(echo, "")
 	// Close handshake terminé (reçu + écho envoyé) : plus rien de valide ne
 	// peut transiter, on rend la socket au système sans attendre.

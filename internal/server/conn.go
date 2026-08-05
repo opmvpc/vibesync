@@ -10,9 +10,8 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/gorilla/websocket"
-
 	"github.com/thibsix/vibesync/internal/protocol"
+	"github.com/thibsix/vibesync/internal/ws"
 )
 
 const (
@@ -36,7 +35,7 @@ const (
 // Toutes les écritures passent par une unique goroutine (writePump).
 type wsClient struct {
 	srv  *Server
-	conn *websocket.Conn
+	conn *ws.Conn
 	// log est immuable après construction : il est utilisé par send() et par
 	// la goroutine d'écriture.
 	log      *slog.Logger
@@ -60,9 +59,14 @@ type wsClient struct {
 	member *member
 }
 
-func newWSClient(s *Server, conn *websocket.Conn, remote string) *wsClient {
+func newWSClient(s *Server, conn *ws.Conn, remote string) *wsClient {
 	log := s.log.With("remote", remote)
 	now := s.clock.Now()
+	// Les trames émises automatiquement par la boucle de lecture (pong de
+	// réponse à un ping du client, écho de close) doivent avoir leur propre
+	// échéance d'écriture : sinon elles héritent de celle posée par writePump,
+	// expirée entre deux pings de transport.
+	conn.AutoWriteTimeout = writeWait
 	return &wsClient{
 		srv:      s,
 		conn:     conn,
@@ -103,7 +107,7 @@ func (c *wsClient) writePump() {
 	ticker := time.NewTicker(pingPeriod)
 	defer func() {
 		ticker.Stop()
-		_ = c.conn.Close()
+		_ = c.conn.CloseNow()
 	}()
 
 	// Un premier ping immédiat donne une estimation de latence dès la connexion
@@ -125,8 +129,7 @@ func (c *wsClient) writePump() {
 		case <-c.done:
 			c.drain()
 			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-			_ = c.conn.WriteMessage(websocket.CloseMessage,
-				websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+			_ = c.conn.WriteClose(ws.CloseNormalClosure, "")
 			// On laisse la boucle de lecture se terminer (échange des trames
 			// Close) avant de couper la socket : sinon le dernier message écrit
 			// peut être perdu par une fermeture abrupte.
@@ -154,7 +157,7 @@ func (c *wsClient) drain() {
 
 func (c *wsClient) writeRaw(raw []byte) bool {
 	_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-	if err := c.conn.WriteMessage(websocket.TextMessage, raw); err != nil {
+	if err := c.conn.WriteMessage(ws.TextMessage, raw); err != nil {
 		c.log.Debug("écriture websocket échouée", "err", err)
 		return false
 	}
@@ -166,7 +169,7 @@ func (c *wsClient) writePing() bool {
 	c.pingSentAt = time.Now()
 	c.mu.Unlock()
 	_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
-	if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+	if err := c.conn.WritePing(nil); err != nil {
 		c.log.Debug("ping websocket échoué", "err", err)
 		return false
 	}
@@ -220,11 +223,10 @@ func (c *wsClient) readPump() {
 
 	c.conn.SetReadLimit(maxMessageSize)
 	_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
-	c.conn.SetPongHandler(func(string) error {
+	c.conn.OnPong = func([]byte) {
 		_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
 		c.observePong(time.Now())
-		return nil
-	})
+	}
 
 	for {
 		msgType, raw, err := c.conn.ReadMessage()
@@ -233,7 +235,7 @@ func (c *wsClient) readPump() {
 			return
 		}
 		_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
-		if msgType != websocket.TextMessage {
+		if msgType != ws.TextMessage {
 			c.rlog.Debug("message non texte ignoré", "msgType", msgType)
 			continue
 		}

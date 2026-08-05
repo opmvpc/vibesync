@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"github.com/thibsix/vibesync/internal/ws"
 )
 
 // Plafonds anti-abus par défaut (§Comportements serveur, point 6).
@@ -45,11 +45,10 @@ type Config struct {
 
 // Server expose les routes HTTP et détient le hub de salles.
 type Server struct {
-	cfg      Config
-	hub      *Hub
-	clock    Clock
-	log      *slog.Logger
-	upgrader websocket.Upgrader
+	cfg   Config
+	hub   *Hub
+	clock Clock
+	log   *slog.Logger
 
 	// passwordHash : condensat SHA-256 du mot de passe attendu ; on compare des
 	// condensats de taille fixe pour ne pas fuiter la longueur du secret.
@@ -107,13 +106,6 @@ func New(cfg Config, opts ...Option) *Server {
 		opt(s)
 	}
 	s.hub = newHub(s.clock, s.log, cfg.MaxRooms, cfg.MaxRoomSize)
-	s.upgrader = websocket.Upgrader{
-		ReadBufferSize:  4096,
-		WriteBufferSize: 4096,
-		// Les clients sont des applications desktop, pas des navigateurs
-		// porteurs de cookies : aucune protection CSRF à assurer ici.
-		CheckOrigin: func(*http.Request) bool { return true },
-	}
 	return s
 }
 
@@ -158,7 +150,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.clients.Add(-1)
 
-	conn, err := s.upgrader.Upgrade(w, r, nil)
+	// Les clients sont des applications desktop, pas des navigateurs porteurs
+	// de cookies : aucun contrôle d'origine à assurer ici.
+	conn, err := ws.Upgrade(w, r)
 	if err != nil {
 		// Upgrade a déjà répondu au client.
 		s.log.Debug("upgrade websocket échoué", "err", err, "remote", r.RemoteAddr)

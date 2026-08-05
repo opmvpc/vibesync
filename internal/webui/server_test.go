@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/thibsix/vibesync/internal/client"
 	"github.com/thibsix/vibesync/internal/protocol"
+	"github.com/thibsix/vibesync/internal/ws"
 )
 
 // stubEngine enregistre les appels de l'UI.
@@ -156,21 +156,20 @@ func TestTokenExige(t *testing.T) {
 	}
 }
 
-func dialUI(t *testing.T, ts *httptest.Server) *websocket.Conn {
+func dialUI(t *testing.T, ts *httptest.Server) *ws.Conn {
 	t.Helper()
 	url := "ws" + strings.TrimPrefix(ts.URL, "http") + "/ui?token=jeton-test"
-	c, resp, err := websocket.DefaultDialer.Dial(url, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c, err := ws.Dial(ctx, url)
 	if err != nil {
 		t.Fatalf("dial /ui: %v", err)
 	}
-	if resp != nil {
-		_ = resp.Body.Close()
-	}
-	t.Cleanup(func() { _ = c.Close() })
+	t.Cleanup(func() { _ = c.CloseNow() })
 	return c
 }
 
-func readUI(t *testing.T, c *websocket.Conn) protocol.Envelope {
+func readUI(t *testing.T, c *ws.Conn) protocol.Envelope {
 	t.Helper()
 	_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
 	_, raw, err := c.ReadMessage()
@@ -184,13 +183,13 @@ func readUI(t *testing.T, c *websocket.Conn) protocol.Envelope {
 	return env
 }
 
-func sendUI(t *testing.T, c *websocket.Conn, msgType string, data any) {
+func sendUI(t *testing.T, c *ws.Conn, msgType string, data any) {
 	t.Helper()
 	raw, err := protocol.Encode(msgType, data)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.WriteMessage(websocket.TextMessage, raw); err != nil {
+	if err := c.WriteMessage(ws.TextMessage, raw); err != nil {
 		t.Fatal(err)
 	}
 }

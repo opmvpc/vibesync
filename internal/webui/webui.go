@@ -18,7 +18,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/thibsix/vibesync/internal/client"
 )
 
@@ -49,13 +48,12 @@ type Options struct {
 
 // Server est le serveur HTTP local (UI + canal /ui).
 type Server struct {
-	eng      Engine
-	token    string
-	mux      *http.ServeMux
-	srv      *http.Server
-	ln       net.Listener
-	upgrader websocket.Upgrader
-	index    []byte
+	eng   Engine
+	token string
+	mux   *http.ServeMux
+	srv   *http.Server
+	ln    net.Listener
+	index []byte
 }
 
 // New construit le serveur local.
@@ -77,9 +75,6 @@ func New(eng Engine, opts Options) (*Server, error) {
 		token: token,
 		mux:   http.NewServeMux(),
 		index: []byte(strings.ReplaceAll(string(index), "__UI_TOKEN__", token)),
-		upgrader: websocket.Upgrader{
-			CheckOrigin: checkLocalOrigin,
-		},
 	}
 	sub, err := fs.Sub(assets, "web")
 	if err != nil {

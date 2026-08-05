@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gorilla/websocket"
 	"github.com/thibsix/vibesync/internal/protocol"
 	"github.com/thibsix/vibesync/internal/vlc"
+	"github.com/thibsix/vibesync/internal/ws"
 )
 
 // fakeServer est un serveur WebSocket factice minimal (le vrai serveur est
@@ -22,20 +22,19 @@ type fakeServer struct {
 	hellos []protocol.Hello
 
 	// handle est appelé après réception du hello ; n est le numéro de session.
-	handle func(c *websocket.Conn, hello protocol.Hello, n int)
+	handle func(c *ws.Conn, hello protocol.Hello, n int)
 }
 
-func newFakeServer(t *testing.T, handle func(c *websocket.Conn, hello protocol.Hello, n int)) *fakeServer {
+func newFakeServer(t *testing.T, handle func(c *ws.Conn, hello protocol.Hello, n int)) *fakeServer {
 	t.Helper()
 	fs := &fakeServer{handle: handle}
-	up := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		c, err := up.Upgrade(w, r, nil)
+		c, err := ws.Upgrade(w, r)
 		if err != nil {
 			return
 		}
-		defer func() { _ = c.Close() }()
+		defer func() { _ = c.CloseNow() }()
 		_, raw, err := c.ReadMessage()
 		if err != nil {
 			return
@@ -80,14 +79,14 @@ func (fs *fakeServer) lastHello() protocol.Hello {
 	return fs.hellos[len(fs.hellos)-1]
 }
 
-func sendMsg(t *testing.T, c *websocket.Conn, msgType string, data any) {
+func sendMsg(t *testing.T, c *ws.Conn, msgType string, data any) {
 	t.Helper()
 	raw, err := protocol.Encode(msgType, data)
 	if err != nil {
 		t.Errorf("encode %s: %v", msgType, err)
 		return
 	}
-	if err := c.WriteMessage(websocket.TextMessage, raw); err != nil {
+	if err := c.WriteMessage(ws.TextMessage, raw); err != nil {
 		return
 	}
 }
@@ -117,7 +116,7 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 }
 
 func TestConnexionHelloPuisWelcome(t *testing.T) {
-	fs := newFakeServer(t, func(c *websocket.Conn, _ protocol.Hello, _ int) {
+	fs := newFakeServer(t, func(c *ws.Conn, _ protocol.Hello, _ int) {
 		sendMsg(t, c, protocol.TypeWelcome, protocol.Welcome{
 			SelfID: "u7", Room: "soirée",
 			State: protocol.RoomState{Paused: true, Rate: 1},
@@ -143,7 +142,7 @@ func TestConnexionHelloPuisWelcome(t *testing.T) {
 }
 
 func TestPongMetAJourLaLatence(t *testing.T) {
-	fs := newFakeServer(t, func(c *websocket.Conn, _ protocol.Hello, _ int) {
+	fs := newFakeServer(t, func(c *ws.Conn, _ protocol.Hello, _ int) {
 		sendMsg(t, c, protocol.TypeWelcome, protocol.Welcome{SelfID: "u1", State: protocol.RoomState{Paused: true, Rate: 1}})
 		for {
 			_, raw, err := c.ReadMessage()
@@ -172,7 +171,7 @@ func TestPongMetAJourLaLatence(t *testing.T) {
 }
 
 func TestReconnexionAvecReHello(t *testing.T) {
-	fs := newFakeServer(t, func(c *websocket.Conn, _ protocol.Hello, n int) {
+	fs := newFakeServer(t, func(c *ws.Conn, _ protocol.Hello, n int) {
 		sendMsg(t, c, protocol.TypeWelcome, protocol.Welcome{
 			SelfID: "u1", Room: "r",
 			State: protocol.RoomState{Paused: true, Rate: 1},
@@ -210,7 +209,7 @@ func TestReconnexionSurServeurInjoignable(t *testing.T) {
 }
 
 func TestErreurFataleStoppeLaReconnexion(t *testing.T) {
-	fs := newFakeServer(t, func(c *websocket.Conn, _ protocol.Hello, _ int) {
+	fs := newFakeServer(t, func(c *ws.Conn, _ protocol.Hello, _ int) {
 		sendMsg(t, c, protocol.TypeError, protocol.ErrorMsg{Code: protocol.ErrBadPassword, Text: "mot de passe incorrect"})
 		time.Sleep(20 * time.Millisecond)
 	})
@@ -228,7 +227,7 @@ func TestErreurFataleStoppeLaReconnexion(t *testing.T) {
 
 func TestDisconnectFermeLaSession(t *testing.T) {
 	closed := make(chan struct{}, 4)
-	fs := newFakeServer(t, func(c *websocket.Conn, _ protocol.Hello, _ int) {
+	fs := newFakeServer(t, func(c *ws.Conn, _ protocol.Hello, _ int) {
 		sendMsg(t, c, protocol.TypeWelcome, protocol.Welcome{SelfID: "u1", State: protocol.RoomState{Paused: true, Rate: 1}})
 		for {
 			if _, _, err := c.ReadMessage(); err != nil {
