@@ -21,7 +21,10 @@ Opus en parallèle.
 | VS-006 | Intégration + tests e2e simulés | ouvert |
 | VS-007 | Docker + Coolify + CI (lint, tests, releases win/mac) | ouvert |
 | VS-008 | Doc utilisateur (README pour les amis) | ouvert |
-| VS-009 | Coquille native Wails (Win ici, mac demain) | ouvert |
+| VS-009 | Coquille native Wails | abandonné (ADR-006) |
+| VS-010 | Cœur headless + spec canal /ui | ouvert |
+| VS-011 | App Windows WPF net48 | ouvert |
+| VS-012 | App macOS SwiftUI | ouvert (Mac dispo 06-08) |
 
 ## Recherches
 
@@ -34,5 +37,7 @@ Opus en parallèle.
 2. VS-009 : coquille Wails Windows + script/doc de build macOS pour le Mac de demain
 3. VS-007 (Docker/Coolify/CI) puis VS-008 (doc amis)
 
-Pivots du jour : client natif exigé (ADR-005 remplace ADR-004) ; QA renforcée
-(tests partout + `go vet` + `staticcheck`) ; cibles client = Windows + macOS arm64.
+Pivots du jour (dans l'ordre) : client graphique natif Win+mac ; QA renforcée
+(tests partout + analyse statique) ; **pas de webview** → UIs 100 % natives
+SwiftUI/WPF sur cœur Go headless (ADR-006) ; **budget client < 10 Mo** → Windows
+en WPF net48 plutôt que WinUI 3 (ADR-007). SDK .NET 8 installé sur la machine.

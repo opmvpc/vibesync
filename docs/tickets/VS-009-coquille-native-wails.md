@@ -1,7 +1,7 @@
 ---
 id: VS-009
 titre: Coquille native Wails (Windows ici, macOS sur le Mac demain)
-statut: ouvert
+statut: abandonné
 priorité: haute
 dépend-de: [VS-006]
 créé: 2026-08-05
@@ -25,3 +25,4 @@ navigateur. À faire APRÈS l'intégration (VS-006) pour ne pas perturber les ag
 ## Journal du ticket
 
 - 2026-08-05 : créé suite au pivot « client natif » demandé par Thibault.
+- 2026-08-05 : abandonné — Thibault refuse les webviews, remplacé par VS-010/011/012 (ADR-006).
