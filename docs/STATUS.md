@@ -18,7 +18,9 @@ Opus en parallèle.
 | VS-003 | Serveur (salles, WS, état autoritatif) | terminé (review terra) |
 | VS-004 | Client réf. : driver VLC + moteur de sync | terminé (review sol, 12 vecteurs) |
 | VS-005 | Client réf. : web UI (debug) | terminé |
-| VS-006 | Intégration + tests e2e simulés | en-cours (agent Opus B) |
+| VS-006 | Intégration + tests e2e simulés | quasi terminé — reste l'exécution du
+  test réel double-VLC (`$env:VIBESYNC_REAL="1"; go test ./test/real/ -v -timeout 10m`),
+  différée car VLC est occupé sur la machine |
 | VS-007 | Docker + Coolify + CI (lint, tests, releases win/mac) | ouvert |
 | VS-008 | Doc utilisateur (README pour les amis) | ouvert |
 | VS-009 | Coquille native Wails | abandonné (ADR-006) |
