@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  qa:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: Analyse statique
+        run: |
+          go vet ./...
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          staticcheck ./...
+      - name: Tests
+        run: go test ./...
+
+  release-core:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: qa
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { goos: windows, goarch: amd64, ext: ".exe" }
+          - { goos: darwin, goarch: arm64, ext: "" }
+          - { goos: linux, goarch: amd64, ext: "" }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: Build core ${{ matrix.goos }}/${{ matrix.goarch }}
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          go build -trimpath -ldflags="-s -w" \
+            -o dist/vibesync-core-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} \
+            ./cmd/vibesync
+      - name: Budget taille (ADR-007, part core seule)
+        run: |
+          size=$(stat -c%s dist/vibesync-core-*)
+          echo "core: $((size / 1024 / 1024)) Mo"
+          test "$size" -lt $((10 * 1024 * 1024))
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vibesync-core-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+
+# L'app WPF (ui/windows) et l'app SwiftUI (ui/macos) auront leurs jobs dédiés
+# (windows-latest / macos-latest) une fois les projets créés — VS-011/VS-012.

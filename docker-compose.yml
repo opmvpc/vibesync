@@ -1,0 +1,13 @@
+# Déploiement Coolify : créer une ressource « Docker Compose » pointant sur ce repo.
+# Attacher un domaine (ex. vibesync.mondomaine.tld) au service : Traefik termine le
+# TLS, les clients se connectent en wss://<domaine>/ws. Aucun port TCP brut à publier.
+services:
+  vibesync:
+    build: .
+    restart: unless-stopped
+    environment:
+      # Mot de passe global optionnel (laisser vide = serveur ouvert)
+      - VIBESYNC_PASSWORD=${VIBESYNC_PASSWORD:-}
+      - VIBESYNC_LOG=${VIBESYNC_LOG:-info}
+    expose:
+      - "8080"
