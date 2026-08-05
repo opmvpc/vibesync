@@ -76,7 +76,13 @@ Source de vérité du protocole client↔serveur. Les types Go correspondants vi
   (0 si `paused`). Drift = position VLC − position attendue.
 - **Correction** : `|drift| ≤ 0,1 s` → rien. `0,1 < |drift| < 2 s` → rate nudge
   (jouer à 1,05× ou 0,95× jusqu'à convergence, puis rate 1). `≥ 2 s` → seek dur vers
-  la position attendue puis affinage par nudge. Ne jamais nudger en pause : seek.
+  la position attendue puis affinage par nudge. Jamais de nudge en pause : seek
+  uniquement, et seulement si `|drift| ≥ 0,6 s` (le seek HTTP de VLC est arrondi à
+  la seconde ; sous ce seuil il serait un no-op ou une oscillation).
+- **Hold post-action** : après l'envoi d'un `control` issu d'une action utilisateur
+  locale, le moteur suspend toute correction (nudge/seek) pendant 2 s, le temps que
+  l'écho `roomState` du serveur devienne la nouvelle référence. Sans ce hold, le
+  moteur « corrige » immédiatement l'action que l'utilisateur vient de faire.
 - **Détection d'action utilisateur** : le client garde la dernière commande qu'il a
   lui-même envoyée à VLC (avec tolérance) ; tout changement observé non provoqué par
   lui (pause/play, saut de position > 3 s) = action utilisateur → `control` au serveur.
