@@ -19,7 +19,7 @@ Opus en parallèle.
 | VS-004 | Client réf. : driver VLC + moteur de sync | terminé (review sol, 12 vecteurs) |
 | VS-005 | Client réf. : web UI (debug) | terminé |
 | VS-006 | Intégration + e2e + test réel double-VLC | **terminé** (7/7 en sandbox, drift 0,25 s) |
-| VS-014 | Client Windows C (cœur validé 12/12 vecteurs) | en-cours : fixes review sol puis UI GDI |
+| VS-014 | Client Windows C complet (cœur + UI GDI) | **terminé** — 172 Ko, 47 ms, 1 010 checks |
 | VS-015 | Client macOS Swift (code complet livré) | en attente du Mac pour build/test |
 | VS-007 | Docker + Coolify + CI (lint, tests, releases win/mac) | ouvert |
 | VS-008 | Doc utilisateur (README pour les amis) | ouvert |
@@ -38,9 +38,14 @@ Opus en parallèle.
 
 ## Prochaine action
 
-1. Attendre les agents Opus (VS-003, VS-004/005), review croisée, intégration (VS-006)
-2. VS-009 : coquille Wails Windows + script/doc de build macOS pour le Mac de demain
-3. VS-007 (Docker/Coolify/CI) puis VS-008 (doc amis)
+1. **Sur le Mac de Thibault** : `swift test` puis `scripts/build-macos.sh` dans
+   ui/macos (suivre docs/build-macos.md ; erreurs de build attendues et localisées,
+   voir §6) — dernier livrable manquant.
+2. Thibault : déployer le serveur sur Coolify (docs/deploy-coolify.md) et faire une
+   vraie soirée test avec un ami.
+3. Reliquats : captures macOS dans le guide amis, releases GitHub taguées (la CI
+   uploade déjà l'artifact Windows), renommage du module Go thibsix→opmvpc quand
+   aucun agent n'écrit.
 
 Pivots du jour (dans l'ordre) : client graphique natif Win+mac ; QA renforcée ;
 pas de webview (ADR-006) ; budget < 10 Mo (ADR-007) ; **philosophie handmade
