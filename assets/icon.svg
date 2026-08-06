@@ -1,0 +1,70 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256"
+     role="img" aria-label="vibesync">
+  <title>vibesync</title>
+
+  <!--
+    Icône vibesync — « deux lecteurs, une seule lecture ».
+
+    Deux triangles « play » identiques, l'un déduit de l'autre par une rotation
+    de 180° autour du centre : le violet (accent de l'app, #8b5cf6) en haut à
+    gauche pointe vers la droite, le lavande en bas à droite pointe vers la
+    gauche. Leurs pointes se font face de part et d'autre d'un couloir sombre
+    en diagonale : deux personnes, deux fichiers, une même timeline qui se
+    rejoint au milieu. La symétrie de rotation est le langage universel de la
+    synchronisation (♻, 🔄) sans recourir à la moindre flèche courbe, illisible
+    en dessous de 32 px.
+
+    Géométrie volontairement pauvre : un squircle, deux triangles à coins
+    arrondis, deux dégradés linéaires. Aucun filtre, aucune ombre, aucun texte.
+    Les coins arrondis sont obtenus par fill + stroke-linejoin="round" sur le
+    polygone brut (somme de Minkowski avec un disque de rayon 12), ce que
+    tools/genicon reproduit par une fonction de distance signée.
+
+    ⚠ Source de vérité partagée avec tools/genicon/main.go : toute modification
+    de coordonnée ou de couleur doit être répercutée des deux côtés
+    (`go run ./tools/genicon` réaffiche les sommets calculés).
+
+    Espace de dessin 256×256 :
+      squircle       8,8 → 248,248, rayon 56, liseré violet 2 à 30 %
+      triangle       base 103 × longueur 90, rayon d'arrondi 12
+      couloir        17 unités entre les deux bords arrondis qui se font face
+  -->
+
+  <defs>
+    <!-- Fond : violet très désaturé en haut, presque noir en bas. -->
+    <linearGradient id="fond" gradientUnits="userSpaceOnUse" x1="0" y1="8" x2="0" y2="248">
+      <stop offset="0" stop-color="#262038"/>
+      <stop offset="1" stop-color="#121016"/>
+    </linearGradient>
+
+    <!-- Triangle violet : dégradé sur la diagonale de sa boîte englobante. -->
+    <linearGradient id="violet" gradientUnits="userSpaceOnUse"
+                    x1="52.17" y1="44.77" x2="142.17" y2="147.77">
+      <stop offset="0" stop-color="#b79eff"/>
+      <stop offset="1" stop-color="#7635e8"/>
+    </linearGradient>
+
+    <!-- Triangle lavande : même axe lumineux (haut-gauche → bas-droite). -->
+    <linearGradient id="lavande" gradientUnits="userSpaceOnUse"
+                    x1="113.83" y1="108.23" x2="203.83" y2="211.23">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#c7b8fa"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Squircle de fond. -->
+  <rect x="8" y="8" width="240" height="240" rx="56" ry="56" fill="url(#fond)"/>
+
+  <!-- Liseré violet, entièrement à l'intérieur du bord (d'où l'inset de 1). -->
+  <rect x="9" y="9" width="238" height="238" rx="55" ry="55"
+        fill="none" stroke="#8b5cf6" stroke-opacity="0.3" stroke-width="2"/>
+
+  <!-- Triangle violet, pointe à droite (haut-gauche).
+       Le stroke de 24 = 2 × rayon d'arrondi arrondit les trois coins. -->
+  <polygon points="52.17,44.77 142.17,96.27 52.17,147.77"
+           fill="url(#violet)" stroke="url(#violet)" stroke-width="24" stroke-linejoin="round"/>
+
+  <!-- Triangle lavande = le précédent tourné de 180° autour de (128,128). -->
+  <polygon points="203.83,211.23 113.83,159.73 203.83,108.23"
+           fill="url(#lavande)" stroke="url(#lavande)" stroke-width="24" stroke-linejoin="round"/>
+</svg>
