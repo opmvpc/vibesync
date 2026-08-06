@@ -172,43 +172,69 @@ final class ProtocolTests: XCTestCase {
     }
 
     // MARK: Assainissement du moteur
+    //
+    // Depuis VS-032 ces règles sont celles du C commun ; ce qui est vérifié ici
+    // est qu'elles restent atteignables — et identiques — depuis le wrapper.
 
     func testSanitizeRoomState() {
         var rs = RoomState(paused: true, positionSec: 0, rate: 1, refServerMs: 0, setBy: "")
-        XCTAssertNotNil(Engine.sanitize(rs), "état en pause valide refusé")
+        XCTAssertNotNil(CoreEngine.sanitize(rs), "état en pause valide refusé")
 
         rs.paused = false
-        XCTAssertNil(Engine.sanitize(rs), "lecture sans référence acceptée")
+        XCTAssertNil(CoreEngine.sanitize(rs), "lecture sans référence acceptée")
 
         rs.refServerMs = 1785960000000
-        XCTAssertNotNil(Engine.sanitize(rs), "état en lecture valide refusé")
+        XCTAssertNotNil(CoreEngine.sanitize(rs), "état en lecture valide refusé")
 
         rs.rate = 8
-        XCTAssertNil(Engine.sanitize(rs), "rate hors [0,25 ; 4] accepté")
+        XCTAssertNil(CoreEngine.sanitize(rs), "rate hors [0,25 ; 4] accepté")
         rs.rate = 0.1
-        XCTAssertNil(Engine.sanitize(rs), "rate trop faible accepté")
+        XCTAssertNil(CoreEngine.sanitize(rs), "rate trop faible accepté")
 
         rs.rate = 1
         rs.positionSec = -1
-        XCTAssertNil(Engine.sanitize(rs), "position négative acceptée")
+        XCTAssertNil(CoreEngine.sanitize(rs), "position négative acceptée")
         rs.positionSec = Double.infinity
-        XCTAssertNil(Engine.sanitize(rs), "position infinie acceptée")
+        XCTAssertNil(CoreEngine.sanitize(rs), "position infinie acceptée")
 
-        XCTAssertEqual(Engine.clampPosition(-5, 100), 0)
-        XCTAssertEqual(Engine.clampPosition(500, 100), 100)
-        XCTAssertEqual(Engine.clampPosition(500, 0), 500)
+        // Règles que seul le C portait (le moteur Swift ne les avait pas) :
+        // position déraisonnable et horodatage hors bornes epoch.
+        rs.positionSec = 40_000_000
+        XCTAssertNil(CoreEngine.sanitize(rs), "position au-delà d'un an de média acceptée")
+        rs.positionSec = 10
+        rs.refServerMs = 5_000_000_000_000
+        XCTAssertNil(CoreEngine.sanitize(rs), "horodatage hors bornes accepté")
+
+        // Aller-retour complet : les champs traversent la frontière intacts.
+        rs.refServerMs = 1785960000000
+        rs.setBy = "u42"
+        guard let sane = CoreEngine.sanitize(rs) else {
+            XCTFail("état valide refusé")
+            return
+        }
+        XCTAssertEqual(sane.setBy, "u42")
+        XCTAssertEqual(sane.positionSec, 10)
+        XCTAssertEqual(sane.refServerMs, 1785960000000)
+        XCTAssertFalse(sane.paused)
+
+        XCTAssertEqual(CoreEngine.clampPosition(-5, 100), 0)
+        XCTAssertEqual(CoreEngine.clampPosition(500, 100), 100)
+        XCTAssertEqual(CoreEngine.clampPosition(500, 0), 500)
     }
 
     func testBackoffAndOffsetMedian() {
-        var backoff = Sync.backoffMin
-        XCTAssertEqual(Sync.nextBackoff(backoff), 2 * Sync.backoffMin)
+        // Doublement borné 1 s → 10 s (docs/protocol.md §Reconnexion).
+        let second: Nanos = 1_000_000_000
+        XCTAssertEqual(CoreEngine.nextBackoff(0), second, "premier délai différent de 1 s")
+        var backoff = second
+        XCTAssertEqual(CoreEngine.nextBackoff(backoff), 2 * second)
         for _ in 0..<10 {
-            backoff = Sync.nextBackoff(backoff)
+            backoff = CoreEngine.nextBackoff(backoff)
         }
-        XCTAssertEqual(backoff, Sync.backoffMax)
+        XCTAssertEqual(backoff, 10 * second, "plafond différent de 10 s")
 
         // Médiane glissante des 5 dernières mesures : un RTT aberrant est ignoré.
-        var engine = Engine()
+        let engine = CoreEngine()
         let base: Nanos = 1785960000000 * 1_000_000
         let deltas: [Int64] = [1000, 1200, 800, 60000, 1100]
         for (index, delta) in deltas.enumerated() {
@@ -228,15 +254,109 @@ final class ProtocolTests: XCTestCase {
     }
 
     func testSessionLostInvalidatesReference() {
-        var engine = Engine()
+        let engine = CoreEngine()
+        engine.connecting(room: "salon")
+        XCTAssertEqual(engine.room, "salon")
         engine.onWelcome(now: VSTime.now(),
                          selfId: "u1",
-                         room: "salon",
                          state: RoomState(paused: true, positionSec: 10, rate: 1, refServerMs: 1, setBy: "u2"))
         XCTAssertTrue(engine.haveState)
+        XCTAssertEqual(engine.selfId, "u1")
+        XCTAssertEqual(engine.roomState.setBy, "u2")
         engine.sessionLost()
         XCTAssertFalse(engine.haveState, "référence non invalidée à la coupure")
         XCTAssertFalse(engine.haveOffset)
+        XCTAssertTrue(engine.selfId.isEmpty)
+    }
+
+    // MARK: Frontière du wrapper (VS-032)
+
+    /// Ce que le wrapper doit garantir et que les vecteurs ne montrent pas :
+    /// les entrées de l'interface produisent les bons messages, et les chaînes
+    /// traversent la frontière C sans se perdre (UTF-8 multi-octets compris).
+    func testWrapperUserActionsAndStrings() {
+        let engine = CoreEngine()
+        engine.connecting(room: "salon")
+        engine.onWelcome(now: VSTime.now(), selfId: "u1", state: nil)
+        XCTAssertFalse(engine.haveState, "un welcome sans état de salle ne doit rien adopter")
+
+        let opened = engine.openFile(name: "L'Été — 4K (accentué).mkv", sizeBytes: 4242)
+        guard case .server(.setFile(let name, let duration, let size))? = opened.first else {
+            XCTFail("openFile n'a pas déclaré le fichier : \(opened.count) décision(s)")
+            return
+        }
+        XCTAssertEqual(name, "L'Été — 4K (accentué).mkv", "chaîne UTF-8 abîmée à la frontière")
+        XCTAssertEqual(duration, 0)
+        XCTAssertEqual(size, 4242)
+        XCTAssertEqual(engine.fileName, "L'Été — 4K (accentué).mkv")
+        XCTAssertFalse(engine.fileDeclared, "durée inconnue : le fichier n'est pas encore déclaré")
+
+        let ready = engine.setReady(true)
+        XCTAssertTrue(engine.ready)
+        guard case .server(.setReady(let value))? = ready.first else {
+            XCTFail("setReady sans message")
+            return
+        }
+        XCTAssertTrue(value)
+
+        let seek = engine.userControl(now: VSTime.now(), action: .seek, positionSec: 42)
+        guard case .server(.control(let action, let position))? = seek.first else {
+            XCTFail("userControl sans control")
+            return
+        }
+        XCTAssertEqual(action, .seek)
+        XCTAssertEqual(position, 42)
+
+        let chat = engine.chat("coucou 👋")
+        guard case .server(.chat(let text))? = chat.first else {
+            XCTFail("chat en ligne non émis")
+            return
+        }
+        XCTAssertEqual(text, "coucou 👋")
+
+        // Statut VLC : l'instantané fait l'aller-retour, et la durée observée
+        // déclare le fichier.
+        var st = VLCStatus()
+        st.state = .paused
+        st.positionSec = 12.5
+        st.lengthSec = 600
+        st.rate = 1
+        st.fileName = "L'Été — 4K (accentué).mkv"
+        _ = engine.onVLCStatus(now: VSTime.now(), st)
+        XCTAssertTrue(engine.haveStatus)
+        XCTAssertEqual(engine.status.state, .paused)
+        XCTAssertEqual(engine.status.positionSec, 12.5)
+        XCTAssertEqual(engine.status.fileName, "L'Été — 4K (accentué).mkv")
+        XCTAssertTrue(engine.fileDeclared)
+        XCTAssertEqual(engine.fileDurationSec, 600)
+    }
+
+    /// File d'attente hors ligne : un chat composé sans session part au welcome
+    /// suivant, dans l'ordre — capacité du C commun que le moteur Swift natif
+    /// n'avait pas (docs/protocol.md §File d'attente hors ligne).
+    func testWrapperQueuesOfflineChat() {
+        let engine = CoreEngine()
+        engine.connecting(room: "salon")
+        XCTAssertTrue(engine.chat("un").isEmpty, "chat hors ligne envoyé quand même")
+        XCTAssertTrue(engine.chat("deux").isEmpty)
+        XCTAssertEqual(engine.pendingChats, ["un", "deux"])
+
+        let out = engine.onWelcome(now: VSTime.now(), selfId: "u1", state: nil)
+        let texts: [String] = out.serverMessages.compactMap {
+            if case .chat(let text) = $0 {
+                return text
+            }
+            return nil
+        }
+        XCTAssertEqual(texts, ["un", "deux"], "file rejouée dans le désordre")
+        XCTAssertTrue(engine.pendingChats.isEmpty)
+
+        // Départ volontaire : ce qui n'est pas parti ne partira pas.
+        engine.disconnected()
+        _ = engine.chat("trois")
+        XCTAssertEqual(engine.pendingChats, ["trois"])
+        engine.disconnected()
+        XCTAssertTrue(engine.pendingChats.isEmpty, "file conservée après un départ volontaire")
     }
 
     // MARK: Écriture JSON

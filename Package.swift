@@ -16,14 +16,15 @@
 //
 // Trois cibles :
 //   - VSCore        : la couche C commune (core/src portable + core/posix)
-//   - VibeSync      : l'exécutable (moteur + réseau + VLC + interface)
-//   - VibeSyncTests : rejeu des 13 vecteurs de conformité — DEUX FOIS, contre
-//                     le moteur Swift natif et contre VSCore — plus les tests
-//                     unitaires
+//   - VibeSync      : l'exécutable (réseau + VLC + interface) — son moteur de
+//                     synchronisation EST VSCore, via le wrapper mince
+//                     ui/macos/Sources/VibeSync/Engine/CoreEngine.swift
+//   - VibeSyncTests : rejeu des 13 vecteurs de conformité — DEUX FOIS, par le
+//                     wrapper (le chemin réel de l'application) et par l'API C
+//                     brute — plus les tests unitaires
 //
-// VSCore n'est PAS encore consommé par l'exécutable : c'est la phase 3
-// (VS-032). Tant que la double couverture n'est pas verte, le moteur Swift
-// natif reste le seul en production.
+// Depuis VS-032 (phase 3 d'ADR-010) il n'y a plus de moteur Swift natif : la
+// machine à états n'existe qu'en un exemplaire, commun aux deux clients.
 import PackageDescription
 
 let package = Package(
@@ -54,6 +55,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "VibeSync",
+            dependencies: ["VSCore"],
             path: "ui/macos/Sources/VibeSync"
         ),
         .testTarget(

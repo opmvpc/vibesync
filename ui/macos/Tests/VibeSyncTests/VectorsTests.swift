@@ -1,8 +1,15 @@
-// VectorsTests.swift — rejeu des vecteurs de conformité test/vectors/*.json.
+// VectorsTests.swift — rejeu des vecteurs de conformité test/vectors/*.json
+// PAR LE CHEMIN RÉEL DE L'APPLICATION.
 //
 // C'est LE contrat du moteur : pour le même `initialVLC` et les mêmes
-// `events`, l'implémentation Swift doit produire les mêmes `vlcCommands` et
-// `toServer` aux mêmes instants que la référence Go et que le port C.
+// `events`, le client macOS doit produire les mêmes `vlcCommands` et
+// `toServer` aux mêmes instants que la référence Go et que le client Windows.
+//
+// Depuis VS-032 (phase 3 d'ADR-010) ce rejeu passe par `CoreEngine`, le
+// wrapper Swift au-dessus du moteur C commun — c'est-à-dire exactement ce
+// qu'exécute AppModel, conversions de frontière comprises. VSCoreVectorsTests,
+// lui, rejoue les mêmes fichiers contre l'API C brute : si ces deux tests
+// divergent un jour, le fautif est le wrapper, pas le moteur.
 //
 // Répertoire des vecteurs : variable d'environnement VIBESYNC_VECTORS, sinon
 // ../../test/vectors relatif au répertoire courant (racine du paquet), sinon
@@ -19,6 +26,9 @@ final class VectorsTests: XCTestCase {
     /// Origine de l'horloge simulée (vlctest.NewClock : 2026-08-05 20:00 UTC).
     private let baseMs: Int64 = 1785960000000
     private let tolerance: Double = 1e-3
+    /// Pas de trace effectivement rejoués : un rejeu qui ne compare rien
+    /// (trace vide, sortie anticipée) passerait sinon en silence.
+    private var replayedSteps = 0
 
     // MARK: - Localisation des vecteurs
 
@@ -67,6 +77,10 @@ final class VectorsTests: XCTestCase {
         for name in names {
             replay(dir.appendingPathComponent(name))
         }
+        // Plancher, pas un compte exact : les 13 vecteurs totalisent 146 pas
+        // aujourd'hui, un vecteur ajouté ne doit pas rendre ce test rouge.
+        XCTAssertGreaterThan(replayedSteps, 100,
+                             "\(replayedSteps) pas de trace rejoués : le rejeu n'a pas eu lieu")
     }
 
     private func replay(_ url: URL) {
@@ -98,9 +112,9 @@ final class VectorsTests: XCTestCase {
             fake.play(now)
         }
 
-        var engine = Engine()
+        let engine = CoreEngine()
         // Les sorties de l'ouverture sont drainées par le générateur.
-        engine.openFile(now: now, name: fileName, sizeBytes: vectorFileSize)
+        engine.openFile(name: fileName, sizeBytes: vectorFileSize)
 
         var eventIndex = 0
         // keepOutput : par défaut, ce que le moteur émet en réaction immédiate à
@@ -147,8 +161,8 @@ final class VectorsTests: XCTestCase {
                     case .welcome(let w):
                         pending += engine.onWelcome(now: now,
                                                     selfId: w.selfId,
-                                                    room: w.room,
-                                                    state: w.state)
+                                                    state: w.state,
+                                                    selfReady: w.selfReady)
                     case .pong(let p):
                         engine.onPong(now: now, p)
                     case .roomState(let rs):
@@ -195,6 +209,7 @@ final class VectorsTests: XCTestCase {
             checkCommands(at, JSON.array(step, "vlcCommands"), out.vlcCommands)
             checkMessages(at, JSON.array(step, "toServer"), out.serverMessages)
 
+            replayedSteps += 1
             for cmd in out.vlcCommands {
                 fake.apply(cmd, now)
             }

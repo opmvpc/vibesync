@@ -88,7 +88,10 @@ public final class AppModel: ObservableObject {
 
     // MARK: Interne
 
-    private var engine = Engine()
+    /// Le moteur de synchronisation : la couche C commune (VSCore) vue à
+    /// travers CoreEngine.swift. Une classe, donc une référence — mais la même
+    /// discipline qu'avant : tous les appels partent de la file principale.
+    private let engine = CoreEngine()
     private let ws = WebSocketClient()
     private var vlc: VLCProcess?
     private var timer: Timer?
@@ -279,7 +282,7 @@ public final class AppModel: ObservableObject {
     }
 
     private func scheduleReconnect() {
-        backoff = Sync.nextBackoff(backoff)
+        backoff = CoreEngine.nextBackoff(backoff)
         nextAttempt = VSTime.now() + backoff
         connectionLabel = "reconnexion dans \(Int(VSTime.seconds(backoff))) s…"
     }
@@ -335,7 +338,16 @@ public final class AppModel: ObservableObject {
                 room = w.room
             }
             noteServerVersion(w)
-            out += engine.onWelcome(now: now, selfId: w.selfId, room: w.room, state: w.state)
+            out += engine.onWelcome(now: now,
+                                    selfId: w.selfId,
+                                    state: w.state,
+                                    selfReady: w.selfReady)
+            // Reprise « salle vierge » : le moteur a émis UN control seek,
+            // l'utilisateur doit savoir pourquoi le film ne repart pas à zéro
+            // (même toast que le client Windows).
+            if let resume = engine.resumeToastSec {
+                pushToast(level: "info", text: "Reprise à \(AppModel.timeLabel(resume))")
+            }
             refreshWatchBanner()
 
         case .pong(let p):
@@ -605,6 +617,7 @@ public final class AppModel: ObservableObject {
         guard let auto = auto, !auto.statusPath.isEmpty else {
             return
         }
+        let st = engine.status
         let root = JSONVal.obj([
             ("ts", .int(VSTime.toUnixMs(now))),
             // Le harnais lance les instances par `open -n`, qui ne rend pas le
@@ -620,8 +633,8 @@ public final class AppModel: ObservableObject {
             ("file", .str(engine.fileName)),
             ("fileDeclared", .bool(engine.fileDeclared)),
             ("vlcRunning", .bool(vlcRunning)),
-            ("vlcState", .str(engine.haveStatus ? engine.status.state.rawValue : "stopped")),
-            ("positionSec", .num(engine.haveStatus ? engine.status.positionSec : 0)),
+            ("vlcState", .str(engine.haveStatus ? st.state.rawValue : "stopped")),
+            ("positionSec", .num(engine.haveStatus ? st.positionSec : 0)),
             ("durationSec", .num(durationSec)),
             ("roomPositionSec", .num(engine.expectedPosition(now))),
             ("paused", .bool(roomPaused)),
@@ -731,8 +744,11 @@ public final class AppModel: ObservableObject {
             correctionLabel = "resynchronisation"
         }
         if engine.haveStatus {
-            positionSec = engine.status.positionSec
-            durationSec = engine.status.lengthSec > 0 ? engine.status.lengthSec : engine.fileDurationSec
+            // Une seule lecture : chaque accès recopie l'instantané depuis
+            // l'état C (nom de fichier compris).
+            let st = engine.status
+            positionSec = st.positionSec
+            durationSec = st.lengthSec > 0 ? st.lengthSec : engine.fileDurationSec
         } else if engine.haveState {
             positionSec = engine.expectedPosition(VSTime.now())
             durationSec = engine.fileDurationSec
@@ -822,9 +838,7 @@ public final class AppModel: ObservableObject {
                 // déclaré au serveur qu'APRÈS le succès du lancement — sinon on
                 // annoncerait un média que personne ne peut encore lire, et un
                 // échec laisserait un setFile mensonger dans la salle.
-                self.apply(self.engine.openFile(now: VSTime.now(),
-                                                name: url.lastPathComponent,
-                                                sizeBytes: size))
+                self.apply(self.engine.openFile(name: url.lastPathComponent, sizeBytes: size))
             case .failure(let err):
                 // Rien de déclaré : seul le message d'erreur est remonté.
                 self.mediaLabel = err.text

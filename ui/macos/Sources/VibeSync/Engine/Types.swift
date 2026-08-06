@@ -1,9 +1,15 @@
-// Types.swift — vocabulaire du moteur de synchronisation.
+// Types.swift — vocabulaire de la FRONTIÈRE avec le moteur.
 //
 // Entrées : état observé de VLC, état de salle du serveur, pong.
 // Sorties : décisions (commandes VLC + messages serveur).
-// Aucune dépendance réseau ni interface : c'est ce qui rend le moteur
-// rejouable contre test/vectors/*.json.
+//
+// Depuis VS-032 (phase 3 d'ADR-010) le moteur lui-même est le C commun
+// (core/src/engine.c) : ces types ne sont plus « ceux du moteur » mais ceux que
+// s'échangent le parseur de statut VLC (VLCStatusParser), le protocole
+// (Protocol.swift), l'interface (AppModel) et le wrapper CoreEngine, qui les
+// convertit en VsStatus/VsRoomState/VsCmd/VsMsg le temps d'un appel. Ils
+// restent en Swift parce que ce sont EUX qui traversent le reste de
+// l'application ; les convertir partout coûterait plus cher qu'ici.
 
 import Foundation
 
