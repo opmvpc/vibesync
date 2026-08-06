@@ -57,7 +57,8 @@ typedef struct {
 
 typedef struct {
     VsInKind kind;
-    Str8 type;  // type brut, même si inconnu (forward-compat)
+    Str8 type;   // type brut, même si inconnu (forward-compat)
+    b32 invalid;  // type connu mais champs obligatoires absents ou mal typés
 
     // welcome
     Str8 self_id;

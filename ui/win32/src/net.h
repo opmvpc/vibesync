@@ -1,22 +1,33 @@
 // net.h — client WebSocket (ws:// et wss://) via WinHTTP.
 //
 // Mode synchrone sur un thread réseau dédié : plus simple et plus robuste que
-// les callbacks asynchrones du pool de threads WinHTTP. Le thread pousse ses
-// événements dans une file à créneaux fixes (SPSC, protégée par un SRWLOCK et
-// signalée par un événement auto-reset), vidée par la boucle principale.
+// les callbacks asynchrones du pool de threads WinHTTP.
 //
-// L'émission se fait depuis le thread appelant sous verrou : WinHTTP autorise
-// un envoi et une réception concurrents sur le même handle WebSocket.
+// Règles de concurrence (revue sécurité mémoire) :
+//   - `net_connect` / `net_close` / `net_destroy` / `net_poll` s'appellent
+//     depuis le thread principal uniquement ; `net_send_text` depuis n'importe
+//     quel thread.
+//   - TOUT accès aux handles WinHTTP (création, publication, envoi,
+//     destruction) se fait sous `lock`, avec un état de cycle de vie explicite
+//     (DEAD → CONNECTING → OPEN → CLOSING → DEAD). Le seul appel hors verrou
+//     est la réception bloquante, sur une copie locale du handle : WinHTTP
+//     garantit que le handle survit à l'opération en cours après un close.
+//   - `net_close` ferme les handles (ce qui débloque la réception) PUIS joint
+//     le thread SANS timeout : rien n'est libéré tant que le thread vit.
+//   - La file d'événements ne perd jamais rien : nœuds de taille exacte dans
+//     une arène dédiée, remise à zéro quand la file se vide. Si l'arène sature
+//     (consommateur bloqué), la connexion est fermée avec une erreur explicite
+//     plutôt que de jeter un roomState.
 #ifndef VS_NET_H
 #define VS_NET_H
 
 #include "base.h"
 
-// Taille maximale d'un message applicatif (les messages du protocole sont
-// courts ; au-delà, la connexion est signalée en erreur plutôt que de faire
-// grossir la mémoire sans borne).
-#define NET_MSG_MAX VS_KB(16)
-#define NET_QUEUE_SLOTS 16
+// Taille maximale d'un message applicatif. Les messages du protocole sont
+// courts ; au-delà, la connexion est signalée en erreur.
+#define NET_MSG_MAX VS_KB(64)
+// Mémoire de la file d'événements en attente (bornée, jamais silencieuse).
+#define NET_QUEUE_ARENA VS_MB(4)
 
 typedef enum {
     NET_EV_NONE = 0,
@@ -26,9 +37,15 @@ typedef enum {
     NET_EV_ERROR,
 } NetEventKind;
 
+// Codes d'erreur propres au client (au-delà des codes Win32).
+#define NET_ERR_MSG_TOO_BIG 0xE0000001u
+#define NET_ERR_QUEUE_FULL 0xE0000002u
+#define NET_ERR_NO_MEMORY 0xE0000003u
+
+// NetSlot est la copie remise à l'appelant par net_poll.
 typedef struct {
     NetEventKind kind;
-    u32 code;  // code Win32/WebSocket associé à l'erreur ou à la fermeture
+    u32 code;
     isize len;
     u8 data[NET_MSG_MAX];
 } NetSlot;
@@ -43,36 +60,47 @@ typedef struct {
 
 b32 net_parse_url(Str8 url, NetUrl *out);
 
-typedef struct {
-    // file d'événements (thread réseau → boucle principale)
-    NetSlot slots[NET_QUEUE_SLOTS];
-    isize head;  // lu par la boucle principale
-    isize tail;  // écrit par le thread réseau
-    isize dropped;
+typedef enum {
+    NET_STATE_DEAD = 0,
+    NET_STATE_CONNECTING,
+    NET_STATE_OPEN,
+    NET_STATE_CLOSING,
+} NetState;
 
+typedef struct NetEvent NetEvent;
+
+typedef struct {
     // Un SRWLOCK tient dans un pointeur et vaut SRWLOCK_INIT à zéro : on le
     // stocke tel quel pour garder windows.h hors de cet en-tête.
-    void *lock;
-    void *send_lock;
-    void *wakeup;  // HANDLE d'événement auto-reset
+    void *lock;        // état + handles WinHTTP
+    void *queue_lock;  // file d'événements
+    void *wakeup;      // HANDLE d'événement auto-reset
 
-    void *thread;
-    void *session;  // HINTERNET WinHttpOpen
-    void *connect;  // HINTERNET
-    void *request;  // HINTERNET
-    void *websock;  // HINTERNET (upgrade complété)
+    Arena *queue_arena;
+    NetEvent *head;
+    NetEvent *tail;
+    isize queued;
+    isize dropped;  // doit rester à 0 : la saturation ferme la connexion
+
+    void *thread;    // thread principal uniquement
+    void *session;   // HINTERNET, sous `lock`
+    void *connect;   // HINTERNET, sous `lock`
+    void *request;   // HINTERNET, sous `lock`
+    void *websock;   // HINTERNET, sous `lock`
+    NetState state;  // sous `lock`
 
     volatile long stop;
-    volatile long running;
     NetUrl url;
 } Net;
 
-// La structure fait quelques centaines de kio (file de messages à créneaux
-// fixes) : l'allouer dans une arène, jamais sur la pile.
+// net_poll écrit dans un NetSlot de 64 Kio : allouer le Net et le NetSlot dans
+// une arène, jamais sur la pile.
 
-// net_init prépare la structure (pas de connexion).
-void net_init(Net *n);
-// net_connect démarre le thread réseau vers `url`. 0 si l'URL est invalide.
+// net_init prépare la structure (pas de connexion). 0 si les ressources
+// système manquent.
+b32 net_init(Net *n);
+// net_connect démarre le thread réseau vers `url`. Toute connexion précédente
+// est fermée et jointe d'abord : il n'y a jamais deux threads réseau.
 b32 net_connect(Net *n, Str8 url);
 // net_send_text envoie un message texte complet. 0 en cas d'échec (la
 // connexion doit alors être refermée et relancée).
@@ -81,9 +109,11 @@ b32 net_send_text(Net *n, Str8 text);
 b32 net_poll(Net *n, NetSlot *out);
 // net_wakeup_handle renvoie le HANDLE à attendre pour être réveillé.
 void *net_wakeup_handle(Net *n);
-// net_close ferme proprement (close WebSocket puis arrêt du thread).
+// net_state renvoie l'état courant du cycle de vie.
+NetState net_state(Net *n);
+// net_close ferme la connexion et joint le thread réseau (idempotent).
 void net_close(Net *n);
-// net_destroy ferme la connexion et libère l'événement de réveil.
+// net_destroy ferme puis libère l'événement de réveil et l'arène de la file.
 void net_destroy(Net *n);
 
 #endif // VS_NET_H

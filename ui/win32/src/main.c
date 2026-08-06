@@ -17,7 +17,9 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#include <stdarg.h>
 #include <stdio.h>
+#include <wchar.h>
 #include <string.h>
 
 typedef struct {
@@ -137,13 +139,31 @@ static void on_server_message(App *app, Str8 raw, VsOutput *out) {
     send_msgs(app, out);
 }
 
-static Str8 arg_value(int argc, char **argv, int *i) {
+static Str8 arg_value(int argc, Str8 *args, int *i) {
     if (*i + 1 >= argc) return str8_lit("");
     (*i)++;
-    return str8_from_cstr(argv[*i]);
+    return args[*i];
 }
 
-int main(int argc, char **argv) {
+// file_size renvoie la taille réelle du média (0 si inconnue).
+static i64 file_size(Arena *scratch, Str8 path) {
+    TempArena t = temp_begin(scratch);
+    u16 *w = utf8_to_utf16(scratch, path, NULL);
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    i64 size = 0;
+    if (GetFileAttributesExW((LPCWSTR)w, GetFileExInfoStandard, &fad) &&
+        !(fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        size = ((i64)fad.nFileSizeHigh << 32) | (i64)fad.nFileSizeLow;
+    }
+    temp_end(t);
+    return size;
+}
+
+int wmain(int argc, wchar_t **argv);
+
+// Entrée UTF-16 (-municode) : l'argv ANSI casserait les chemins et pseudos
+// accentués. Tout est converti en UTF-8 dès l'entrée.
+int wmain(int argc, wchar_t **argv) {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCtrlHandler(console_ctrl, TRUE);
 
@@ -162,13 +182,16 @@ int main(int argc, char **argv) {
     app->password = str8_lit("");
     app->file = str8_lit("");
 
+    Str8 *args = arena_push_array(perm, Str8, argc > 0 ? argc : 1);
+    for (int i = 0; i < argc; i++) args[i] = utf16_to_utf8(perm, (const u16 *)argv[i]);
+
     for (int i = 1; i < argc; i++) {
-        Str8 arg = str8_from_cstr(argv[i]);
-        if (str8_eq_cstr(arg, "--server")) app->url = arg_value(argc, argv, &i);
-        else if (str8_eq_cstr(arg, "--room")) app->room = arg_value(argc, argv, &i);
-        else if (str8_eq_cstr(arg, "--nom") || str8_eq_cstr(arg, "--name")) app->name = arg_value(argc, argv, &i);
-        else if (str8_eq_cstr(arg, "--mdp")) app->password = arg_value(argc, argv, &i);
-        else if (str8_eq_cstr(arg, "--fichier") || str8_eq_cstr(arg, "--file")) app->file = arg_value(argc, argv, &i);
+        Str8 arg = args[i];
+        if (str8_eq_cstr(arg, "--server")) app->url = arg_value(argc, args, &i);
+        else if (str8_eq_cstr(arg, "--room")) app->room = arg_value(argc, args, &i);
+        else if (str8_eq_cstr(arg, "--nom") || str8_eq_cstr(arg, "--name")) app->name = arg_value(argc, args, &i);
+        else if (str8_eq_cstr(arg, "--mdp")) app->password = arg_value(argc, args, &i);
+        else if (str8_eq_cstr(arg, "--fichier") || str8_eq_cstr(arg, "--file")) app->file = arg_value(argc, args, &i);
         else {
             printf("usage: vibesync --server ws://hote/ws --room salon --nom thib [--mdp X] [--fichier film.mkv]\n");
             return 2;
@@ -181,7 +204,10 @@ int main(int argc, char **argv) {
         return 2;
     }
     app->net = arena_push_struct(perm, Net);
-    net_init(app->net);
+    if (!net_init(app->net)) {
+        logf_line("initialisation réseau impossible");
+        return 2;
+    }
 
     VsOutput out;
     vs_output_reset(&out);
@@ -200,7 +226,8 @@ int main(int argc, char **argv) {
                 app->vlc_running = 1;
                 isize slash = app->file.len;
                 while (slash > 0 && app->file.data[slash - 1] != '\\' && app->file.data[slash - 1] != '/') slash--;
-                engine_open_file(&app->engine, str8_sub(app->file, slash, -1), 0, &out);
+                engine_open_file(&app->engine, str8_sub(app->file, slash, -1),
+                                 file_size(scratch, app->file), &out);
             }
         }
     }
@@ -211,7 +238,9 @@ int main(int argc, char **argv) {
     while (!InterlockedCompareExchange(&g_quit, 0, 0)) {
         i64 now = vs_now_ns();
 
-        if (!app->ws_open && now >= app->next_attempt && !app->net->thread) start_connection(app);
+        if (!app->ws_open && now >= app->next_attempt && net_state(app->net) == NET_STATE_DEAD) {
+            start_connection(app);
+        }
 
         // Événements réseau.
         NetSlot *slot = arena_push_struct(scratch, NetSlot);

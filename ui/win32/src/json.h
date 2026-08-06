@@ -8,6 +8,12 @@
 
 #define JSON_MAX_DEPTH 32
 #define JSON_MAX_INPUT VS_MB(8)
+// Budget de valeurs : un document dense (des centaines de milliers de petites
+// valeurs) doit être refusé proprement, pas épuiser l'arène de travail.
+#define JSON_MAX_VALUES 100000
+// Le parseur refuse aussi de dépasser cette fraction de l'arène fournie.
+#define JSON_ARENA_BUDGET_NUM 3
+#define JSON_ARENA_BUDGET_DEN 4
 
 typedef enum {
     JSON_NULL = 0,
@@ -41,6 +47,7 @@ typedef enum {
     JSON_ERR_NUMBER,
     JSON_ERR_TRAILING,
     JSON_ERR_UTF8,
+    JSON_ERR_BUDGET,
 } JsonError;
 
 const char *json_error_text(JsonError e);
@@ -51,6 +58,9 @@ const char *json_error_text(JsonError e);
 JsonValue *json_parse(Arena *a, Str8 text, JsonError *err);
 
 // --- accès (tous tolérants au NULL) ---
+// json_get renvoie la DERNIÈRE occurrence de la clé, comme encoding/json en
+// Go : une clé dupliquée dans un message piégé doit produire le même
+// comportement chez tous les clients.
 JsonValue *json_get(const JsonValue *obj, const char *key);
 JsonValue *json_at(const JsonValue *arr, isize index);
 f64 json_num(const JsonValue *v, f64 def);

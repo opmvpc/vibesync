@@ -2,6 +2,8 @@
 
 #include <string.h>
 
+b32 vs_valid_epoch_ms(i64 ms) { return ms >= VS_MS_MIN && ms <= VS_MS_MAX; }
+
 b32 vs_status_loaded(const VsStatus *s) {
     return s->state == VS_PLAY_PLAYING || s->state == VS_PLAY_PAUSED;
 }
@@ -226,8 +228,13 @@ void engine_disconnected(VsEngine *e) {
 
 b32 engine_sanitize_roomstate(const VsRoomState *in, VsRoomState *out) {
     if (!f64_is_finite(in->position_sec) || in->position_sec < 0) return 0;
+    // Position déraisonnable : au-delà d'un an de média, c'est du bruit.
+    if (in->position_sec > 31536000.0) return 0;
     if (!f64_is_finite(in->rate) || in->rate < VS_MIN_RATE || in->rate > VS_MAX_RATE) return 0;
     if (!in->paused && in->ref_server_ms <= 0) return 0;
+    // Horodatage hors bornes : refus (sinon débordement signé dans le calcul
+    // de la position attendue).
+    if (in->ref_server_ms != 0 && !vs_valid_epoch_ms(in->ref_server_ms)) return 0;
     *out = *in;
     return 1;
 }
@@ -260,6 +267,9 @@ void engine_on_roomstate(VsEngine *e, i64 now, const VsRoomState *raw) {
 
 void engine_on_pong(VsEngine *e, i64 now, VsPong p) {
     i64 now_ms = vs_ns_to_unix_ms(now);
+    // Défense en profondeur : protocol.c valide déjà les bornes, mais le
+    // moteur ne doit jamais pouvoir déborder sur une entrée aberrante.
+    if (!vs_valid_epoch_ms(p.t) || !vs_valid_epoch_ms(p.server_ms) || !vs_valid_epoch_ms(now_ms)) return;
     i64 rtt = now_ms - p.t;
     if (rtt < 0) rtt = 0;
     i64 offset = p.server_ms + rtt / 2 - now_ms;
@@ -491,12 +501,26 @@ static void plan(VsEngine *e, i64 now, VsOutput *out) {
             n++;
             e->correcting = VS_CORRECT_SEEK;
         }
-    } else {
-        if (e->status.state == VS_PLAY_PAUSED) {
-            acts[n].kind = VS_CMD_RESUME;
-            acts[n].value = 0;
+    } else if (e->status.state == VS_PLAY_PAUSED) {
+        // Départ / reprise de lecture (docs/protocol.md §Départ et reprise) :
+        // on cale d'abord VLC sur la position de référence, PUIS on joue. Le
+        // nudge (5 %/s) mettrait 10 s à résorber 0,5 s d'écart de départ.
+        if (abs_drift >= VS_START_SEEK_SEC) {
+            acts[n].kind = VS_CMD_SEEK;
+            acts[n].value = expected;
+            n++;
+            e->correcting = VS_CORRECT_SEEK;
+            e->nudging = 0;
+        }
+        acts[n].kind = VS_CMD_RESUME;
+        acts[n].value = 0;
+        n++;
+        if (f64_abs(e->applied_rate - base) > 1e-3 || f64_abs(e->status.rate - base) > 1e-3) {
+            acts[n].kind = VS_CMD_RATE;
+            acts[n].value = base;
             n++;
         }
+    } else {
         f64 target = base;
         b32 want_rate = 0;
         if (abs_drift >= VS_HARD_SEEK_SEC) {

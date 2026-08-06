@@ -27,6 +27,12 @@ typedef enum {
 const char *vlc_error_text(VlcError e);
 
 #define VLC_HOST "127.0.0.1"
+// Préparation du média (pause + position 0), cf. internal/vlc.Prepare.
+#define VLC_PREPARE_TIMEOUT_MS 15000
+#define VLC_PREPARE_POLL_MS 20
+// Le seek HTTP est arrondi à la seconde : viser mieux que la demi-seconde
+// n'aurait pas de sens.
+#define VLC_START_TOLERANCE 0.5
 
 typedef struct {
     int port;
@@ -64,9 +70,14 @@ b32 vlc_locate(Arena *a, Str8 *out_path);
 // pour se rebrancher sur un VLC déjà lancé).
 void vlc_client_init(VlcClient *c, int port, Str8 password);
 
-// vlc_launch lance VLC sur `file_path` et attend que son interface HTTP
-// réponde (timeout_ms, 20 000 par défaut si ≤ 0).
+// vlc_launch lance VLC sur `file_path`, attend que son interface HTTP réponde
+// puis force pause + position 0 (cf. vlc_prepare_paused). En cas d'échec, le
+// process lancé est arrêté : pas d'orphelin. timeout_ms ≤ 0 → 20 000.
 VlcError vlc_launch(Arena *scratch, VlcClient *c, Str8 binary, Str8 file_path, i64 timeout_ms);
+
+// vlc_prepare_paused force pause + position 0 et ne rend la main qu'une fois
+// l'état « en pause » observé (docs/protocol.md §Chargement de fichier).
+VlcError vlc_prepare_paused(VlcClient *c, Arena *scratch, i64 timeout_ms);
 
 VlcError vlc_status(VlcClient *c, Arena *scratch, VsStatus *out);
 VlcError vlc_pause(VlcClient *c, Arena *scratch);

@@ -11,7 +11,9 @@ if not exist "%CC%" set "CC=x86_64-w64-mingw32-clang.exe"
 set "STD=-std=c11 -ffp-contract=off"
 set "WARN=-Wall -Wextra -Werror -Wshadow -Wvla -Wstrict-prototypes -Wmissing-prototypes"
 set "LIBS=-lwinhttp -lws2_32 -lbcrypt"
-set "CORE=%ROOT%src\base.c %ROOT%src\json.c %ROOT%src\protocol.c %ROOT%src\engine.c %ROOT%src\vlc.c %ROOT%src\net.c"
+rem Chaque chemin est entre guillemets : un checkout dans un dossier contenant
+rem des espaces doit compiler sans bricolage.
+set "CORE="%ROOT%src\base.c" "%ROOT%src\json.c" "%ROOT%src\protocol.c" "%ROOT%src\engine.c" "%ROOT%src\vlc.c" "%ROOT%src\net.c""
 set "VECTORS=%ROOT%..\..\test\vectors"
 if not exist "%ROOT%build" mkdir "%ROOT%build"
 
@@ -24,7 +26,8 @@ exit /b 2
 
 :release
 echo [release] vibesync.exe
-"%CC%" %STD% %WARN% -O2 -s -o "%ROOT%build\vibesync.exe" %CORE% "%ROOT%src\main.c" %LIBS%
+rem -municode : point d'entrée wmain (arguments UTF-16, chemins accentués).
+"%CC%" %STD% %WARN% -O2 -s -municode -o "%ROOT%build\vibesync.exe" %CORE% "%ROOT%src\main.c" %LIBS%
 if errorlevel 1 exit /b 1
 for %%F in ("%ROOT%build\vibesync.exe") do echo         %%~zF octets
 exit /b 0

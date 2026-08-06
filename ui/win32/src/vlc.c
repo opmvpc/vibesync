@@ -464,15 +464,73 @@ VlcError vlc_launch(Arena *scratch, VlcClient *c, Str8 binary, Str8 file_path, i
     // Attente de l'interface HTTP (VLC met un instant à démarrer).
     if (timeout_ms <= 0) timeout_ms = 20000;
     i64 deadline = vs_now_ns() + timeout_ms * 1000000LL;
+    VlcError err = VLC_ERR_TIMEOUT;
     for (;;) {
         VsStatus st;
         TempArena tt = temp_begin(scratch);
-        VlcError err = vlc_status(c, scratch, &st);
+        err = vlc_status(c, scratch, &st);
         temp_end(tt);
-        if (err == VLC_OK) return VLC_OK;
-        if (err == VLC_ERR_AUTH) return err;
-        if (vs_now_ns() > deadline) return VLC_ERR_TIMEOUT;
+        if (err == VLC_OK) break;
+        if (err == VLC_ERR_AUTH) break;
+        if (vs_now_ns() > deadline) {
+            err = VLC_ERR_TIMEOUT;
+            break;
+        }
         Sleep(100);
+    }
+    if (err == VLC_OK) err = vlc_prepare_paused(c, scratch, timeout_ms);
+    if (err != VLC_OK) {
+        // Ni orphelin ni handle qui fuit : le VLC qu'on vient de lancer est
+        // arrêté avant de rendre l'erreur.
+        b32 keep = c->keep_alive;
+        c->keep_alive = 0;
+        vlc_close(c);
+        c->keep_alive = keep;
+    }
+    return err;
+}
+
+// vlc_prepare_paused met un média fraîchement ouvert en pause à la position 0
+// et ne rend la main qu'une fois cet état **observé** (docs/protocol.md
+// §Chargement de fichier, port de internal/vlc.Prepare).
+//
+// VLC démarre la lecture tout seul à l'ouverture : sans cette étape, deux
+// clients qui ouvrent leur média à quelques centaines de millisecondes d'écart
+// démarrent déjà désynchronisés, et le rattrapage au rate (5 %/s) mettrait une
+// dizaine de secondes. La boucle est idempotente : on redemande pause et seek 0
+// tant que l'état visé n'est pas constaté, ce qui absorbe le délai d'ouverture
+// du média comme les commandes perdues.
+VlcError vlc_prepare_paused(VlcClient *c, Arena *scratch, i64 timeout_ms) {
+    if (timeout_ms <= 0) timeout_ms = VLC_PREPARE_TIMEOUT_MS;
+    i64 deadline = vs_now_ns() + timeout_ms * 1000000LL;
+    VlcError last = VLC_ERR_TIMEOUT;
+    for (;;) {
+        TempArena t = temp_begin(scratch);
+        VsStatus st;
+        b32 ready = 0;
+        last = vlc_status(c, scratch, &st);
+        if (last == VLC_OK) {
+            if (!vs_status_loaded(&st)) {
+                last = VLC_ERR_TIMEOUT;  // média pas encore ouvert : rien à commander
+            } else {
+                b32 at_start = st.position_sec < VLC_START_TOLERANCE;
+                if (st.state == VS_PLAY_PAUSED && at_start) {
+                    ready = 1;
+                } else {
+                    if (st.state == VS_PLAY_PLAYING) last = vlc_pause(c, scratch);
+                    if (!at_start) {
+                        VlcError e2 = vlc_seek(c, scratch, 0);
+                        if (last == VLC_OK) last = e2;
+                    }
+                    if (last == VLC_OK) last = VLC_ERR_TIMEOUT;  // pas encore constaté
+                }
+            }
+        }
+        temp_end(t);
+        if (ready) return VLC_OK;
+        if (last == VLC_ERR_AUTH) return last;
+        if (vs_now_ns() > deadline) return last;
+        Sleep(VLC_PREPARE_POLL_MS);
     }
 }
 

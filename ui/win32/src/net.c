@@ -10,7 +10,15 @@ _Static_assert(sizeof(SRWLOCK) == sizeof(void *), "SRWLOCK tient dans un pointeu
 
 #define SRW(field) ((PSRWLOCK)(void *)&(field))
 
-// ----------------------------------------------------------------- URL ---
+struct NetEvent {
+    NetEventKind kind;
+    u32 code;
+    isize len;
+    NetEvent *next;
+    u8 *data;
+};
+
+// ------------------------------------------------------------------- URL ---
 
 b32 net_parse_url(Str8 url, NetUrl *out) {
     memset(out, 0, sizeof(*out));
@@ -45,10 +53,10 @@ b32 net_parse_url(Str8 url, NetUrl *out) {
 
     Str8 host = authority;
     if (authority.data[0] == '[') {  // IPv6 littéral
-        isize close = str8_find_char(authority, ']', 0);
-        if (close < 0) return 0;
-        host = str8_sub(authority, 1, close - 1);
-        Str8 after = str8_sub(authority, close + 1, -1);
+        isize close_br = str8_find_char(authority, ']', 0);
+        if (close_br < 0) return 0;
+        host = str8_sub(authority, 1, close_br - 1);
+        Str8 after = str8_sub(authority, close_br + 1, -1);
         if (after.len > 0) {
             if (after.data[0] != ':') return 0;
             i64 p = 0;
@@ -73,48 +81,90 @@ b32 net_parse_url(Str8 url, NetUrl *out) {
     return 1;
 }
 
-// -------------------------------------------------------------- file SPSC ---
+// ---------------------------------------------------- file d'événements ---
+//
+// Nœuds de taille exacte dans une arène dédiée. L'arène n'est remise à zéro
+// que lorsque la file est vide (allocation/libération strictement FIFO) : rien
+// n'est jamais écrasé sous le consommateur, et la profondeur n'est plus
+// plafonnée à un nombre fixe de créneaux.
 
-static void queue_push(Net *n, NetEventKind kind, u32 code, const u8 *data, isize len) {
-    if (len > NET_MSG_MAX) len = NET_MSG_MAX;
-    AcquireSRWLockExclusive(SRW(n->lock));
-    isize next = (n->tail + 1) % NET_QUEUE_SLOTS;
-    if (next == n->head) {
-        n->dropped++;  // file pleine : la boucle principale est en retard
-        ReleaseSRWLockExclusive(SRW(n->lock));
-        return;
+// queue_push_locked suppose queue_lock tenu. Renvoie 0 si l'arène sature.
+static b32 queue_push_locked(Net *n, NetEventKind kind, u32 code, const u8 *data, isize len) {
+    isize need = (isize)sizeof(NetEvent) + len + 64;
+    if (arena_pos(n->queue_arena) + need > NET_QUEUE_ARENA - VS_KB(64)) return 0;
+    NetEvent *ev = arena_push_struct(n->queue_arena, NetEvent);
+    ev->kind = kind;
+    ev->code = code;
+    ev->len = len;
+    if (len > 0) {
+        ev->data = arena_push_array(n->queue_arena, u8, len);
+        if (data) memcpy(ev->data, data, (size_t)len);
     }
-    NetSlot *s = &n->slots[n->tail];
-    s->kind = kind;
-    s->code = code;
-    s->len = len;
-    if (len > 0 && data) memcpy(s->data, data, (size_t)len);
-    n->tail = next;
-    ReleaseSRWLockExclusive(SRW(n->lock));
+    if (n->tail) {
+        n->tail->next = ev;
+    } else {
+        n->head = ev;
+    }
+    n->tail = ev;
+    n->queued++;
+    return 1;
+}
+
+// queue_push est appelée par le thread réseau. En cas de saturation, elle
+// remonte une erreur explicite et demande l'arrêt : jamais de perte muette
+// d'un état autoritatif.
+static void queue_push(Net *n, NetEventKind kind, u32 code, const u8 *data, isize len) {
+    b32 saturated = 0;
+    AcquireSRWLockExclusive(SRW(n->queue_lock));
+    if (!queue_push_locked(n, kind, code, data, len)) {
+        // Dernière tentative sans charge utile : signaler la saturation.
+        if (!queue_push_locked(n, NET_EV_ERROR, NET_ERR_QUEUE_FULL, NULL, 0)) {
+            n->dropped++;  // file totalement bloquée : le consommateur est mort
+        }
+        saturated = 1;
+    }
+    ReleaseSRWLockExclusive(SRW(n->queue_lock));
+    if (saturated) InterlockedExchange(&n->stop, 1);
     if (n->wakeup) SetEvent((HANDLE)n->wakeup);
 }
 
 b32 net_poll(Net *n, NetSlot *out) {
     b32 got = 0;
-    AcquireSRWLockExclusive(SRW(n->lock));
-    if (n->head != n->tail) {
-        NetSlot *s = &n->slots[n->head];
-        out->kind = s->kind;
-        out->code = s->code;
-        out->len = s->len;
-        if (s->len > 0) memcpy(out->data, s->data, (size_t)s->len);
-        n->head = (n->head + 1) % NET_QUEUE_SLOTS;
+    AcquireSRWLockExclusive(SRW(n->queue_lock));
+    NetEvent *ev = n->head;
+    if (ev) {
+        out->kind = ev->kind;
+        out->code = ev->code;
+        out->len = VS_MIN(ev->len, (isize)NET_MSG_MAX);
+        if (out->len > 0) memcpy(out->data, ev->data, (size_t)out->len);
+        n->head = ev->next;
+        if (!n->head) {
+            n->tail = NULL;
+            arena_reset(n->queue_arena);  // file vide : mémoire récupérable
+        }
+        n->queued--;
         got = 1;
     }
-    ReleaseSRWLockExclusive(SRW(n->lock));
+    ReleaseSRWLockExclusive(SRW(n->queue_lock));
     return got;
 }
 
 void *net_wakeup_handle(Net *n) { return n->wakeup; }
 
-// ----------------------------------------------------------- thread réseau ---
+NetState net_state(Net *n) {
+    AcquireSRWLockShared(SRW(n->lock));
+    NetState s = n->state;
+    ReleaseSRWLockShared(SRW(n->lock));
+    return s;
+}
 
-static void net_teardown_handles(Net *n) {
+// --------------------------------------------------- handles sous verrou ---
+
+// close_handles_locked ferme et annule les handles WinHTTP. Fermer un handle
+// débloque immédiatement l'appel synchrone en cours du thread réseau. Les
+// pointeurs sont annulés dans la foulée : chaque handle est fermé une fois et
+// une seule, quel que soit le thread qui arrive le premier.
+static void close_handles_locked(Net *n) {
     if (n->websock) {
         WinHttpCloseHandle((HINTERNET)n->websock);
         n->websock = NULL;
@@ -133,87 +183,119 @@ static void net_teardown_handles(Net *n) {
     }
 }
 
+// publish tente de publier un handle fraîchement créé. Si l'arrêt a été
+// demandé entre-temps, le handle est fermé sur place et la fonction renvoie 0 :
+// aucun handle n'échappe au cycle de vie.
+static b32 publish(Net *n, void **slot, HINTERNET h) {
+    b32 ok = 0;
+    AcquireSRWLockExclusive(SRW(n->lock));
+    if (n->state == NET_STATE_CONNECTING && !InterlockedCompareExchange(&n->stop, 0, 0)) {
+        *slot = (void *)h;
+        ok = 1;
+    }
+    ReleaseSRWLockExclusive(SRW(n->lock));
+    if (!ok) WinHttpCloseHandle(h);
+    return ok;
+}
+
+// ---------------------------------------------------------- thread réseau ---
+
+static void thread_finish(Net *n) {
+    AcquireSRWLockExclusive(SRW(n->lock));
+    close_handles_locked(n);
+    n->state = NET_STATE_DEAD;
+    ReleaseSRWLockExclusive(SRW(n->lock));
+    if (n->wakeup) SetEvent((HANDLE)n->wakeup);
+}
+
 static DWORD WINAPI net_thread(LPVOID param) {
     Net *n = (Net *)param;
-    Arena *a = arena_create(VS_KB(256));
+    Arena *a = arena_create(VS_KB(512));
     if (!a) {
-        queue_push(n, NET_EV_ERROR, 0, NULL, 0);
-        InterlockedExchange(&n->running, 0);
+        queue_push(n, NET_EV_ERROR, NET_ERR_NO_MEMORY, NULL, 0);
+        thread_finish(n);
         return 1;
     }
 
     u16 *whost = utf8_to_utf16(a, str8_from_cstr(n->url.host), NULL);
     u16 *wpath = utf8_to_utf16(a, str8_from_cstr(n->url.path), NULL);
+    HINTERNET ws_local = NULL;
+    u8 *msg = NULL;
+    isize msg_len = 0;
+    b32 msg_overflow = 0;
 
-    HINTERNET session = WinHttpOpen(L"vibesync/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-                                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!session) {
+    HINTERNET h = WinHttpOpen(L"vibesync/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
+                              WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!h) {
         queue_push(n, NET_EV_ERROR, (u32)GetLastError(), NULL, 0);
         goto done;
     }
-    n->session = session;
-    {
-        DWORD tmo = 10000;
-        WinHttpSetTimeouts(session, (int)tmo, (int)tmo, (int)tmo, 0 /* réception : sans limite */);
-    }
+    // Réception sans limite : c'est la fermeture des handles qui débloque.
+    WinHttpSetTimeouts(h, 10000, 10000, 5000, 0);
+    if (!publish(n, &n->session, h)) goto done;
 
-    HINTERNET connect = WinHttpConnect(session, (LPCWSTR)whost, (INTERNET_PORT)n->url.port, 0);
-    if (!connect) {
+    h = WinHttpConnect((HINTERNET)n->session, (LPCWSTR)whost, (INTERNET_PORT)n->url.port, 0);
+    if (!h) {
         queue_push(n, NET_EV_ERROR, (u32)GetLastError(), NULL, 0);
         goto done;
     }
-    n->connect = connect;
+    if (!publish(n, &n->connect, h)) goto done;
 
-    DWORD flags = n->url.secure ? WINHTTP_FLAG_SECURE : 0;
-    HINTERNET request = WinHttpOpenRequest(connect, L"GET", (LPCWSTR)wpath, NULL, WINHTTP_NO_REFERER,
-                                           WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
-    if (!request) {
+    h = WinHttpOpenRequest((HINTERNET)n->connect, L"GET", (LPCWSTR)wpath, NULL, WINHTTP_NO_REFERER,
+                           WINHTTP_DEFAULT_ACCEPT_TYPES, n->url.secure ? WINHTTP_FLAG_SECURE : 0);
+    if (!h) {
         queue_push(n, NET_EV_ERROR, (u32)GetLastError(), NULL, 0);
         goto done;
     }
-    n->request = request;
+    if (!publish(n, &n->request, h)) goto done;
 
-    if (!WinHttpSetOption(request, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, NULL, 0)) {
+    if (!WinHttpSetOption(h, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, NULL, 0) ||
+        !WinHttpSendRequest(h, WINHTTP_NO_ADDITIONAL_HEADERS, 0, NULL, 0, 0, 0) ||
+        !WinHttpReceiveResponse(h, NULL)) {
         queue_push(n, NET_EV_ERROR, (u32)GetLastError(), NULL, 0);
         goto done;
     }
-    if (!WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, NULL, 0, 0, 0) ||
-        !WinHttpReceiveResponse(request, NULL)) {
+    h = WinHttpWebSocketCompleteUpgrade(h, 0);
+    if (!h) {
         queue_push(n, NET_EV_ERROR, (u32)GetLastError(), NULL, 0);
         goto done;
     }
-    HINTERNET ws = WinHttpWebSocketCompleteUpgrade(request, 0);
-    if (!ws) {
-        queue_push(n, NET_EV_ERROR, (u32)GetLastError(), NULL, 0);
-        goto done;
-    }
-    // Le handle de requête n'est plus utile une fois l'upgrade complété.
-    WinHttpCloseHandle(request);
-    n->request = NULL;
-    n->websock = ws;
+    if (!publish(n, &n->websock, h)) goto done;
+
+    // Copie locale du handle WebSocket : la réception se fait hors verrou.
+    // WinHTTP ne libère pas un handle tant qu'une opération est en cours, même
+    // si WinHttpCloseHandle a été appelé par le thread principal ; l'appel
+    // rend alors la main avec ERROR_WINHTTP_OPERATION_CANCELLED.
+    AcquireSRWLockExclusive(SRW(n->lock));
+    ws_local = (HINTERNET)n->websock;
+    if (ws_local) n->state = NET_STATE_OPEN;
+    ReleaseSRWLockExclusive(SRW(n->lock));
+    if (!ws_local) goto done;
+
     queue_push(n, NET_EV_CONNECTED, 0, NULL, 0);
 
     // Boucle de réception : réassemblage des fragments jusqu'au message complet.
-    u8 *msg = arena_push_array(a, u8, NET_MSG_MAX);
-    isize msg_len = 0;
-    b32 msg_overflow = 0;
-    u8 chunk[4096];
+    msg = arena_push_array(a, u8, NET_MSG_MAX);
     for (;;) {
         if (InterlockedCompareExchange(&n->stop, 0, 0)) break;
         DWORD got = 0;
         WINHTTP_WEB_SOCKET_BUFFER_TYPE type = WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE;
-        DWORD rc = WinHttpWebSocketReceive(ws, chunk, (DWORD)sizeof(chunk), &got, &type);
+        u8 chunk[8192];
+        DWORD rc = WinHttpWebSocketReceive(ws_local, chunk, (DWORD)sizeof(chunk), &got, &type);
         if (rc != NO_ERROR) {
-            if (!InterlockedCompareExchange(&n->stop, 0, 0)) {
-                queue_push(n, NET_EV_ERROR, (u32)rc, NULL, 0);
-            }
+            if (!InterlockedCompareExchange(&n->stop, 0, 0)) queue_push(n, NET_EV_ERROR, (u32)rc, NULL, 0);
             break;
         }
         if (type == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) {
             USHORT status = 0;
             u8 reason[WINHTTP_WEB_SOCKET_MAX_CLOSE_REASON_LENGTH];
             DWORD reason_len = 0;
-            WinHttpWebSocketQueryCloseStatus(ws, &status, reason, (DWORD)sizeof(reason), &reason_len);
+            AcquireSRWLockExclusive(SRW(n->lock));
+            if (n->websock) {
+                WinHttpWebSocketQueryCloseStatus((HINTERNET)n->websock, &status, reason, (DWORD)sizeof(reason),
+                                                 &reason_len);
+            }
+            ReleaseSRWLockExclusive(SRW(n->lock));
             queue_push(n, NET_EV_CLOSED, status, reason, (isize)reason_len);
             break;
         }
@@ -222,47 +304,63 @@ static DWORD WINAPI net_thread(LPVOID param) {
         b32 final = (type == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE ||
                      type == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE);
         if (msg_len + (isize)got > NET_MSG_MAX) {
-            msg_overflow = 1;  // message hors gabarit : on le jette proprement
+            msg_overflow = 1;  // message hors gabarit : refus explicite
         } else if (got > 0) {
             memcpy(msg + msg_len, chunk, (size_t)got);
             msg_len += (isize)got;
         }
         if (!final) continue;
         if (msg_overflow) {
-            queue_push(n, NET_EV_ERROR, (u32)ERROR_INSUFFICIENT_BUFFER, NULL, 0);
-        } else if (!binary) {  // le protocole vibesync est en texte JSON
-            queue_push(n, NET_EV_MESSAGE, 0, msg, msg_len);
+            queue_push(n, NET_EV_ERROR, NET_ERR_MSG_TOO_BIG, NULL, 0);
+            break;  // le flux n'est plus fiable : on ferme
         }
+        if (!binary) queue_push(n, NET_EV_MESSAGE, 0, msg, msg_len);  // protocole = texte JSON
         msg_len = 0;
         msg_overflow = 0;
     }
 
 done:
-    net_teardown_handles(n);
     arena_destroy(a);
-    InterlockedExchange(&n->running, 0);
-    if (n->wakeup) SetEvent((HANDLE)n->wakeup);
+    thread_finish(n);
     return 0;
 }
 
 // ------------------------------------------------------------------- API ---
 
-void net_init(Net *n) {
+b32 net_init(Net *n) {
     memset(n, 0, sizeof(*n));
     n->wakeup = (void *)CreateEventW(NULL, FALSE, FALSE, NULL);
+    n->queue_arena = arena_create(NET_QUEUE_ARENA);
+    if (!n->wakeup || !n->queue_arena) {
+        net_destroy(n);
+        return 0;
+    }
+    return 1;
 }
 
 b32 net_connect(Net *n, Str8 url) {
-    if (n->thread) return 0;  // déjà connecté
+    // Idempotence : toute connexion précédente est fermée ET jointe avant
+    // d'en démarrer une autre — il n'existe jamais deux threads réseau.
+    net_close(n);
+    if (!n->wakeup || !n->queue_arena) return 0;
     if (!net_parse_url(url, &n->url)) return 0;
-    if (!n->wakeup) n->wakeup = (void *)CreateEventW(NULL, FALSE, FALSE, NULL);
-    n->head = n->tail = 0;
-    n->dropped = 0;
+
+    AcquireSRWLockExclusive(SRW(n->queue_lock));
+    n->head = n->tail = NULL;
+    n->queued = 0;
+    arena_reset(n->queue_arena);
+    ReleaseSRWLockExclusive(SRW(n->queue_lock));
+
     InterlockedExchange(&n->stop, 0);
-    InterlockedExchange(&n->running, 1);
+    AcquireSRWLockExclusive(SRW(n->lock));
+    n->state = NET_STATE_CONNECTING;
+    ReleaseSRWLockExclusive(SRW(n->lock));
+
     HANDLE th = CreateThread(NULL, 0, net_thread, n, 0, NULL);
     if (!th) {
-        InterlockedExchange(&n->running, 0);
+        AcquireSRWLockExclusive(SRW(n->lock));
+        n->state = NET_STATE_DEAD;
+        ReleaseSRWLockExclusive(SRW(n->lock));
         return 0;
     }
     n->thread = (void *)th;
@@ -271,38 +369,44 @@ b32 net_connect(Net *n, Str8 url) {
 
 b32 net_send_text(Net *n, Str8 text) {
     if (text.len <= 0) return 1;
+    if (text.len > NET_MSG_MAX) return 0;
     b32 ok = 0;
-    AcquireSRWLockExclusive(SRW(n->send_lock));
-    HINTERNET ws = (HINTERNET)n->websock;
-    if (ws) {
-        DWORD rc = WinHttpWebSocketSend(ws, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, text.data,
-                                        (DWORD)text.len);
+    // L'envoi se fait SOUS le verrou des handles : une fermeture concurrente
+    // attend la fin de l'envoi, et un envoi ne peut pas voir un handle fermé.
+    AcquireSRWLockExclusive(SRW(n->lock));
+    if (n->state == NET_STATE_OPEN && n->websock) {
+        DWORD rc = WinHttpWebSocketSend((HINTERNET)n->websock, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
+                                        text.data, (DWORD)text.len);
         ok = (rc == NO_ERROR);
     }
-    ReleaseSRWLockExclusive(SRW(n->send_lock));
+    ReleaseSRWLockExclusive(SRW(n->lock));
     return ok;
 }
 
 void net_close(Net *n) {
     InterlockedExchange(&n->stop, 1);
-    AcquireSRWLockExclusive(SRW(n->send_lock));
-    HINTERNET ws = (HINTERNET)n->websock;
-    if (ws) {
-        // Fermeture applicative puis fermeture du handle : le Receive bloqué
-        // du thread réseau rend la main immédiatement.
-        WinHttpWebSocketClose(ws, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, NULL, 0);
+
+    AcquireSRWLockExclusive(SRW(n->lock));
+    if (n->state != NET_STATE_DEAD) n->state = NET_STATE_CLOSING;
+    if (n->websock) {
+        // Trame de fermeture applicative (n'attend pas la réponse du pair),
+        // puis fermeture des handles : la réception bloquée rend la main.
+        WinHttpWebSocketShutdown((HINTERNET)n->websock, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, NULL, 0);
     }
-    ReleaseSRWLockExclusive(SRW(n->send_lock));
+    close_handles_locked(n);
+    ReleaseSRWLockExclusive(SRW(n->lock));
+
+    // Join SANS timeout : rien n'est libéré tant que le thread réseau vit.
     if (n->thread) {
-        if (WaitForSingleObject((HANDLE)n->thread, 3000) == WAIT_TIMEOUT) {
-            // Dernier recours : fermer les handles réveille la réception.
-            net_teardown_handles(n);
-            WaitForSingleObject((HANDLE)n->thread, 2000);
-        }
+        WaitForSingleObject((HANDLE)n->thread, INFINITE);
         CloseHandle((HANDLE)n->thread);
         n->thread = NULL;
     }
-    net_teardown_handles(n);
+
+    AcquireSRWLockExclusive(SRW(n->lock));
+    close_handles_locked(n);  // filet : un handle publié en course est fermé
+    n->state = NET_STATE_DEAD;
+    ReleaseSRWLockExclusive(SRW(n->lock));
 }
 
 void net_destroy(Net *n) {
@@ -311,4 +415,10 @@ void net_destroy(Net *n) {
         CloseHandle((HANDLE)n->wakeup);
         n->wakeup = NULL;
     }
+    if (n->queue_arena) {
+        arena_destroy(n->queue_arena);
+        n->queue_arena = NULL;
+    }
+    n->head = n->tail = NULL;
+    n->queued = 0;
 }

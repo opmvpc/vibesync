@@ -49,3 +49,48 @@ Smoke test réel contre le serveur Go local : upgrade wss/ws, `welcome`, ping/po
 `name_taken` fatal, fermeture propre.
 
 **Taille** : `vibesync.exe` release = **64 512 octets** (63 Ko) ; tests 381 Ko.
+
+## Post-review sol
+
+Les 11 findings de la revue sécurité mémoire sont corrigés dans `ui/win32/`.
+
+**Bloquants (concurrence `net.c`)**. Cycle de vie explicite
+DEAD→CONNECTING→OPEN→CLOSING→DEAD, et **tout** accès aux handles WinHTTP
+(création, publication, envoi, destruction) sous un seul SRWLOCK ; seule la
+réception bloque hors verrou, sur une copie locale que WinHTTP maintient vivante
+le temps de l'opération. `net_close` ferme les handles (ce qui débloque la
+réception) **puis** joint le thread **sans timeout** — plus rien n'est libéré
+tant que le thread vit — et `net_connect` ferme/joint d'abord : jamais deux
+threads réseau. `publish()` referme sur place un handle créé pendant un arrêt.
+
+**Majeurs**. File d'événements dynamique (nœuds de taille exacte en arène
+dédiée, remise à zéro à vide) : plus de créneaux fixes, plus de perte muette ;
+saturation → `NET_ERR_QUEUE_FULL` + fermeture. JSON : budget de 100 000 valeurs
+et refus au-delà des 3/4 de l'arène (`JSON_ERR_BUDGET`, plus de `vs_fatal`) ;
+clé dupliquée = **la dernière gagne**, comme `encoding/json`. `protocol.c` exige
+présence **et** type des champs obligatoires (`m->invalid`), et borne les
+horodatages à [1970, 2100] ; `engine.c` re-vérifie ces bornes (défense en
+profondeur contre le débordement signé de l'offset). `main.c` passe à
+`wmain`/`-municode`.
+
+**Mineurs**. VLC arrêté (pas d'orphelin) si l'authentification ou le démarrage
+échoue ; `sizeBytes` réel via `GetFileAttributesExW` ; chemins de `build.bat`
+entre guillemets (build vérifié depuis un dossier contenant des espaces).
+
+**Spec (test réel double-VLC)**. `vlc_prepare_paused` force pause + position 0
+et n'accepte le média qu'une fois l'état « en pause » **observé** (port de
+`internal/vlc.Prepare` : tolérance 0,5 s, scrutation 20 ms, idempotent).
+`engine.c` cale la position **avant** de jouer sur une transition pause→lecture
+(seek si écart ≥ 0,3 s) — l'ordre `seek` puis `resume` correspond au vecteur 08
+régénéré.
+
+**QA**. `build.bat test` et `build.bat asan` : **973 vérifications, 0 échec**,
+12/12 vecteurs conformes. Nouveaux harnais sans aucune dépendance : un **mini
+serveur WebSocket** (handshake RFC 6455 + SHA-1 maison) et un **faux VLC HTTP**,
+tous deux sur Winsock. Ils couvrent : 3 cycles connexion/envoi/écho/fermeture,
+**100 itérations de fermeture concurrente d'un envoi** (le scénario du bloquant
+nº 2), coupure serveur, saturation de file (125 messages puis erreur explicite,
+0 perte), Basic auth, réponses *chunked*, préparation pause+0 et son
+idempotence. Vérifié en réel : pseudo et salle accentués intacts côté serveur
+(`room=salle-été`, `name=Thibault-Éloïse`), et reconnexion automatique après
+redémarrage du serveur. Release : **66 560 octets**.

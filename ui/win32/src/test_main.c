@@ -15,6 +15,8 @@
 #include "vlc.h"
 
 #define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 
 #include <stdarg.h>
@@ -292,6 +294,41 @@ static void test_json(Arena *a) {
         CHECK(json_get_i64(json_at(v, 4999), "k", -1) == 4999, "dernier élément");
     }
 
+    // Budget : un document dense doit être refusé proprement, pas épuiser
+    // l'arène (vs_fatal tuerait le process sur une entrée hostile).
+    {
+        Builder dense;
+        builder_init(&dense, a, VS_MB(2));
+        builder_cstr(&dense, "[");
+        for (int i = 0; i < JSON_MAX_VALUES + 100; i++) {
+            if (i) builder_cstr(&dense, ",");
+            builder_cstr(&dense, "0");
+        }
+        builder_cstr(&dense, "]");
+        JsonError err = JSON_OK;
+        CHECK(json_parse(a, builder_result(&dense), &err) == NULL && err == JSON_ERR_BUDGET,
+              "budget de valeurs non appliqué (%s)", json_error_text(err));
+    }
+    // Budget mémoire : une petite arène refuse au lieu d'exploser.
+    {
+        Arena *small = arena_create(VS_KB(256));
+        CHECK(small != NULL, "arène de test");
+        if (small) {
+            Builder dense;
+            builder_init(&dense, a, VS_KB(512));
+            builder_cstr(&dense, "[");
+            for (int i = 0; i < 20000; i++) {
+                if (i) builder_cstr(&dense, ",");
+                builder_cstr(&dense, "{\"k\":1}");
+            }
+            builder_cstr(&dense, "]");
+            JsonError err = JSON_OK;
+            CHECK(json_parse(small, builder_result(&dense), &err) == NULL && err == JSON_ERR_BUDGET,
+                  "budget d'arène non appliqué (%s)", json_error_text(err));
+            arena_destroy(small);
+        }
+    }
+
     // Accès tolérants au NULL / aux mauvais types.
     {
         JsonValue *v = json_parse(a, S("{\"a\":1,\"b\":\"x\"}"), NULL);
@@ -437,9 +474,50 @@ static void test_protocol(Arena *a) {
         CHECK(proto_decode(a, S("pas du json")) == NULL, "JSON invalide accepté");
         CHECK(proto_decode(a, S("{\"data\":{}}")) == NULL, "enveloppe sans type acceptée");
         CHECK(proto_decode(a, S("[]")) == NULL, "enveloppe non-objet acceptée");
-        // data absent : ne doit pas crasher.
+        // data absent ou champs obligatoires manquants : message invalidé,
+        // jamais transformé en zéros silencieux.
         m = proto_decode(a, S("{\"type\":\"welcome\"}"));
-        CHECK(m && m->kind == VS_IN_WELCOME && m->user_count == 0, "welcome sans data");
+        CHECK(m && m->kind == VS_IN_UNKNOWN && m->invalid, "welcome sans data accepté");
+        m = proto_decode(a, S("{\"type\":\"welcome\",\"data\":{\"selfId\":\"u1\"}}"));
+        CHECK(m && m->invalid, "welcome sans state accepté");
+        m = proto_decode(a, S("{\"type\":\"pong\",\"data\":{}}"));
+        CHECK(m && m->kind == VS_IN_UNKNOWN && m->invalid, "pong vide accepté (devenait t=0)");
+        m = proto_decode(a, S("{\"type\":\"pong\",\"data\":{\"t\":\"10\",\"serverMs\":20}}"));
+        CHECK(m && m->invalid, "pong avec t textuel accepté");
+        m = proto_decode(a, S("{\"type\":\"pong\",\"data\":{\"t\":10,\"serverMs\":9e18}}"));
+        CHECK(m && m->invalid, "pong avec serverMs hors bornes accepté");
+        m = proto_decode(a, S("{\"type\":\"pong\",\"data\":{\"t\":-5,\"serverMs\":20}}"));
+        CHECK(m && m->invalid, "pong avec t négatif accepté");
+        m = proto_decode(a, S("{\"type\":\"roomState\",\"data\":{\"paused\":false,\"positionSec\":1,"
+                              "\"rate\":1}}"));
+        CHECK(m && m->invalid, "roomState en lecture sans refServerMs accepté");
+        m = proto_decode(a, S("{\"type\":\"roomState\",\"data\":{\"paused\":true,\"positionSec\":1,"
+                              "\"rate\":1}}"));
+        CHECK(m && m->kind == VS_IN_ROOMSTATE, "roomState en pause sans refServerMs refusé");
+        m = proto_decode(a, S("{\"type\":\"error\",\"data\":{}}"));
+        CHECK(m && m->invalid, "erreur sans code acceptée");
+        m = proto_decode(a, S("{\"type\":\"chatEvent\",\"data\":{\"from\":\"a\"}}"));
+        CHECK(m && m->invalid, "chatEvent sans texte accepté");
+
+        // Clés dupliquées : la dernière gagne (encoding/json en Go). Un
+        // roomState piégé doit produire le même état chez tous les clients.
+        m = proto_decode(a, S("{\"type\":\"roomState\",\"data\":{\"paused\":true,\"positionSec\":10,"
+                              "\"rate\":1,\"positionSec\":42}}"));
+        CHECK(m && m->kind == VS_IN_ROOMSTATE && m->state.position_sec == 42,
+              "clé dupliquée : %f au lieu de 42", m ? m->state.position_sec : -1);
+        JsonValue *dup = json_parse(a, S("{\"a\":1,\"b\":2,\"a\":3}"), NULL);
+        CHECK(json_get_num(dup, "a", 0) == 3, "json_get doit rendre la dernière occurrence");
+
+        // Un pong hors bornes ne doit pas empoisonner l'offset d'horloge.
+        VsEngine e;
+        engine_init(&e);
+        i64 now = 1785960000000LL * 1000000LL;
+        VsPong bad = {INT64_MIN, INT64_MAX};
+        engine_on_pong(&e, now, bad);
+        CHECK(!e.have_offset && e.offset_ms == 0, "pong aberrant accepté par le moteur");
+        VsPong good = {vs_ns_to_unix_ms(now), vs_ns_to_unix_ms(now) + 30};
+        engine_on_pong(&e, now, good);
+        CHECK(e.have_offset && e.offset_ms == 30, "pong valide refusé (%lld)", (long long)e.offset_ms);
     }
 
     temp_end(top);
@@ -560,6 +638,753 @@ static void test_vlc(Arena *a) {
     temp_end(top);
 }
 
+// ------------------------------------------- mini serveur WebSocket local ---
+//
+// Serveur RFC 6455 minimal (handshake + trames texte) pour exercer net.c pour
+// de vrai : cycle connexion/envoi/réception/fermeture, saturation de la file,
+// et surtout arrêt CONCURRENT d'un envoi — le scénario des deux bloquants de
+// la revue. Aucune dépendance : Winsock + SHA-1 maison.
+
+typedef struct {
+    u32 h[5];
+    u64 bits;
+    u8 buf[64];
+    isize buf_len;
+} Sha1;
+
+static u32 rol32(u32 v, int n) { return (v << n) | (v >> (32 - n)); }
+
+static void sha1_block(Sha1 *s, const u8 *p) {
+    u32 w[80];
+    for (int i = 0; i < 16; i++) {
+        w[i] = ((u32)p[i * 4] << 24) | ((u32)p[i * 4 + 1] << 16) | ((u32)p[i * 4 + 2] << 8) | p[i * 4 + 3];
+    }
+    for (int i = 16; i < 80; i++) w[i] = rol32(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+    u32 a1 = s->h[0], b1 = s->h[1], c1 = s->h[2], d1 = s->h[3], e1 = s->h[4];
+    for (int i = 0; i < 80; i++) {
+        u32 f, k;
+        if (i < 20) {
+            f = (b1 & c1) | (~b1 & d1);
+            k = 0x5a827999u;
+        } else if (i < 40) {
+            f = b1 ^ c1 ^ d1;
+            k = 0x6ed9eba1u;
+        } else if (i < 60) {
+            f = (b1 & c1) | (b1 & d1) | (c1 & d1);
+            k = 0x8f1bbcdcu;
+        } else {
+            f = b1 ^ c1 ^ d1;
+            k = 0xca62c1d6u;
+        }
+        u32 tmp = rol32(a1, 5) + f + e1 + k + w[i];
+        e1 = d1;
+        d1 = c1;
+        c1 = rol32(b1, 30);
+        b1 = a1;
+        a1 = tmp;
+    }
+    s->h[0] += a1;
+    s->h[1] += b1;
+    s->h[2] += c1;
+    s->h[3] += d1;
+    s->h[4] += e1;
+}
+
+static void sha1_init(Sha1 *s) {
+    s->h[0] = 0x67452301u;
+    s->h[1] = 0xefcdab89u;
+    s->h[2] = 0x98badcfeu;
+    s->h[3] = 0x10325476u;
+    s->h[4] = 0xc3d2e1f0u;
+    s->bits = 0;
+    s->buf_len = 0;
+}
+
+static void sha1_update(Sha1 *s, const u8 *data, isize len) {
+    s->bits += (u64)len * 8;
+    while (len > 0) {
+        isize take = VS_MIN(64 - s->buf_len, len);
+        memcpy(s->buf + s->buf_len, data, (size_t)take);
+        s->buf_len += take;
+        data += take;
+        len -= take;
+        if (s->buf_len == 64) {
+            sha1_block(s, s->buf);
+            s->buf_len = 0;
+        }
+    }
+}
+
+static void sha1_final(Sha1 *s, u8 out[20]) {
+    u64 bits = s->bits;
+    u8 pad = 0x80;
+    sha1_update(s, &pad, 1);
+    u8 zero = 0;
+    while (s->buf_len != 56) sha1_update(s, &zero, 1);
+    u8 len_be[8];
+    for (int i = 0; i < 8; i++) len_be[i] = (u8)(bits >> (56 - 8 * i));
+    s->bits = bits;  // sha1_update ci-dessous ne doit pas fausser le compte
+    sha1_update(s, len_be, 8);
+    for (int i = 0; i < 5; i++) {
+        out[i * 4] = (u8)(s->h[i] >> 24);
+        out[i * 4 + 1] = (u8)(s->h[i] >> 16);
+        out[i * 4 + 2] = (u8)(s->h[i] >> 8);
+        out[i * 4 + 3] = (u8)s->h[i];
+    }
+}
+
+typedef struct {
+    SOCKET listener;
+    int port;
+    HANDLE thread;
+    volatile long stop;
+    volatile long accepted;
+    volatile long received;
+    volatile long echo;        // renvoyer chaque message reçu
+    volatile long flood;       // nombre de messages à pousser dès la connexion
+    volatile long flood_size;  // taille de chaque message poussé
+    volatile long drop_after;  // fermer brutalement après N messages reçus
+} MiniWs;
+
+static b32 sock_send_all(SOCKET s, const u8 *data, isize len) {
+    isize sent = 0;
+    while (sent < len) {
+        int n = send(s, (const char *)data + sent, (int)(len - sent), 0);
+        if (n <= 0) return 0;
+        sent += n;
+    }
+    return 1;
+}
+
+static b32 sock_recv_exact(SOCKET s, u8 *out, isize len) {
+    isize got = 0;
+    while (got < len) {
+        int n = recv(s, (char *)out + got, (int)(len - got), 0);
+        if (n <= 0) return 0;
+        got += n;
+    }
+    return 1;
+}
+
+static b32 ws_send_text_frame(SOCKET s, const u8 *data, isize len) {
+    u8 hdr[10];
+    isize n = 0;
+    hdr[0] = 0x81;  // FIN + texte
+    if (len < 126) {
+        hdr[1] = (u8)len;
+        n = 2;
+    } else if (len <= 0xffff) {
+        hdr[1] = 126;
+        hdr[2] = (u8)(len >> 8);
+        hdr[3] = (u8)len;
+        n = 4;
+    } else {
+        hdr[1] = 127;
+        for (int i = 0; i < 8; i++) hdr[2 + i] = (u8)((u64)len >> (56 - 8 * i));
+        n = 10;
+    }
+    if (!sock_send_all(s, hdr, n)) return 0;
+    return sock_send_all(s, data, len);
+}
+
+// ws_recv_frame lit une trame masquée du client. opcode reçoit l'opcode.
+static b32 ws_recv_frame(SOCKET s, u8 *out, isize cap, isize *out_len, int *opcode) {
+    u8 h[2];
+    if (!sock_recv_exact(s, h, 2)) return 0;
+    *opcode = h[0] & 0x0f;
+    b32 masked = (h[1] & 0x80) != 0;
+    u64 len = h[1] & 0x7f;
+    if (len == 126) {
+        u8 e[2];
+        if (!sock_recv_exact(s, e, 2)) return 0;
+        len = ((u64)e[0] << 8) | e[1];
+    } else if (len == 127) {
+        u8 e[8];
+        if (!sock_recv_exact(s, e, 8)) return 0;
+        len = 0;
+        for (int i = 0; i < 8; i++) len = (len << 8) | e[i];
+    }
+    u8 mask[4] = {0, 0, 0, 0};
+    if (masked && !sock_recv_exact(s, mask, 4)) return 0;
+    if (len > (u64)cap) return 0;
+    if (len > 0 && !sock_recv_exact(s, out, (isize)len)) return 0;
+    if (masked) {
+        for (u64 i = 0; i < len; i++) out[i] ^= mask[i & 3];
+    }
+    *out_len = (isize)len;
+    return 1;
+}
+
+static b32 ws_handshake(SOCKET s, Arena *a) {
+    u8 req[4096];
+    isize len = 0;
+    for (;;) {
+        if (len >= (isize)sizeof(req)) return 0;
+        int n = recv(s, (char *)req + len, (int)(sizeof(req) - (size_t)len), 0);
+        if (n <= 0) return 0;
+        len += n;
+        if (len >= 4 && memcmp(req + len - 4, "\r\n\r\n", 4) == 0) break;
+    }
+    Str8 head = str8(req, len);
+    Str8 tag = str8_lit("Sec-WebSocket-Key:");
+    isize at = -1;
+    for (isize i = 0; i + tag.len <= head.len; i++) {
+        if (memcmp(head.data + i, tag.data, (size_t)tag.len) == 0) {
+            at = i + tag.len;
+            break;
+        }
+    }
+    if (at < 0) return 0;
+    isize end = at;
+    while (end < head.len && head.data[end] != '\r' && head.data[end] != '\n') end++;
+    Str8 key = str8_trim(str8_sub(head, at, end - at));
+
+    Str8 magic = str8_lit("258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    Sha1 sh;
+    sha1_init(&sh);
+    sha1_update(&sh, key.data, key.len);
+    sha1_update(&sh, magic.data, magic.len);
+    u8 digest[20];
+    sha1_final(&sh, digest);
+    char accept[64];
+    base64_encode(digest, 20, accept, (isize)sizeof(accept));
+
+    Builder resp;
+    builder_init(&resp, a, 256);
+    builder_cstr(&resp, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n");
+    builder_cstr(&resp, "Sec-WebSocket-Accept: ");
+    builder_cstr(&resp, accept);
+    builder_cstr(&resp, "\r\n\r\n");
+    Str8 out = builder_result(&resp);
+    return sock_send_all(s, out.data, out.len);
+}
+
+static DWORD WINAPI mini_ws_thread(LPVOID param) {
+    MiniWs *srv = (MiniWs *)param;
+    Arena *a = arena_create(VS_MB(2));
+    if (!a) return 1;
+    while (!InterlockedCompareExchange(&srv->stop, 0, 0)) {
+        SOCKET c = accept(srv->listener, NULL, NULL);
+        if (c == INVALID_SOCKET) break;
+        InterlockedIncrement(&srv->accepted);
+        isize mark = arena_pos(a);
+        if (!ws_handshake(c, a)) {
+            closesocket(c);
+            arena_pop_to(a, mark);
+            continue;
+        }
+        long flood = InterlockedCompareExchange(&srv->flood, 0, 0);
+        if (flood > 0) {
+            long size = InterlockedCompareExchange(&srv->flood_size, 0, 0);
+            if (size < 16) size = 16;
+            u8 *payload = arena_push_array(a, u8, size);
+            memset(payload, 'x', (size_t)size);
+            payload[0] = '{';
+            payload[size - 1] = '}';
+            for (long i = 0; i < flood; i++) {
+                if (!ws_send_text_frame(c, payload, size)) break;
+            }
+        }
+        u8 *buf = arena_push_array(a, u8, VS_KB(128));
+        for (;;) {
+            if (InterlockedCompareExchange(&srv->stop, 0, 0)) break;
+            isize n = 0;
+            int opcode = 0;
+            if (!ws_recv_frame(c, buf, VS_KB(128), &n, &opcode)) break;
+            if (opcode == 0x8) break;  // close
+            if (opcode != 0x1 && opcode != 0x2 && opcode != 0x0) continue;
+            long count = InterlockedIncrement(&srv->received);
+            long drop = InterlockedCompareExchange(&srv->drop_after, 0, 0);
+            if (drop > 0 && count >= drop) break;  // fermeture brutale
+            if (InterlockedCompareExchange(&srv->echo, 0, 0)) {
+                if (!ws_send_text_frame(c, buf, n)) break;
+            }
+        }
+        closesocket(c);
+        arena_pop_to(a, mark);
+    }
+    arena_destroy(a);
+    return 0;
+}
+
+static b32 mini_ws_start(MiniWs *srv) {
+    memset(srv, 0, sizeof(*srv));
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+    srv->listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (srv->listener == INVALID_SOCKET) return 0;
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (bind(srv->listener, (struct sockaddr *)&addr, sizeof(addr)) != 0) return 0;
+    int alen = (int)sizeof(addr);
+    if (getsockname(srv->listener, (struct sockaddr *)&addr, &alen) != 0) return 0;
+    srv->port = ntohs(addr.sin_port);
+    if (listen(srv->listener, 8) != 0) return 0;
+    srv->thread = CreateThread(NULL, 0, mini_ws_thread, srv, 0, NULL);
+    return srv->thread != NULL;
+}
+
+static void mini_ws_stop(MiniWs *srv) {
+    InterlockedExchange(&srv->stop, 1);
+    if (srv->listener != INVALID_SOCKET) {
+        closesocket(srv->listener);
+        srv->listener = INVALID_SOCKET;
+    }
+    if (srv->thread) {
+        WaitForSingleObject(srv->thread, 5000);
+        CloseHandle(srv->thread);
+        srv->thread = NULL;
+    }
+}
+
+static Str8 mini_ws_url(Arena *a, const MiniWs *srv) {
+    Builder b;
+    builder_init(&b, a, 64);
+    builder_cstr(&b, "ws://127.0.0.1:");
+    builder_i64(&b, srv->port);
+    builder_cstr(&b, "/ws");
+    return builder_result(&b);
+}
+
+// wait_event attend un événement précis (ms max) en vidant la file.
+static b32 wait_event(Net *net, NetSlot *slot, NetEventKind want, int timeout_ms) {
+    i64 deadline = vs_now_ns() + (i64)timeout_ms * 1000000LL;
+    for (;;) {
+        while (net_poll(net, slot)) {
+            if (slot->kind == want) return 1;
+            if (slot->kind == NET_EV_ERROR || slot->kind == NET_EV_CLOSED) {
+                if (want != NET_EV_ERROR && want != NET_EV_CLOSED) return 0;
+            }
+        }
+        if (vs_now_ns() > deadline) return 0;
+        HANDLE h = (HANDLE)net_wakeup_handle(net);
+        if (h) WaitForSingleObject(h, 20);
+        else Sleep(5);
+    }
+}
+
+typedef struct {
+    Net *net;
+    volatile long stop;
+    volatile long sent;
+} Spammer;
+
+// spam_thread martèle net_send_text pendant que le thread principal ferme :
+// c'est le scénario de course « fermeture serveur pendant un envoi ».
+static DWORD WINAPI spam_thread(LPVOID param) {
+    Spammer *sp = (Spammer *)param;
+    Str8 msg = str8_lit("{\"type\":\"ping\",\"data\":{\"t\":1785960000000}}");
+    while (!InterlockedCompareExchange(&sp->stop, 0, 0)) {
+        if (net_send_text(sp->net, msg)) InterlockedIncrement(&sp->sent);
+    }
+    return 0;
+}
+
+static void test_net_live(Arena *a) {
+    section("net (cycle réel)");
+    TempArena top = temp_begin(a);
+    MiniWs srv;
+    if (!mini_ws_start(&srv)) {
+        failf("mini serveur WebSocket indisponible");
+        temp_end(top);
+        return;
+    }
+    InterlockedExchange(&srv.echo, 1);
+    Str8 url = mini_ws_url(a, &srv);
+    Net *net = arena_push_struct(a, Net);
+    NetSlot *slot = arena_push_struct(a, NetSlot);
+
+    CHECK(net_init(net), "net_init");
+
+    // 1. Trois cycles connexion → envoi → écho → fermeture : pas de second
+    //    thread réseau, pas de handle qui fuit, reconnexion propre.
+    for (int cycle = 0; cycle < 3; cycle++) {
+        CHECK(net_connect(net, url), "cycle %d : net_connect", cycle);
+        CHECK(wait_event(net, slot, NET_EV_CONNECTED, 5000), "cycle %d : pas de NET_EV_CONNECTED", cycle);
+        CHECK(net_state(net) == NET_STATE_OPEN, "cycle %d : état != OPEN", cycle);
+        Str8 msg = str8_lit("{\"type\":\"hello\",\"data\":{\"version\":1}}");
+        CHECK(net_send_text(net, msg), "cycle %d : envoi", cycle);
+        CHECK(wait_event(net, slot, NET_EV_MESSAGE, 5000), "cycle %d : pas d'écho", cycle);
+        CHECK(slot->len == msg.len && memcmp(slot->data, msg.data, (size_t)msg.len) == 0,
+              "cycle %d : écho altéré (%lld octets)", cycle, (long long)slot->len);
+        net_close(net);
+        CHECK(net_state(net) == NET_STATE_DEAD, "cycle %d : état != DEAD après close", cycle);
+        CHECK(!net_send_text(net, msg), "cycle %d : envoi accepté après fermeture", cycle);
+    }
+    CHECK(srv.accepted == 3, "%ld connexions acceptées, attendu 3", (long)srv.accepted);
+
+    // 2. Fermeture CONCURRENTE d'un envoi, 100 itérations : c'est le scénario
+    //    du bloquant nº2 (data race / double close sur les handles WinHTTP).
+    {
+        int stress = 100;
+        int connected = 0;
+        for (int i = 0; i < stress; i++) {
+            if (!net_connect(net, url)) continue;
+            Spammer sp;
+            memset(&sp, 0, sizeof(sp));
+            sp.net = net;
+            HANDLE th = CreateThread(NULL, 0, spam_thread, &sp, 0, NULL);
+            if (wait_event(net, slot, NET_EV_CONNECTED, 3000)) connected++;
+            Sleep(i % 3);  // fenêtres de course variées
+            net_close(net);
+            InterlockedExchange(&sp.stop, 1);
+            if (th) {
+                WaitForSingleObject(th, 5000);
+                CloseHandle(th);
+            }
+            CHECK(net_state(net) == NET_STATE_DEAD, "stress %d : état != DEAD", i);
+            while (net_poll(net, slot)) { /* vidange */ }
+        }
+        CHECK(connected > stress / 2, "seulement %d/%d connexions établies sous stress", connected, stress);
+        printf("  stress fermeture/envoi : %d itérations, %d connectées\n", stress, connected);
+    }
+
+    // 3. Fermeture brutale par le serveur : la perte est signalée, jamais tue.
+    {
+        InterlockedExchange(&srv.drop_after, 1);
+        CHECK(net_connect(net, url), "connexion pour fermeture brutale");
+        if (wait_event(net, slot, NET_EV_CONNECTED, 5000)) {
+            net_send_text(net, str8_lit("{\"type\":\"ping\",\"data\":{\"t\":1}}"));
+            b32 signaled = 0;
+            i64 deadline = vs_now_ns() + 5000LL * 1000000LL;
+            while (vs_now_ns() < deadline && !signaled) {
+                while (net_poll(net, slot)) {
+                    if (slot->kind == NET_EV_ERROR || slot->kind == NET_EV_CLOSED) signaled = 1;
+                }
+                Sleep(10);
+            }
+            CHECK(signaled, "coupure serveur non remontée");
+        }
+        net_close(net);
+        InterlockedExchange(&srv.drop_after, 0);
+    }
+
+    net_destroy(net);
+    mini_ws_stop(&srv);
+    temp_end(top);
+}
+
+static void test_net_queue_saturation(Arena *a) {
+    section("net (saturation de file)");
+    TempArena top = temp_begin(a);
+    MiniWs srv;
+    if (!mini_ws_start(&srv)) {
+        failf("mini serveur WebSocket indisponible");
+        temp_end(top);
+        return;
+    }
+    // Beaucoup plus que ce que l'arène de file peut contenir : le consommateur
+    // ne vide rien pendant ce temps.
+    InterlockedExchange(&srv.flood_size, 32768);
+    InterlockedExchange(&srv.flood, 400);
+    Str8 url = mini_ws_url(a, &srv);
+    Net *net = arena_push_struct(a, Net);
+    NetSlot *slot = arena_push_struct(a, NetSlot);
+    CHECK(net_init(net), "net_init");
+    CHECK(net_connect(net, url), "net_connect");
+
+    Sleep(1500);  // le serveur inonde, personne ne consomme
+
+    isize messages = 0, errors = 0, queue_full = 0;
+    while (net_poll(net, slot)) {
+        if (slot->kind == NET_EV_MESSAGE) {
+            messages++;
+            // Aucune troncature silencieuse : les messages restent entiers.
+            CHECK(slot->len == 32768, "message tronqué (%lld octets)", (long long)slot->len);
+            if (slot->len == 32768) {
+                CHECK(slot->data[0] == '{' && slot->data[slot->len - 1] == '}', "message corrompu");
+            }
+        } else if (slot->kind == NET_EV_ERROR) {
+            errors++;
+            if (slot->code == NET_ERR_QUEUE_FULL) queue_full++;
+        }
+    }
+    printf("  %lld messages reçus, %lld erreurs (dont %lld saturation)\n", (long long)messages,
+           (long long)errors, (long long)queue_full);
+    CHECK(messages > 50, "file trop petite : seulement %lld messages avant saturation", (long long)messages);
+    CHECK(queue_full > 0, "saturation non signalée explicitement");
+    CHECK(net->dropped == 0, "%lld événement(s) perdus silencieusement", (long long)net->dropped);
+
+    net_destroy(net);
+    mini_ws_stop(&srv);
+    temp_end(top);
+}
+
+// --------------------------------------------- faux VLC HTTP (sur socket) ---
+//
+// Sert /requests/status.json comme le vrai VLC, pour exercer le chemin réseau
+// de vlc.c (Basic auth, commandes, réponses chunked) et la préparation
+// pause+seek 0 exigée par docs/protocol.md §Chargement de fichier.
+
+typedef struct {
+    SOCKET listener;
+    int port;
+    HANDLE thread;
+    volatile long stop;
+    volatile long requests;
+    volatile long chunked;  // répondre en Transfer-Encoding: chunked
+    char password[64];
+    // état simulé, protégé par le verrou
+    SRWLOCK lock;
+    const char *state;
+    f64 pos;
+    f64 length;
+    f64 rate;
+} FakeVlcHttp;
+
+static void fake_http_body(FakeVlcHttp *srv, Arena *a, Str8 *out) {
+    JsonWriter w;
+    jw_init(&w, a);
+    jw_obj_begin(&w);
+    jw_key(&w, "state");
+    jw_cstr(&w, srv->state);
+    jw_kv_num(&w, "length", srv->length);
+    jw_kv_num(&w, "time", (f64)(i64)srv->pos);
+    jw_kv_num(&w, "rate", srv->rate);
+    jw_kv_num(&w, "position", srv->length > 0 ? srv->pos / srv->length : 0);
+    jw_key(&w, "information");
+    jw_obj_begin(&w);
+    jw_key(&w, "category");
+    jw_obj_begin(&w);
+    jw_key(&w, "meta");
+    jw_obj_begin(&w);
+    jw_kv_str(&w, "filename", str8_lit("ep1.mkv"));
+    jw_obj_end(&w);
+    jw_obj_end(&w);
+    jw_obj_end(&w);
+    jw_obj_end(&w);
+    *out = jw_result(&w);
+}
+
+// fake_http_apply exécute la commande portée par la query.
+static void fake_http_apply(FakeVlcHttp *srv, Str8 query) {
+    Str8 cmd = str8_lit("");
+    Str8 val = str8_lit("");
+    isize i = 0;
+    while (i < query.len) {
+        isize amp = str8_find_char(query, '&', i);
+        Str8 pair = str8_sub(query, i, (amp < 0 ? query.len : amp) - i);
+        isize eq = str8_find_char(pair, '=', 0);
+        if (eq > 0) {
+            Str8 k = str8_sub(pair, 0, eq);
+            Str8 v = str8_sub(pair, eq + 1, -1);
+            if (str8_eq_cstr(k, "command")) cmd = v;
+            else if (str8_eq_cstr(k, "val")) val = v;
+        }
+        if (amp < 0) break;
+        i = amp + 1;
+    }
+    if (cmd.len == 0) return;
+    if (str8_eq_cstr(cmd, "pl_forcepause")) {
+        if (strcmp(srv->state, "playing") == 0) srv->state = "paused";
+    } else if (str8_eq_cstr(cmd, "pl_forceresume")) {
+        if (strcmp(srv->state, "paused") == 0) srv->state = "playing";
+    } else if (str8_eq_cstr(cmd, "seek")) {
+        f64 v = 0;
+        if (str_to_f64(val, &v) && v >= 0) srv->pos = v;
+    } else if (str8_eq_cstr(cmd, "rate")) {
+        f64 v = 0;
+        if (str_to_f64(val, &v) && v > 0) srv->rate = v;
+    }
+}
+
+static DWORD WINAPI fake_vlc_thread(LPVOID param) {
+    FakeVlcHttp *srv = (FakeVlcHttp *)param;
+    Arena *a = arena_create(VS_MB(1));
+    if (!a) return 1;
+    char expected[128];
+    {
+        u8 raw[80];
+        isize m = 0;
+        raw[m++] = ':';
+        for (isize i = 0; srv->password[i] && m < (isize)sizeof(raw); i++) raw[m++] = (u8)srv->password[i];
+        base64_encode(raw, m, expected, (isize)sizeof(expected));
+    }
+    while (!InterlockedCompareExchange(&srv->stop, 0, 0)) {
+        SOCKET c = accept(srv->listener, NULL, NULL);
+        if (c == INVALID_SOCKET) break;
+        isize mark = arena_pos(a);
+        u8 req[8192];
+        isize len = 0;
+        b32 complete = 0;
+        while (len < (isize)sizeof(req)) {
+            int n = recv(c, (char *)req + len, (int)(sizeof(req) - (size_t)len), 0);
+            if (n <= 0) break;
+            len += n;
+            if (len >= 4 && memcmp(req + len - 4, "\r\n\r\n", 4) == 0) {
+                complete = 1;
+                break;
+            }
+        }
+        if (!complete) {
+            closesocket(c);
+            arena_pop_to(a, mark);
+            continue;
+        }
+        InterlockedIncrement(&srv->requests);
+        Str8 head = str8(req, len);
+        // Authentification : « Authorization: Basic <b64> ».
+        b32 authorized = 0;
+        Str8 tag = str8_lit("Authorization: Basic ");
+        for (isize i = 0; i + tag.len <= head.len; i++) {
+            if (memcmp(head.data + i, tag.data, (size_t)tag.len) != 0) continue;
+            isize s = i + tag.len, e = s;
+            while (e < head.len && head.data[e] != '\r' && head.data[e] != '\n') e++;
+            authorized = str8_eq(str8_trim(str8_sub(head, s, e - s)), str8_from_cstr(expected));
+            break;
+        }
+        Builder resp;
+        builder_init(&resp, a, VS_KB(8));
+        if (!authorized) {
+            builder_cstr(&resp, "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"VLC\"\r\n"
+                                "Content-Length: 0\r\nConnection: close\r\n\r\n");
+        } else {
+            isize qs = str8_find_char(head, '?', 0);
+            isize sp = str8_find_char(head, ' ', 4);
+            Str8 query = str8_lit("");
+            if (qs > 0 && sp > qs) query = str8_sub(head, qs + 1, sp - qs - 1);
+            Str8 body;
+            AcquireSRWLockExclusive(&srv->lock);
+            fake_http_apply(srv, query);
+            fake_http_body(srv, a, &body);
+            ReleaseSRWLockExclusive(&srv->lock);
+            if (InterlockedCompareExchange(&srv->chunked, 0, 0)) {
+                builder_cstr(&resp, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                                    "Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n");
+                // Deux blocs pour exercer réellement le dé-chunking.
+                isize half = body.len / 2;
+                char hex[24];
+                snprintf(hex, sizeof(hex), "%llx\r\n", (unsigned long long)half);
+                builder_cstr(&resp, hex);
+                builder_bytes(&resp, body.data, half);
+                builder_cstr(&resp, "\r\n");
+                snprintf(hex, sizeof(hex), "%llx\r\n", (unsigned long long)(body.len - half));
+                builder_cstr(&resp, hex);
+                builder_bytes(&resp, body.data + half, body.len - half);
+                builder_cstr(&resp, "\r\n0\r\n\r\n");
+            } else {
+                char hdr[160];
+                snprintf(hdr, sizeof(hdr),
+                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %llu\r\n"
+                         "Connection: close\r\n\r\n",
+                         (unsigned long long)body.len);
+                builder_cstr(&resp, hdr);
+                builder_bytes(&resp, body.data, body.len);
+            }
+        }
+        Str8 out = builder_result(&resp);
+        sock_send_all(c, out.data, out.len);
+        shutdown(c, SD_SEND);
+        closesocket(c);
+        arena_pop_to(a, mark);
+    }
+    arena_destroy(a);
+    return 0;
+}
+
+static b32 fake_vlc_start(FakeVlcHttp *srv, const char *password) {
+    memset(srv, 0, sizeof(*srv));
+    InitializeSRWLock(&srv->lock);
+    srv->state = "playing";  // VLC démarre la lecture tout seul à l'ouverture
+    srv->pos = 5.0;
+    srv->length = 1200;
+    srv->rate = 1;
+    isize n = (isize)strlen(password);
+    if (n >= (isize)sizeof(srv->password)) return 0;
+    memcpy(srv->password, password, (size_t)n + 1);
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+    srv->listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (srv->listener == INVALID_SOCKET) return 0;
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(srv->listener, (struct sockaddr *)&addr, sizeof(addr)) != 0) return 0;
+    int alen = (int)sizeof(addr);
+    if (getsockname(srv->listener, (struct sockaddr *)&addr, &alen) != 0) return 0;
+    srv->port = ntohs(addr.sin_port);
+    if (listen(srv->listener, 8) != 0) return 0;
+    srv->thread = CreateThread(NULL, 0, fake_vlc_thread, srv, 0, NULL);
+    return srv->thread != NULL;
+}
+
+static void fake_vlc_stop(FakeVlcHttp *srv) {
+    InterlockedExchange(&srv->stop, 1);
+    if (srv->listener != INVALID_SOCKET) {
+        closesocket(srv->listener);
+        srv->listener = INVALID_SOCKET;
+    }
+    if (srv->thread) {
+        WaitForSingleObject(srv->thread, 5000);
+        CloseHandle(srv->thread);
+        srv->thread = NULL;
+    }
+}
+
+static void test_vlc_live(Arena *a) {
+    section("vlc (HTTP réel)");
+    TempArena top = temp_begin(a);
+    FakeVlcHttp srv;
+    if (!fake_vlc_start(&srv, "mdp-test")) {
+        failf("faux VLC HTTP indisponible");
+        temp_end(top);
+        return;
+    }
+    VlcClient c;
+    vlc_client_init(&c, srv.port, S("mdp-test"));
+
+    VsStatus st;
+    CHECK(vlc_status(&c, a, &st) == VLC_OK, "status sur socket");
+    CHECK(st.state == VS_PLAY_PLAYING, "VLC démarre en lecture");
+    CHECK(approx(st.position_sec, 5, 1e-6), "position initiale = %f", st.position_sec);
+    CHECK(strbuf_eq(&st.file_name, S("ep1.mkv")), "nom de fichier");
+
+    // Réponses chunked : même résultat.
+    InterlockedExchange(&srv.chunked, 1);
+    CHECK(vlc_status(&c, a, &st) == VLC_OK, "status en Transfer-Encoding: chunked");
+    CHECK(st.length_sec == 1200, "durée en chunked");
+    InterlockedExchange(&srv.chunked, 0);
+
+    // Préparation : pause + position 0 constatés (§Chargement de fichier).
+    CHECK(vlc_prepare_paused(&c, a, 5000) == VLC_OK, "préparation pause+0");
+    CHECK(vlc_status(&c, a, &st) == VLC_OK, "status après préparation");
+    CHECK(st.state == VS_PLAY_PAUSED, "média non mis en pause");
+    CHECK(st.position_sec < VLC_START_TOLERANCE, "média non ramené au début (%f)", st.position_sec);
+    // Idempotence : un second appel ne fait rien de plus.
+    long before = srv.requests;
+    CHECK(vlc_prepare_paused(&c, a, 5000) == VLC_OK, "préparation idempotente");
+    CHECK(srv.requests - before <= 2, "préparation non idempotente (%ld requêtes)", srv.requests - before);
+
+    // Commandes.
+    CHECK(vlc_seek(&c, a, 42.4) == VLC_OK, "seek");
+    CHECK(vlc_status(&c, a, &st) == VLC_OK, "status après seek");
+    CHECK(approx(st.position_sec, 42, 1e-6), "seek arrondi à la seconde : %f", st.position_sec);
+    CHECK(vlc_set_rate(&c, a, 1.05) == VLC_OK, "rate");
+    CHECK(vlc_resume(&c, a) == VLC_OK, "resume");
+    CHECK(vlc_status(&c, a, &st) == VLC_OK, "status final");
+    CHECK(st.state == VS_PLAY_PLAYING && approx(st.rate, 1.05, 1e-9), "reprise et rate");
+    VsCmd cmd = {VS_CMD_PAUSE, 0};
+    CHECK(vlc_apply(&c, a, cmd) == VLC_OK, "vlc_apply pause");
+
+    // Mauvais mot de passe : 401 remonté distinctement.
+    VlcClient bad;
+    vlc_client_init(&bad, srv.port, S("mauvais"));
+    CHECK(vlc_status(&bad, a, &st) == VLC_ERR_AUTH, "mot de passe erroné accepté");
+
+    // Port fermé : erreur de connexion, pas de blocage.
+    VlcClient dead;
+    vlc_client_init(&dead, 1, S("x"));
+    VlcError err = vlc_status(&dead, a, &st);
+    CHECK(err == VLC_ERR_CONNECT || err == VLC_ERR_RECV, "port fermé : %s", vlc_error_text(err));
+
+    fake_vlc_stop(&srv);
+    temp_end(top);
+}
+
 // ------------------------------------------------------------ moteur : unités ---
 
 static void test_engine_units(void) {
@@ -620,6 +1445,63 @@ static void test_engine_units(void) {
     vs_output_reset(&out);
     engine_session_lost(&e);
     CHECK(!e.have_state && !e.have_offset, "référence non invalidée à la coupure");
+
+    // Départ de lecture (docs/protocol.md §Départ et reprise) : la salle passe
+    // en lecture alors que VLC est en pause → on cale AVANT de jouer.
+    struct {
+        f64 vlc_pos;
+        b32 want_seek;
+        const char *nom;
+    } starts[] = {
+        {99.65, 1, "écart 0,35 s : seek de calage attendu"},
+        {99.95, 0, "écart 0,05 s : pas de seek, on joue directement"},
+        {97.0, 1, "écart 3 s : seek de calage"},
+    };
+    for (isize k = 0; k < VS_ARRAY_COUNT(starts); k++) {
+        VsEngine se;
+        engine_init(&se);
+        VsOutput so;
+        vs_output_reset(&so);
+        i64 t0 = 1785960000000LL * 1000000LL;
+        engine_open_file(&se, S("ep1.mkv"), 15, &so);
+        vs_output_reset(&so);
+
+        VsRoomState rs;
+        memset(&rs, 0, sizeof(rs));
+        rs.paused = 0;
+        rs.position_sec = 100;
+        rs.rate = 1;
+        rs.ref_server_ms = vs_ns_to_unix_ms(t0);
+        strbuf_set(&rs.set_by, S("u2"));
+        engine_on_welcome(&se, t0, S("u1"), &rs, NULL, &so);
+        VsPong pg = {vs_ns_to_unix_ms(t0), vs_ns_to_unix_ms(t0)};
+        engine_on_pong(&se, t0, pg);
+        vs_output_reset(&so);
+
+        VsStatus st;
+        memset(&st, 0, sizeof(st));
+        st.state = VS_PLAY_PAUSED;
+        st.position_sec = starts[k].vlc_pos;
+        st.length_sec = 1200;
+        st.rate = 1;
+        strbuf_set(&st.file_name, S("ep1.mkv"));
+        engine_on_vlc_status(&se, t0, &st, &so);
+        vs_output_reset(&so);
+        engine_on_tick(&se, t0, &so);
+
+        isize want = starts[k].want_seek ? 2 : 1;
+        CHECK(so.cmd_count == want, "%s : %lld commande(s), attendu %lld", starts[k].nom,
+              (long long)so.cmd_count, (long long)want);
+        if (so.cmd_count == want) {
+            if (starts[k].want_seek) {
+                CHECK(so.cmds[0].kind == VS_CMD_SEEK, "%s : la première commande doit être le seek", starts[k].nom);
+                CHECK(approx(so.cmds[0].value, 100, 0.01), "%s : seek vers %.3f", starts[k].nom, so.cmds[0].value);
+                CHECK(so.cmds[1].kind == VS_CMD_RESUME, "%s : le resume doit suivre le seek", starts[k].nom);
+            } else {
+                CHECK(so.cmds[0].kind == VS_CMD_RESUME, "%s : resume seul attendu", starts[k].nom);
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------------ faux VLC ---
@@ -1100,6 +1982,9 @@ int main(int argc, char **argv) {
     test_protocol(a);
     test_vlc(a);
     test_engine_units();
+    test_vlc_live(a);
+    test_net_live(a);
+    test_net_queue_saturation(a);
     test_vectors(a, override);
 
     printf("\n%d vérifications, %d échec(s)\n", g_checks, g_failures);

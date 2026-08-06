@@ -13,6 +13,7 @@ const char *json_error_text(JsonError e) {
         case JSON_ERR_NUMBER: return "nombre invalide";
         case JSON_ERR_TRAILING: return "octets en trop après la valeur";
         case JSON_ERR_UTF8: return "UTF-8 invalide";
+        case JSON_ERR_BUDGET: return "budget de valeurs ou de mémoire dépassé";
     }
     return "erreur inconnue";
 }
@@ -22,6 +23,9 @@ typedef struct {
     Str8 in;
     isize at;
     isize depth;
+    isize values;      // budget de valeurs
+    isize arena_start;  // position de l'arène à l'entrée
+    isize arena_limit;  // au-delà : refus propre (pas de vs_fatal)
     JsonError err;
 } Parser;
 
@@ -44,7 +48,23 @@ static u8 p_peek(const Parser *p) { return p->at < p->in.len ? p->in.data[p->at]
 
 static JsonValue *p_value(Parser *p);
 
+// budget_ok borne le nombre de valeurs ET la consommation d'arène : une entrée
+// hostile dense doit échouer en erreur de parse, jamais en erreur fatale.
+static b32 budget_ok(Parser *p) {
+    if (p->err != JSON_OK) return 0;
+    if (++p->values > JSON_MAX_VALUES) {
+        p_fail(p, JSON_ERR_BUDGET);
+        return 0;
+    }
+    if (arena_pos(p->arena) > p->arena_limit) {
+        p_fail(p, JSON_ERR_BUDGET);
+        return 0;
+    }
+    return 1;
+}
+
 static JsonValue *node(Parser *p, JsonKind kind) {
+    if (!budget_ok(p)) return NULL;
     JsonValue *v = arena_push_struct(p->arena, JsonValue);
     v->kind = kind;
     return v;
@@ -98,6 +118,10 @@ static b32 p_string(Parser *p, Str8 *out) {
     }
 
     // Deuxième passe : déséchappement (la sortie ne peut pas être plus longue).
+    if (arena_pos(p->arena) + raw.len + 1 > p->arena_limit) {
+        p_fail(p, JSON_ERR_BUDGET);
+        return 0;
+    }
     u8 *buf = arena_push_array(p->arena, u8, raw.len + 1);
     isize n = 0;
     isize k = 0;
@@ -280,6 +304,7 @@ static JsonValue *p_value(Parser *p) {
             p->at++;
             p->depth++;
             JsonValue *obj = node(p, JSON_OBJECT);
+            if (!obj) return NULL;
             p_skip_ws(p);
             if (p_peek(p) == '}') {
                 p->at++;
@@ -318,6 +343,7 @@ static JsonValue *p_value(Parser *p) {
             p->at++;
             p->depth++;
             JsonValue *arr = node(p, JSON_ARRAY);
+            if (!arr) return NULL;
             p_skip_ws(p);
             if (p_peek(p) == ']') {
                 p->at++;
@@ -344,13 +370,13 @@ static JsonValue *p_value(Parser *p) {
         }
         case '"': {
             JsonValue *v = node(p, JSON_STRING);
-            if (!p_string(p, &v->string)) return NULL;
+            if (!v || !p_string(p, &v->string)) return NULL;
             return v;
         }
         case 't':
             if (p_literal(p, "true")) {
                 JsonValue *v = node(p, JSON_BOOL);
-                v->boolean = 1;
+                if (v) v->boolean = 1;
                 return v;
             }
             p_fail(p, JSON_ERR_SYNTAX);
@@ -358,7 +384,7 @@ static JsonValue *p_value(Parser *p) {
         case 'f':
             if (p_literal(p, "false")) {
                 JsonValue *v = node(p, JSON_BOOL);
-                v->boolean = 0;
+                if (v) v->boolean = 0;
                 return v;
             }
             p_fail(p, JSON_ERR_SYNTAX);
@@ -370,7 +396,7 @@ static JsonValue *p_value(Parser *p) {
         default: {
             if (c == '-' || (c >= '0' && c <= '9')) {
                 JsonValue *v = node(p, JSON_NUMBER);
-                if (!p_number(p, &v->number)) return NULL;
+                if (!v || !p_number(p, &v->number)) return NULL;
                 return v;
             }
             p_fail(p, JSON_ERR_SYNTAX);
@@ -391,7 +417,15 @@ JsonValue *json_parse(Arena *a, Str8 text, JsonError *err) {
         *err = JSON_ERR_TOO_BIG;
         return NULL;
     }
-    Parser p = {a, text, 0, 0, JSON_OK};
+    Parser p;
+    memset(&p, 0, sizeof(p));
+    p.arena = a;
+    p.in = text;
+    p.err = JSON_OK;
+    p.arena_start = arena_pos(a);
+    // Budget mémoire : au-delà des 3/4 de l'arène fournie, refus propre.
+    p.arena_limit = arena_capacity(a) / JSON_ARENA_BUDGET_DEN * JSON_ARENA_BUDGET_NUM;
+    if (p.arena_limit <= p.arena_start) p.arena_limit = arena_capacity(a);
     JsonValue *v = p_value(&p);
     if (!v) {
         *err = p.err == JSON_OK ? JSON_ERR_SYNTAX : p.err;
@@ -410,10 +444,13 @@ JsonValue *json_parse(Arena *a, Str8 text, JsonError *err) {
 JsonValue *json_get(const JsonValue *obj, const char *key) {
     if (!obj || obj->kind != JSON_OBJECT) return NULL;
     Str8 k = str8_from_cstr(key);
+    JsonValue *found = NULL;
+    // Clé dupliquée : la DERNIÈRE gagne, comme encoding/json en Go. Sans cette
+    // règle, un roomState piégé ferait diverger les clients Go, C et Swift.
     for (JsonValue *c = obj->first; c; c = c->next) {
-        if (str8_eq(c->key, k)) return c;
+        if (str8_eq(c->key, k)) found = c;
     }
-    return NULL;
+    return found;
 }
 
 JsonValue *json_at(const JsonValue *arr, isize index) {

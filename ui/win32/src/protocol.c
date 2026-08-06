@@ -81,13 +81,57 @@ b32 proto_session_token(char *out, isize cap) {
 
 // --------------------------------------------------------------- décodage ---
 
-static void read_roomstate(const JsonValue *o, VsRoomState *rs) {
+// --- lecture stricte : présence ET type sont exigés ---
+//
+// Un champ obligatoire absent ou d'un type inattendu invalide le message : il
+// est ignoré (docs/protocol.md §forward-compat) au lieu de se transformer en
+// zéro silencieux (un `pong` vide deviendrait {t:0, serverMs:0} et empoisonnerait
+// l'offset d'horloge).
+
+static b32 need_num(const JsonValue *o, const char *key, f64 *out) {
+    const JsonValue *v = json_get(o, key);
+    if (!v || v->kind != JSON_NUMBER || !f64_is_finite(v->number)) return 0;
+    *out = v->number;
+    return 1;
+}
+
+static b32 need_ms(const JsonValue *o, const char *key, i64 *out) {
+    f64 raw = 0;
+    if (!need_num(o, key, &raw)) return 0;
+    if (raw < (f64)VS_MS_MIN || raw > (f64)VS_MS_MAX) return 0;
+    *out = (i64)raw;
+    return vs_valid_epoch_ms(*out);
+}
+
+static b32 need_bool(const JsonValue *o, const char *key, b32 *out) {
+    const JsonValue *v = json_get(o, key);
+    if (!v || v->kind != JSON_BOOL) return 0;
+    *out = v->boolean;
+    return 1;
+}
+
+static b32 need_str(const JsonValue *o, const char *key, Str8 *out) {
+    const JsonValue *v = json_get(o, key);
+    if (!v || v->kind != JSON_STRING) return 0;
+    *out = v->string;
+    return 1;
+}
+
+// read_roomstate exige paused, positionSec, rate et refServerMs (sauf en
+// pause, où une référence absente ou nulle est admise).
+static b32 read_roomstate(const JsonValue *o, VsRoomState *rs) {
     memset(rs, 0, sizeof(*rs));
-    rs->paused = json_get_bool(o, "paused", 0);
-    rs->position_sec = json_get_num(o, "positionSec", 0);
-    rs->rate = json_get_num(o, "rate", 0);
-    rs->ref_server_ms = json_get_i64(o, "refServerMs", 0);
-    strbuf_set(&rs->set_by, json_get_str(o, "setBy", str8_lit("")));
+    if (!o || o->kind != JSON_OBJECT) return 0;
+    if (!need_bool(o, "paused", &rs->paused)) return 0;
+    if (!need_num(o, "positionSec", &rs->position_sec)) return 0;
+    if (!need_num(o, "rate", &rs->rate)) return 0;
+    if (!need_ms(o, "refServerMs", &rs->ref_server_ms)) {
+        if (!rs->paused) return 0;  // en lecture, la référence est obligatoire
+        rs->ref_server_ms = 0;
+    }
+    Str8 set_by;
+    if (need_str(o, "setBy", &set_by)) strbuf_set(&rs->set_by, set_by);
+    return 1;
 }
 
 static isize read_users(Arena *a, const JsonValue *arr, VsUser **out) {
@@ -99,12 +143,16 @@ static isize read_users(Arena *a, const JsonValue *arr, VsUser **out) {
     isize i = 0;
     for (JsonValue *c = arr->first; c && i < n; c = c->next) {
         if (c->kind != JSON_OBJECT) continue;
+        Str8 id;
+        if (!need_str(c, "id", &id) || id.len == 0) continue;  // entrée inexploitable
         VsUser *u = &users[i++];
-        u->id = json_get_str(c, "id", str8_lit(""));
-        u->name = json_get_str(c, "name", str8_lit(""));
+        u->id = id;
+        if (!need_str(c, "name", &u->name)) u->name = str8_lit("");
         u->ready = json_get_bool(c, "ready", 0);
         u->position_sec = json_get_num(c, "positionSec", 0);
+        if (!f64_is_finite(u->position_sec)) u->position_sec = 0;
         u->latency_ms = json_get_i64(c, "latencyMs", 0);
+        if (u->latency_ms < 0 || u->latency_ms > 600000) u->latency_ms = 0;
         JsonValue *f = json_get(c, "file");
         if (f && f->kind == JSON_OBJECT) {
             u->has_file = 1;
@@ -136,48 +184,69 @@ void proto_fill(Arena *a, Str8 type, const JsonValue *data, VsInMsg *m) {
     m->kind = VS_IN_UNKNOWN;
 
     if (str8_eq_cstr(m->type, "welcome")) {
-        m->kind = VS_IN_WELCOME;
-        m->self_id = json_get_str(data, "selfId", str8_lit(""));
-        m->room = json_get_str(data, "room", str8_lit(""));
-        JsonValue *st = json_get(data, "state");
-        if (st && st->kind == JSON_OBJECT) {
-            read_roomstate(st, &m->state);
-            m->have_state = 1;
+        // selfId et state sont obligatoires : sans eux le welcome ne peut pas
+        // servir de référence de session.
+        if (!need_str(data, "selfId", &m->self_id) || m->self_id.len == 0) {
+            m->invalid = 1;
+            return;
         }
+        if (!read_roomstate(json_get(data, "state"), &m->state)) {
+            m->invalid = 1;
+            return;
+        }
+        m->have_state = 1;
+        m->kind = VS_IN_WELCOME;
+        Str8 room;
+        if (need_str(data, "room", &room)) m->room = room;
         m->user_count = read_users(a, json_get(data, "users"), &m->users);
         for (isize i = 0; i < m->user_count; i++) {
-            if (m->self_id.len > 0 && str8_eq(m->users[i].id, m->self_id)) {
+            if (str8_eq(m->users[i].id, m->self_id)) {
                 m->have_self_ready = 1;
                 m->self_ready = m->users[i].ready;
                 break;
             }
         }
     } else if (str8_eq_cstr(m->type, "pong")) {
-        m->kind = VS_IN_PONG;
-        m->pong.t = json_get_i64(data, "t", 0);
-        m->pong.server_ms = json_get_i64(data, "serverMs", 0);
-    } else if (str8_eq_cstr(m->type, "roomState")) {
-        m->kind = VS_IN_ROOMSTATE;
-        if (data && data->kind == JSON_OBJECT) {
-            read_roomstate(data, &m->state);
-            m->have_state = 1;
+        if (!need_ms(data, "t", &m->pong.t) || !need_ms(data, "serverMs", &m->pong.server_ms)) {
+            m->invalid = 1;
+            return;
         }
+        m->kind = VS_IN_PONG;
+    } else if (str8_eq_cstr(m->type, "roomState")) {
+        if (!read_roomstate(data, &m->state)) {
+            m->invalid = 1;
+            return;
+        }
+        m->have_state = 1;
+        m->kind = VS_IN_ROOMSTATE;
     } else if (str8_eq_cstr(m->type, "users")) {
         m->kind = VS_IN_USERS;
         m->user_count = read_users(a, json_get(data, "users"), &m->users);
     } else if (str8_eq_cstr(m->type, "chatEvent") || str8_eq_cstr(m->type, "chat")) {
+        if (!need_str(data, "from", &m->from) || !need_str(data, "text", &m->text)) {
+            m->invalid = 1;
+            return;
+        }
         m->kind = VS_IN_CHATEVENT;
-        m->from = json_get_str(data, "from", str8_lit(""));
-        m->text = json_get_str(data, "text", str8_lit(""));
-        m->server_ms = json_get_i64(data, "serverMs", 0);
+        i64 ms = 0;
+        if (need_ms(data, "serverMs", &ms)) m->server_ms = ms;
     } else if (str8_eq_cstr(m->type, "toast")) {
+        if (!need_str(data, "text", &m->text)) {
+            m->invalid = 1;
+            return;
+        }
         m->kind = VS_IN_TOAST;
-        m->level = json_get_str(data, "level", str8_lit("info"));
-        m->text = json_get_str(data, "text", str8_lit(""));
+        m->level = str8_lit("info");
+        Str8 level;
+        if (need_str(data, "level", &level)) m->level = level;
     } else if (str8_eq_cstr(m->type, "error")) {
+        if (!need_str(data, "code", &m->code) || m->code.len == 0) {
+            m->invalid = 1;
+            return;
+        }
         m->kind = VS_IN_ERROR;
-        m->code = json_get_str(data, "code", str8_lit(""));
-        m->text = json_get_str(data, "text", str8_lit(""));
+        Str8 text;
+        if (need_str(data, "text", &text)) m->text = text;
     }
 }
 

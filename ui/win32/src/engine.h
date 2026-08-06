@@ -30,6 +30,17 @@
 #define VS_OFFSET_SAMPLES 5
 #define VS_BACKOFF_MIN_NS (1000 * 1000000LL)
 #define VS_BACKOFF_MAX_NS (10000 * 1000000LL)
+// Départ de lecture : au-delà de cet écart, on cale VLC par un seek AVANT de
+// jouer plutôt que de compter sur le nudge (5 %/s = 10 s pour 0,5 s).
+#define VS_START_SEEK_SEC 0.3
+
+// Bornes des horodatages epoch en millisecondes acceptés (1970 → 2100). Toute
+// valeur hors bornes est rejetée : les soustractions de l'offset d'horloge
+// doivent rester loin d'un débordement signé (comportement indéfini).
+#define VS_MS_MIN 0LL
+#define VS_MS_MAX 4102444800000LL
+
+b32 vs_valid_epoch_ms(i64 ms);
 
 // --- état observé de VLC ---
 typedef enum {
