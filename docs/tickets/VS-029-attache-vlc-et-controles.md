@@ -48,3 +48,14 @@ deux sens.
 ## Journal du ticket
 
 - 2026-08-06 : créé (retour terrain critique).
+- 2026-08-06 (soir) : blindage livré (8b2982d, écrit à l'aveugle depuis le Mac,
+  CI verte) — vlc_build_command avec 9 drapeaux ajoutés dont
+  --no-one-instance-when-started-from-file (VRAI par défaut chez VLC : cause
+  racine la plus probable — le média part vers l'instance déjà ouverte qui
+  joue, pendant que notre process meurt), --start-paused, --lua-intf=http,
+  --no-playlist-enqueue ; échec d'attache → VLC tué + toast « cause — piste »
+  + trace vs_log dans %APPDATA%\vibesync.log. Gel des 15 drapeaux en test.
+  RESTE (Windows réel requis — VM Win11 UTM en préparation ou retour du PC) :
+  repro vlcrc Syncplay, critères 4-5 (détection d'action utilisateur prouvée
+  en réel client C, séance 2 clients C), asan/budget locaux. NOTE : le driver
+  Go internal/vlc/launch.go n'a pas les 9 nouveaux drapeaux — à aligner.

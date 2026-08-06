@@ -24,10 +24,13 @@ maison.
 - [x] La valeur en mémoire est effacée (SecureZeroMemory) quand elle n'est plus utile
 - [x] Tests : round-trip DPAPI, blob corrompu, ini sans entrée, migration d'un ini
       existant
-- [ ] macOS (au polissage Swift) : Keychain Services, même UX → suivi via VS-015
+- [x] macOS (au polissage Swift) : Keychain Services, même UX → suivi via VS-015
 
 ## Journal du ticket
 
 - 2026-08-06 : créé.
 - 2026-08-06 : livré côté Windows (secret.c, DPAPI). Dans v0.2.0. Terminé
   (Keychain mac au polissage Swift, VS-015).
+- 2026-08-06 (soir) : macOS livré (Keychain.swift, Security.framework API C,
+  case « Se souvenir » cochée par défaut, échec d'écriture → toast + case
+  décochée). Commit 73499fc.

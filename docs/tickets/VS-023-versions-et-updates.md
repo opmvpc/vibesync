@@ -35,3 +35,7 @@ fichier `VERSION` à la racine, injecté au build (ldflags Go, -D en C, plist Sw
 - 2026-08-06 : créé.
 - 2026-08-06 : livré, puis fix terra n°5 (c811207) : le client livré ne recevait
   jamais sa version. Dans v0.2.0. Terminé (injection mac au polissage Swift).
+- 2026-08-06 (soir) : injection mac livrée (73499fc) — clé Info.plist
+  VibeSyncVersion écrite par scripts/build-macos.sh depuis VERSION, port de
+  NewerVersion (Version.swift, aligné strconv.Atoi/TrimSpace), bannière de
+  mise à jour dans l'UI.

@@ -31,7 +31,7 @@ noms de fichiers circulent déjà via `setFile`/`users`.
 - [x] Tests : 25 checks (sérialisation ini, arborescence temporaire réelle :
       trouvé/casse/absent/partiel/homonymes/bornes/300 fichiers) ; test + asan
       verts (1 282 checks) ; 242 Ko (48 % du budget)
-- [ ] macOS : à porter au polissage Swift (NSOpenPanel dossier, ~/Downloads
+- [x] macOS : à porter au polissage Swift (NSOpenPanel dossier, ~/Downloads
       défaut) → suivi via VS-015
 
 ## Journal du ticket
@@ -42,3 +42,6 @@ noms de fichiers circulent déjà via `setFile`/`users`.
   ignorés, CompareStringOrdinal), bandeaux notice_bar empilables. Essai réel
   2 clients concluant (fichier retrouvé 2 niveaux sous le dossier, VLC lancé).
   Dans v0.2.0. Terminé (port mac via VS-015).
+- 2026-08-06 (soir) : macOS livré (MediaLibrary.swift — recherche bornée
+  identique, hors thread UI, jeton de génération anti-résultat périmé ;
+  SettingsView + bandeaux). Commit 73499fc.
