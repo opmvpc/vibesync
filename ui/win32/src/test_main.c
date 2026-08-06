@@ -1,7 +1,8 @@
 // test_main.c — point d'entrée de la suite de tests console
 // (vibesync_tests.exe).
 //
-// Depuis VS-030 (ADR-010), la suite est scindée en deux :
+// Depuis VS-030 (ADR-010), la suite est scindée en deux — et depuis VS-031 la
+// moitié portable a rejoint la couche commune, dans core/tests :
 //   test_core.c   PORTABLE — base, json, protocol, engine, conn, parsing du
 //                 status VLC, ini en mémoire, algorithme des dossiers médias,
 //                 et le REJEU DES VECTEURS DE CONFORMITÉ test/vectors/*.json

@@ -1,6 +1,7 @@
-// FakeVLC.swift — faux lecteur pour le rejeu des vecteurs.
+// FakeVLC.swift — faux lecteur pour le rejeu des vecteurs, partagé par
+// VectorsTests (moteur Swift natif) et VSCoreVectorsTests (moteur C de VSCore).
 //
-// Port de la FakeVlc du harnais C (ui/win32/src/test_main.c), elle-même copie
+// Port de la FakeVlc du harnais C (core/tests/test_core.c), elle-même copie
 // de internal/vlc/vlctest.Fake : position qui avance selon l'horloge simulée,
 // seek arrondi à la seconde par l'interface HTTP, `position` = pos/length et
 // `length` arrondie — c'est ce qui explique les résidus de virgule flottante

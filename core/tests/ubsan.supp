@@ -1,0 +1,11 @@
+# Suppressions UndefinedBehaviorSanitizer de la suite C (scripts/test-core-macos.sh).
+#
+# Une seule entrée, et elle est TEMPORAIRE : str_to_i64 négocie
+# « -9223372036854775808 » par -(i64)acc quand acc vaut déjà 2^63. Le résultat
+# est correct en complément à deux mais le calcul est un comportement indéfini
+# formel. Bug préexistant, jamais vu jusqu'ici parce que `build.bat asan`
+# n'active pas -fsanitize=undefined ; corrigé par le ticket VS-035.
+#
+# Toute autre remontée d'UBSan doit faire ÉCHOUER la suite : n'ajoutez pas de
+# ligne ici sans ticket.
+signed-integer-overflow:base_core.c

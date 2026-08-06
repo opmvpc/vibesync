@@ -98,58 +98,28 @@ xattr -dr com.apple.quarantine /Applications/VibeSync.app
 Pour forcer le chemin de VLC : `VIBESYNC_VLC=/chemin/vers/VLC open …` ou
 exporter la variable avant de lancer l'app depuis un terminal.
 
-## 6. Si erreurs de build
+## 6. Organisation du paquet (depuis VS-031)
 
-C'est l'hypothèse par défaut : le code n'a **jamais été compilé** (écrit sur
-Windows, sans toolchain Swift). Les erreurs attendues sont mécaniques
-(signature d'API, inférence de type), pas structurelles.
+`Package.swift` vit **à la racine du dépôt** (contrainte SwiftPM : une cible ne
+référence pas de sources hors racine du paquet). Toutes les commandes `swift`
+partent donc de la racine :
 
-**Marche à suivre : me renvoyer la sortie brute de `swift build` ou
-`swift test`, telle quelle, avec les numéros de ligne.** Ne pas corriger à
-l'aveugle : chaque fichier a un rôle isolé, la correction est locale.
+```sh
+swift test               # 34 tests, dont le rejeu des 13 vecteurs via l'API C
+swift build -c release
+./scripts/build-macos.sh # bundle .app signé ad hoc + version injectée
+./scripts/test-core-macos.sh  # suite C portable (asan+ubsan) hors SwiftPM
+```
 
-Points connus à surveiller, dans l'ordre de probabilité :
+Cibles : `VSCore` (couche C commune de `core/`, ADR-010 — `core/src` compilé
+aussi par `ui/win32/build.bat`, `core/posix` réservé à macOS), `VibeSync`
+(l'app, `ui/macos/Sources/VibeSync`) et `VibeSyncTests`. Le moteur Swift natif
+et le moteur C sont tous deux rejoués contre `test/vectors/` tant que la
+bascule de phase 3 (VS-032) n'est pas faite.
 
-1. **`swift test` refuse de lier la cible exécutable.** SwiftPM sait tester une
-   cible `executableTarget` depuis Swift 5.5, mais certaines toolchains
-   coincent. Parade sans toucher au code :
-
-   ```sh
-   cd ui/macos
-   mkdir -p Sources/VibeSyncCore
-   git mv Sources/VibeSync/Engine Sources/VibeSync/Net Sources/VibeSync/VLC Sources/VibeSyncCore/
-   ```
-
-   puis dans `Package.swift`, remplacer les cibles par :
-
-   ```swift
-   .target(name: "VibeSyncCore", path: "Sources/VibeSyncCore"),
-   .executableTarget(name: "VibeSync", dependencies: ["VibeSyncCore"], path: "Sources/VibeSync"),
-   .testTarget(name: "VibeSyncTests", dependencies: ["VibeSyncCore"], path: "Tests/VibeSyncTests"),
-   ```
-
-   et ajouter `import VibeSyncCore` en tête des fichiers de `Sources/VibeSync/UI/`
-   et de `main.swift` (les tests remplacent `@testable import VibeSync` par
-   `@testable import VibeSyncCore`).
-
-2. **Un vecteur diverge.** Les vecteurs `test/vectors/*.json` ont été
-   régénérés le 06-08 pour intégrer deux règles neuves de
-   `docs/protocol.md §Comportements client` — *Chargement de fichier* (pause
-   forcée + position 0, `setFile` seulement une fois la pause observée) et
-   *Départ et reprise de lecture* (seek de calage au-delà de 0,3 s avant de
-   lancer la lecture). Le moteur Swift les implémente
-   (`Engine.fileDeclared`, `Sync.startSeekSec`) mais n'a pas pu être confronté
-   aux nouveaux fichiers. Une divergence ici est **attendue et facile** :
-   le message d'échec donne le vecteur, l'instant et la valeur obtenue.
-
-3. **Concurrence Swift 6.** Le manifeste est en `swift-tools-version:5.7`,
-   donc en mode langage Swift 5 : les diagnostics `Sendable` ne devraient pas
-   apparaître. S'ils apparaissent quand même, ce sont des avertissements, pas
-   des erreurs.
-
-4. **API SwiftUI.** Tout est volontairement macOS 11/12 (`onChange(of:perform:)`,
-   `Color(nsColor:)`, `Label`, `overlay(alignment:)`). Des avertissements de
-   dépréciation sur macOS 14+ sont normaux et sans effet.
+Le code a été compilé, testé et validé en réel sur Mac le 2026-08-06 (voir §7) :
+une erreur de build signale une régression, pas un défaut d'écriture à
+l'aveugle.
 
 ## 7. Test réel automatisé (`scripts/run-real-macos.sh`)
 

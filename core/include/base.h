@@ -5,12 +5,15 @@
 // l'API du système. Toute allocation passe par une arène : pas un seul malloc.
 //
 // ADR-010 — cet en-tête est COMMUN aux deux clients natifs ; il ne déclare que
-// des prototypes, jamais de type du système. Deux implémentations :
-//   base_core.c   portable pur (chaînes, constructeur, nombres, UTF-8)
-//   base_win32.c  plateforme  (arènes VirtualAlloc, horloge, aléa, journal,
-//                 conversions UTF-16 — le côté portable n'en voit jamais)
-// Les sections marquées « frontière plateforme » sont à réimplémenter telles
-// quelles pour macOS (phase 2, VS-031).
+// des prototypes, jamais de type du système. Trois implémentations :
+//   core/src/base_core.c        portable pur (chaînes, constructeur, nombres,
+//                               UTF-8)
+//   ui/win32/src/base_win32.c   plateforme Windows (arènes VirtualAlloc,
+//                               horloge, aléa, journal, conversions UTF-16)
+//   core/posix/base_posix.c     plateforme macOS/POSIX (arènes mmap, horloge,
+//                               aléa, journal) — SANS les conversions UTF-16 :
+//                               rien n'en a besoin de ce côté, la couche
+//                               commune ne parle qu'UTF-8.
 #ifndef VS_BASE_H
 #define VS_BASE_H
 
@@ -208,13 +211,14 @@ void vs_write_stderr(Str8 s);
 
 // ----------------------------------------------------------------- journal ---
 
-// VS_LOG_MAX plafonne %APPDATA%\vibesync.log : au-delà, le fichier repart de
-// zéro. Un journal qui grossit sans fin chez l'utilisateur est un bug, pas une
+// VS_LOG_MAX plafonne le fichier de journal : au-delà, il repart de zéro. Un
+// journal qui grossit sans fin chez l'utilisateur est un bug, pas une
 // fonctionnalité.
 #define VS_LOG_MAX VS_MB(1)
 
-// vs_log ajoute une ligne horodatée (UTC) à %APPDATA%\vibesync.log, et la
-// recopie sur stderr et dans le débogueur. Sans journal, un échec de lancement
+// vs_log ajoute une ligne horodatée (UTC) au journal de l'utilisateur
+// (%APPDATA%\vibesync.log sous Windows, ~/Library/Logs/vibesync.log sous
+// macOS), et la recopie sur stderr et dans le débogueur. Sans journal, un échec de lancement
 // de VLC chez un ami se résume à « ça marche pas » : c'est le seul témoin
 // exploitable à distance (VS-029). Appelable depuis n'importe quel thread : les
 // écritures sont sérialisées par un verrou interne, et la rotation décide sur

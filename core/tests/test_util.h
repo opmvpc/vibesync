@@ -1,11 +1,13 @@
 // test_util.h — harnais partagé par les deux moitiés de la suite (VS-030).
 //
 // La suite est scindée comme le code (ADR-010) :
-//   test_core.c   tests PORTABLES — compilables et exécutables sur macOS,
-//                 rejeu des vecteurs de conformité compris ;
-//   test_win32.c  tests de la moitié plateforme (Winsock, WinHTTP, DPAPI,
-//                 GDI, disque, UTF-16) ;
-//   test_main.c   le main Windows, qui appelle les deux.
+//   core/tests/test_core.c     tests PORTABLES — compilables et exécutables sur
+//                              macOS, rejeu des vecteurs de conformité compris ;
+//   ui/win32/src/test_win32.c  tests de la moitié plateforme (Winsock, WinHTTP,
+//                              DPAPI, GDI, disque, UTF-16) ;
+//   ui/win32/src/test_main.c   le main Windows, qui appelle les deux ;
+//   core/tests/main_posix.c    le main macOS, qui n'appelle que le portable
+//                              (scripts/test-core-macos.sh).
 //
 // Le compteur de vérifications est commun : le total affiché doit rester
 // identique au découpage près (aucune vérification perdue ni ajoutée).

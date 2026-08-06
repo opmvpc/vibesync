@@ -1,6 +1,6 @@
 // ProtocolTests.swift — encodage/décodage du protocole et jeton de session.
 // Les charges utiles sont reprises de la référence Go et du harnais C
-// (ui/win32/src/test_main.c §protocol).
+// (core/tests/test_core.c §protocol).
 
 import XCTest
 @testable import VibeSync

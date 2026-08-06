@@ -6,8 +6,8 @@
 // prototypes déclarés ici (et par la poignée de primitives de base.h :
 // arènes, horloge, aléa, journal), implémentés une fois par plateforme :
 //
-//   Win32  : base_win32.c, media_win32.c, vlc_win32.c, ini_win32.c
-//   macOS  : phase 2 (VS-031), non écrit à ce stade
+//   Win32  : ui/win32/src/{base,media,vlc,ini}_win32.c
+//   POSIX  : core/posix/{base,media}_posix.c (macOS, VS-031)
 #ifndef VS_PLATFORM_H
 #define VS_PLATFORM_H
 

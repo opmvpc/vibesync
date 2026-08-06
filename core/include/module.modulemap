@@ -1,0 +1,22 @@
+// module.modulemap — surface C exposée à Swift (ADR-010, VS-031).
+//
+// La cible SwiftPM `VSCore` compile core/src (portable) + core/posix
+// (implémentation macOS des primitives) ; ce fichier dit ce que
+// `import VSCore` rend visible côté Swift.
+//
+// Les en-têtes sont listés un par un plutôt que par un umbrella : le contenu
+// de core/include est le contrat public de la couche commune, il doit se lire
+// ici sans avoir à ouvrir le répertoire. test_util.h n'y figure pas — il vit
+// dans core/tests et n'appartient pas au module.
+module VSCore {
+    header "base.h"
+    header "platform.h"
+    header "json.h"
+    header "protocol.h"
+    header "engine.h"
+    header "conn.h"
+    header "vlc.h"
+    header "ini.h"
+    header "media.h"
+    export *
+}

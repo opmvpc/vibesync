@@ -4,4 +4,5 @@ dist/
 /vibesync-server
 coverage.out
 .DS_Store
-ui/macos/.build/
+# SwiftPM : le paquet a sa racine à la racine du dépôt depuis VS-031.
+.build/

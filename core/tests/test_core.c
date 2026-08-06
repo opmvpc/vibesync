@@ -1,14 +1,17 @@
 // test_core.c — moitié PORTABLE de la suite de tests (ADR-010, VS-030).
 //
-// Ne dépend que du C portable de CORE_SHARED : base_core, json, protocol,
+// Ne dépend que du C portable de core/src : base_core, json, protocol,
 // engine, conn, vlc_core, ini_core, media_core. Compilable et exécutable
 // ailleurs que sous Windows — c'est tout l'intérêt : le REJEU DES VECTEURS DE
 // CONFORMITÉ test/vectors/*.json, qui gèle le moteur de sync, cesse d'être un
 // test « à l'aveugle » réservé à la machine de build Windows.
 //
 // La moitié plateforme (Winsock, WinHTTP, DPAPI, GDI, disque, UTF-16) est dans
-// test_win32.c. Le compteur de vérifications est commun : le découpage n'en
-// ajoute ni n'en retire aucune.
+// ui/win32/src/test_win32.c. Le compteur de vérifications est commun : le
+// découpage n'en ajoute ni n'en retire aucune.
+//
+// Depuis VS-031, ce fichier est compilé DEUX FOIS : par build.bat (Windows) et
+// par scripts/test-core-macos.sh (macOS, asan+ubsan, main_posix.c).
 
 #include "conn.h"
 #include "engine.h"

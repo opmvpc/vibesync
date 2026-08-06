@@ -14,6 +14,15 @@ ADR-010. Même méthode que la phase 3, bloc par bloc : ajout parallèle → bas
 → retrait. Inclut `conn.c` (normalisation URL + politique de retry), jamais
 porté en Swift : la connexion macOS gagne l'auto-préfixage d'hôte nu du C.
 
+## Point dur identifié en phase 2 (à trancher AVANT de basculer MediaLibrary)
+
+`name_eq_ci` POSIX (VS-031) compare point de code par point de code (ASCII +
+Latin-1) alors que APFS/HFS+ tient `é` NFC et `e`+`◌́` NFD pour le même nom —
+cas le plus probable en réel sur des fichiers accentués. Sens de l'écart :
+« macOS trouve moins », jamais de faux positif. Avant de remplacer
+MediaLibrary.swift : soit normaliser (NFC) les deux côtés de la comparaison
+dans l'impl. POSIX, soit documenter l'écart comme assumé.
+
 ## Critères d'acceptation
 
 - [ ] Protocol.swift, JSON.swift, VLCStatusParser.swift, MediaLibrary.swift,

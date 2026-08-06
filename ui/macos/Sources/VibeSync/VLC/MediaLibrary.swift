@@ -1,5 +1,5 @@
 // MediaLibrary.swift — retrouver chez soi le fichier qu'un participant regarde
-// (VS-026). Port de ui/win32/src/media.c.
+// (VS-026). Port de core/src/media_core.c.
 //
 // Aucun changement de protocole : les noms de fichiers circulent déjà par
 // `setFile`/`users`. On cherche le nom EXACT (comparaison insensible à la

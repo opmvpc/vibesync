@@ -13,8 +13,11 @@ set -eu
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 REPO_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
-PACKAGE_DIR="$REPO_ROOT/ui/macos"
-BUILD_DIR="$PACKAGE_DIR/build"
+# Depuis VS-031 (phase 2 d'ADR-010), la racine du paquet SwiftPM est celle du
+# dépôt : c'est la seule qui contienne à la fois core/ (couche C commune) et
+# ui/macos/. Le bundle assemblé, lui, reste rangé sous ui/macos/build.
+PACKAGE_DIR="$REPO_ROOT"
+BUILD_DIR="$REPO_ROOT/ui/macos/build"
 APP="$BUILD_DIR/VibeSync.app"
 
 ARCH_ARGS=""

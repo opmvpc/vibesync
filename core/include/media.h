@@ -39,8 +39,9 @@ b32 media_find(Arena *scratch, const StrBuf *dirs, isize dir_count, Str8 name, M
 b32 media_find_with(Arena *scratch, const VsDirOps *ops, const StrBuf *dirs, isize dir_count, Str8 name,
                     MediaFind *out);
 
-// media_default_dir renvoie le dossier Téléchargements de l'utilisateur
-// (FOLDERID_Downloads), repli sur %USERPROFILE%\Downloads.
+// media_default_dir renvoie le dossier Téléchargements de l'utilisateur :
+// FOLDERID_Downloads (repli %USERPROFILE%\Downloads) sous Windows,
+// ~/Downloads (repli ~/Movies puis ~) sous macOS.
 b32 media_default_dir(Arena *a, Str8 *out);
 
 // --- persistance dans vibesync.ini ---

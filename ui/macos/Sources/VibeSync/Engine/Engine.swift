@@ -1,6 +1,6 @@
 // Engine.swift — moteur de synchronisation, machine à états PURE.
 //
-// Port Swift de ui/win32/src/engine.c (lui-même port de internal/client, la
+// Port Swift de core/src/engine.c (lui-même port de internal/client, la
 // référence Go), conforme à docs/protocol.md §Comportements client et gelé par
 // test/vectors/*.json.
 //

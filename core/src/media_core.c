@@ -2,8 +2,9 @@
 //
 // L'algorithme borné (profondeur, nombre d'entrées, homonyme le plus gros) ne
 // connaît du système que la primitive de parcours `VsDirOps` (platform.h) :
-// il ne manipule que de l'UTF-8. L'implémentation FindFirstFileW et les
-// dossiers par défaut sont dans media_win32.c.
+// il ne manipule que de l'UTF-8. Les implémentations du parcours et les
+// dossiers par défaut sont ailleurs : ui/win32/src/media_win32.c
+// (FindFirstFileW) et core/posix/media_posix.c (opendir/readdir).
 #include "media.h"
 
 #include <string.h>

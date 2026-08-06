@@ -11,7 +11,8 @@ mis-à-jour: 2026-08-06
 ## Contexte
 
 En rejouant `test_core.c` sous UBSan sur macOS (VS-030), un UB préexistant est
-apparu dans `str_to_i64` (`ui/win32/src/base_core.c:250`, ex-`base.c:461`) :
+apparu dans `str_to_i64` (`core/src/base_core.c:250` depuis VS-031,
+ex-`ui/win32/src/base.c:461`) :
 `-(i64)acc` quand `acc == 2^63` (INT64_MIN n'a pas d'opposé représentable).
 Repris verbatim lors de la scission pour respecter le « diff de logique nul ».
 
