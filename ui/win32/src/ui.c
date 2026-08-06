@@ -62,6 +62,166 @@ static void stroke_round(HDC dc, Rect r, i32 radius, u32 color, i32 width) {
     DeleteObject(p);
 }
 
+// ------------------------------------------------------- anticrénelage ---
+//
+// GDI ne sait pas anticréneler : un engrenage de 20 px tracé au Polygon donne
+// des dents en escalier, une coche au Polyline donne un zigzag de marches.
+// Recette maison, sans la moindre bibliothèque : le glyphe est tracé UI_AA_SS
+// fois plus grand, en blanc sur noir, dans un DIB de masque ; la moyenne des
+// UI_AA_SS² échantillons d'un pixel destination donne sa couverture, dont on
+// fait le canal alpha d'une image prémultipliée que GdiAlphaBlend compose sur le
+// fond réel (donc quel que soit ce fond, y compris à travers un évidement).
+//
+// Coût : deux DIB éphémères et un balayage de quelques centaines de pixels par
+// glyphe — négligeable pour une interface qui ne redessine qu'à l'événement.
+#define UI_AA_SS 4
+#define UI_AA_MAX 128  // côté maximal, en pixels destination, d'un glyphe anticrénelé
+
+typedef struct {
+    HDC dc;        // DC du masque supersamplé
+    HBITMAP bmp;
+    HGDIOBJ old;
+    u8 *px;        // BGRX du masque ; seul l'octet bleu est lu
+    i32 w, h;      // dimensions du masque = destination × UI_AA_SS
+    Rect dst;
+} AaMask;
+
+// dib_create alloue un DIB 32 bits descendant (origine en haut à gauche).
+static HBITMAP dib_create(HDC ref, i32 w, i32 h, void **bits) {
+    BITMAPINFO bi;
+    memset(&bi, 0, sizeof(bi));
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    return CreateDIBSection(ref, &bi, DIB_RGB_COLORS, bits, NULL, 0);
+}
+
+static b32 aa_begin(AaMask *m, HDC dc, Rect dst) {
+    memset(m, 0, sizeof(*m));
+    if (dst.w <= 0 || dst.h <= 0 || dst.w > UI_AA_MAX || dst.h > UI_AA_MAX) return 0;
+    void *bits = NULL;
+    m->dst = dst;
+    m->w = dst.w * UI_AA_SS;
+    m->h = dst.h * UI_AA_SS;
+    m->bmp = dib_create(dc, m->w, m->h, &bits);
+    if (!m->bmp) return 0;
+    m->dc = CreateCompatibleDC(dc);
+    if (!m->dc) {
+        DeleteObject(m->bmp);
+        m->bmp = NULL;
+        return 0;
+    }
+    m->px = (u8 *)bits;  // CreateDIBSection rend la surface déjà à zéro : fond noir
+    m->old = SelectObject(m->dc, m->bmp);
+    return 1;
+}
+
+// aa_shape trace une forme pleine dans le masque : `on` ajoute de la couverture,
+// sinon il en retire (évidement — le moyeu de l'engrenage, par exemple).
+static void aa_shape(AaMask *m, const POINT *poly, int n, const Rect *disc, b32 on) {
+    COLORREF ink = on ? RGB(255, 255, 255) : RGB(0, 0, 0);
+    HBRUSH br = CreateSolidBrush(ink);
+    HPEN pen = CreatePen(PS_SOLID, 1, ink);
+    HGDIOBJ ob = SelectObject(m->dc, br);
+    HGDIOBJ op = SelectObject(m->dc, pen);
+    if (poly) Polygon(m->dc, poly, n);
+    if (disc) Ellipse(m->dc, disc->x, disc->y, disc->x + disc->w, disc->y + disc->h);
+    SelectObject(m->dc, ob);
+    SelectObject(m->dc, op);
+    DeleteObject(br);
+    DeleteObject(pen);
+}
+
+// aa_stroke trace une polyligne épaisse, bouts et coudes arrondis.
+static void aa_stroke(AaMask *m, const POINT *pts, int n, i32 width) {
+    LOGBRUSH lb;
+    lb.lbStyle = BS_SOLID;
+    lb.lbColor = RGB(255, 255, 255);
+    lb.lbHatch = 0;
+    HPEN pen = ExtCreatePen(PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_ROUND | PS_JOIN_ROUND, (DWORD)width, &lb, 0,
+                            NULL);
+    if (!pen) return;
+    HGDIOBJ op = SelectObject(m->dc, pen);
+    Polyline(m->dc, pts, n);
+    SelectObject(m->dc, op);
+    DeleteObject(pen);
+}
+
+// aa_end réduit le masque (moyenne de blocs UI_AA_SS × UI_AA_SS), compose la
+// couleur demandée sur `dc`, puis libère tout.
+static void aa_end(AaMask *m, HDC dc, u32 color) {
+    if (!m->bmp) return;
+    GdiFlush();  // les tracés doivent être visibles dans le DIB avant relecture
+    void *bits = NULL;
+    HBITMAP out = dib_create(dc, m->dst.w, m->dst.h, &bits);
+    HDC odc = out ? CreateCompatibleDC(dc) : NULL;
+    if (odc) {
+        HGDIOBJ oo = SelectObject(odc, out);
+        u8 *o = (u8 *)bits;
+        i32 sr = (i32)((color >> 16) & 0xff), sg = (i32)((color >> 8) & 0xff), sb = (i32)(color & 0xff);
+        for (i32 y = 0; y < m->dst.h; y++) {
+            for (i32 x = 0; x < m->dst.w; x++) {
+                i32 sum = 0;
+                for (i32 j = 0; j < UI_AA_SS; j++) {
+                    const u8 *row = m->px + ((isize)(y * UI_AA_SS + j) * m->w + (isize)x * UI_AA_SS) * 4;
+                    for (i32 i = 0; i < UI_AA_SS; i++) sum += row[i * 4];
+                }
+                i32 cov = sum / (UI_AA_SS * UI_AA_SS);
+                u8 *d = o + ((isize)y * m->dst.w + x) * 4;
+                d[0] = (u8)(sb * cov / 255);  // prémultiplié, comme l'exige AC_SRC_ALPHA
+                d[1] = (u8)(sg * cov / 255);
+                d[2] = (u8)(sr * cov / 255);
+                d[3] = (u8)cov;
+            }
+        }
+        BLENDFUNCTION bf;
+        bf.BlendOp = AC_SRC_OVER;
+        bf.BlendFlags = 0;
+        bf.SourceConstantAlpha = 255;
+        bf.AlphaFormat = AC_SRC_ALPHA;
+        GdiAlphaBlend(dc, m->dst.x, m->dst.y, m->dst.w, m->dst.h, odc, 0, 0, m->dst.w, m->dst.h, bf);
+        SelectObject(odc, oo);
+        DeleteDC(odc);
+    }
+    if (out) DeleteObject(out);
+    SelectObject(m->dc, m->old);
+    DeleteDC(m->dc);
+    DeleteObject(m->bmp);
+    memset(m, 0, sizeof(*m));
+}
+
+// sin_128 : sinus en millièmes, sur un tour découpé en 128 pas. Table du premier
+// quadrant plus symétries — de l'entier partout, aucune dépendance à math.h.
+static i32 sin_128(i32 k) {
+    static const i16 Q[33] = {0,   49,  98,  147, 195, 243, 290, 337, 383, 428, 471,
+                              514, 556, 596, 634, 672, 707, 741, 773, 803, 831, 858,
+                              882, 904, 924, 942, 957, 970, 981, 989, 995, 999, 1000};
+    k &= 127;
+    if (k <= 32) return Q[k];
+    if (k <= 64) return Q[64 - k];
+    if (k <= 96) return -Q[k - 64];
+    return -Q[128 - k];
+}
+
+static i32 cos_128(i32 k) { return sin_128(k + 32); }
+
+// fill_circle : disque anticrénelé (pastilles d'état). Repli sur RoundRect si le
+// masque n'a pas pu être alloué — mieux vaut créneler que ne rien dessiner.
+static void fill_circle(HDC dc, Rect r, u32 color) {
+    AaMask m;
+    if (!aa_begin(&m, dc, r)) {
+        fill_round(dc, r, VS_MIN(r.w, r.h) / 2, color);
+        return;
+    }
+    i32 d = VS_MIN(m.w, m.h);
+    Rect disc = rect((m.w - d) / 2, (m.h - d) / 2, d, d);
+    aa_shape(&m, NULL, 0, &disc, 1);
+    aa_end(&m, dc, color);
+}
+
 // wide convertit une tranche UTF-8 en UTF-16 dans l'arène de frame.
 static const wchar_t *wide(UiApp *a, Str8 s, isize *out_len) {
     return (const wchar_t *)utf8_to_utf16(a->scratch, s, out_len);
@@ -490,16 +650,31 @@ static b32 button(UiApp *a, HDC dc, Rect r, const char *label, u64 id, BtnStyle 
 // glyph_play dessine ▶ ou ❚❚ à la main : aucune dépendance à une police
 // d'icônes, un rendu net à tous les DPI.
 static void glyph_play(HDC dc, Rect r, u32 color, b32 show_play) {
+    if (show_play) {
+        // Les deux flancs du triangle sont obliques : sans anticrénelage, ils
+        // montent en marches d'escalier bien visibles sur un bouton violet.
+        AaMask m;
+        if (aa_begin(&m, dc, r)) {
+            POINT p[3] = {
+                {m.w / 6, 0},
+                {m.w - m.w / 8, m.h / 2},
+                {m.w / 6, m.h},
+            };
+            aa_shape(&m, p, 3, NULL, 1);
+            aa_end(&m, dc, color);
+            return;
+        }
+    }
+    // Pause : deux barres à angles droits, que GDI rend déjà parfaitement.
     HBRUSH br = CreateSolidBrush(cr(color));
     HPEN pen = CreatePen(PS_SOLID, 1, cr(color));
     HGDIOBJ ob = SelectObject(dc, br);
     HGDIOBJ op = SelectObject(dc, pen);
     if (show_play) {
-        i32 w = r.w, h = r.h;
         POINT p[3] = {
-            {r.x + w / 6, r.y},
-            {r.x + w - w / 8, r.y + h / 2},
-            {r.x + w / 6, r.y + h},
+            {r.x + r.w / 6, r.y},
+            {r.x + r.w - r.w / 8, r.y + r.h / 2},
+            {r.x + r.w / 6, r.y + r.h},
         };
         Polygon(dc, p, 3);
     } else {
@@ -553,42 +728,37 @@ static Str8 bullets(UiApp *a, isize count) {
     return str8(buf, n);
 }
 
-// glyph_gear dessine un engrenage à 8 dents en primitives : un polygone dont le
-// rayon alterne toutes les 22,5°, plus un moyeu. Table de cosinus en millièmes
-// pour rester en entiers — net à tous les DPI, sans police d'icônes.
-static void glyph_gear(HDC dc, Rect r, u32 color, u32 hub_color) {
-    static const i32 COS[16] = {1000, 924,  707,  383,  0,    -383, -707, -924,
-                                -1000, -924, -707, -383, 0,    383,  707,  924};
-    i32 ro = VS_MIN(r.w, r.h) / 2;
-    if (ro < 4) return;
-    i32 ri = ro * 66 / 100;
-    i32 cx = r.x + r.w / 2, cy = r.y + r.h / 2;
-    POINT p[16];
-    for (int k = 0; k < 16; k++) {
-        i32 rad = (k % 2 == 0) ? ro : ri;
-        p[k].x = cx + COS[k] * rad / 1000;
-        p[k].y = cy + COS[(k + 12) % 16] * rad / 1000;  // sin(x) = cos(x − 90°)
+// glyph_gear dessine un engrenage à 8 dents. L'ancienne version alternait deux
+// rayons tous les 22,5° : ça ne fait pas des dents mais des pointes, d'où
+// l'étoile à huit branches qu'on voyait à la place d'une roue. Une vraie dent
+// demande quatre sommets — pied, sommet, sommet, pied — donc un flanc incliné et
+// un plat en tête. Sur 128 pas de tour, la denture fait 16 pas : le plat occupe
+// ±3, le pied ±5, ce qui laisse 6 pas de creux entre deux dents.
+//
+// Le moyeu est un évidement (couverture retirée) et non un disque de la couleur
+// du fond : le bouton peut changer de teinte au survol sans que la roue s'en
+// aperçoive.
+static void glyph_gear(HDC dc, Rect r, u32 color) {
+    AaMask m;
+    if (!aa_begin(&m, dc, r)) return;
+    i32 ro = VS_MIN(m.w, m.h) / 2;
+    i32 rr = ro * 74 / 100;  // rayon de pied
+    i32 cx = m.w / 2, cy = m.h / 2;
+    static const i32 OFF[4] = {-5, -3, 3, 5};
+    POINT p[32];
+    for (i32 t = 0; t < 8; t++) {
+        for (i32 i = 0; i < 4; i++) {
+            i32 k = t * 16 + OFF[i];
+            i32 rad = (i == 1 || i == 2) ? ro : rr;
+            p[t * 4 + i].x = cx + cos_128(k) * rad / 1000;
+            p[t * 4 + i].y = cy + sin_128(k) * rad / 1000;
+        }
     }
-    HBRUSH br = CreateSolidBrush(cr(color));
-    HPEN pen = CreatePen(PS_SOLID, 1, cr(color));
-    HGDIOBJ ob = SelectObject(dc, br);
-    HGDIOBJ op = SelectObject(dc, pen);
-    Polygon(dc, p, 16);
-    SelectObject(dc, ob);
-    SelectObject(dc, op);
-    DeleteObject(br);
-    DeleteObject(pen);
-
-    i32 hub = ro * 34 / 100;
-    HBRUSH hb = CreateSolidBrush(cr(hub_color));
-    HPEN hp = CreatePen(PS_SOLID, 1, cr(hub_color));
-    ob = SelectObject(dc, hb);
-    op = SelectObject(dc, hp);
-    Ellipse(dc, cx - hub, cy - hub, cx + hub, cy + hub);
-    SelectObject(dc, ob);
-    SelectObject(dc, op);
-    DeleteObject(hb);
-    DeleteObject(hp);
+    aa_shape(&m, p, 32, NULL, 1);
+    i32 hub = ro * 36 / 100;
+    Rect hole = rect(cx - hub, cy - hub, 2 * hub, 2 * hub);
+    aa_shape(&m, NULL, 0, &hole, 0);
+    aa_end(&m, dc, color);
 }
 
 // field dessine un champ de saisie. Renvoie 1 si Entrée a été pressée dedans.
@@ -783,17 +953,18 @@ static b32 checkbox(UiApp *a, HDC dc, Rect r, const char *text, b32 *value, u64 
     stroke_round(dc, b, S(a, 4), *value ? UI_ACCENT_HI : (hover ? UI_MUTED : UI_LINE), 1);
     if (a->focus == id) stroke_round(dc, rect_inset(b, -2), S(a, 6), UI_ACCENT_HI, 1);
     if (*value) {
-        // Coche : deux segments, nets à tous les DPI.
-        HPEN pen = CreatePen(PS_SOLID, VS_MAX(2, S(a, 2)), cr(0xffffffu));
-        HGDIOBJ op = SelectObject(dc, pen);
-        POINT pts[3] = {
-            {b.x + box / 4, b.y + box / 2},
-            {b.x + box * 45 / 100, b.y + box * 70 / 100},
-            {b.x + box * 78 / 100, b.y + box * 30 / 100},
-        };
-        Polyline(dc, pts, 3);
-        SelectObject(dc, op);
-        DeleteObject(pen);
+        // Coche : deux segments obliques, donc anticrénelés — au trait GDI nu,
+        // la branche montante partait en escalier d'un pixel sur deux.
+        AaMask m;
+        if (aa_begin(&m, dc, b)) {
+            POINT pts[3] = {
+                {m.w * 25 / 100, m.h * 51 / 100},
+                {m.w * 43 / 100, m.h * 70 / 100},
+                {m.w * 77 / 100, m.h * 31 / 100},
+            };
+            aa_stroke(&m, pts, 3, VS_MAX(2, S(a, 2)) * UI_AA_SS);
+            aa_end(&m, dc, 0xffffffu);
+        }
     }
     draw_text(a, dc, rect(b.x + box + S(a, 9), r.y, r.w - box - S(a, 9), r.h), text,
               hover ? UI_TEXT : UI_MUTED, a->f_small, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
@@ -924,6 +1095,10 @@ static void free_fonts(UiApp *app) {
 
 void ui_release(UiApp *app) {
     free_fonts(app);
+    if (app->logo_bmp) {
+        DeleteObject(app->logo_bmp);
+        app->logo_bmp = NULL;
+    }
     if (app->scratch) {
         arena_destroy(app->scratch);
         app->scratch = NULL;
@@ -992,9 +1167,8 @@ enum {
 static b32 gear_button(UiApp *a, HDC dc, Rect r) {
     b32 hover = !a->input_locked && rect_hit(r, a->mouse_x, a->mouse_y);
     b32 clicked = button(a, dc, r, "", ID_GEAR, BTN_GHOST, 1);
-    i32 g = VS_MIN(r.w, r.h) - S(a, 14);
-    glyph_gear(dc, rect(r.x + (r.w - g) / 2, r.y + (r.h - g) / 2, g, g), hover ? UI_TEXT : UI_MUTED,
-               hover ? UI_PANEL_HI : UI_PANEL);
+    i32 g = VS_MIN(r.w, r.h) - S(a, 12);
+    glyph_gear(dc, rect(r.x + (r.w - g) / 2, r.y + (r.h - g) / 2, g, g), hover ? UI_TEXT : UI_MUTED);
     return clicked;
 }
 
@@ -1022,9 +1196,97 @@ static void health_line(UiApp *a, HDC dc, Rect r) {
         default: break;
     }
     i32 d = S(a, 8);
-    fill_round(dc, rect(r.x, r.y + (r.h - d) / 2, d, d), d / 2, col);
+    fill_circle(dc, rect(r.x, r.y + (r.h - d) / 2, d, d), col);
     draw_text(a, dc, rect(r.x + d + S(a, 7), r.y, r.w - d - S(a, 7), r.h), label, col == UI_FAINT ? UI_FAINT : UI_MUTED,
               a->f_small, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+}
+
+// ---- logo de l'application ----
+//
+// Le logo de l'en-tête EST l'icône de l'exe (ressource 1, le vibesync.ico que
+// montrent l'explorateur et la barre des tâches) : fini la pastille dessinée à
+// la main qui ne ressemblait à rien de la marque. Le .ico embarque un calque
+// 256 × 256 ; on le tire à cette définition, on le compose sur la couleur du
+// panneau, puis on le réduit nous-mêmes par moyenne de blocs. C'est ce dernier
+// point qui compte : LoadImage et DrawIconEx ne savent redimensionner qu'au plus
+// proche voisin, ce qui donne une bouillie d'escaliers à 32 px. La moyenne, elle,
+// donne un logo net à 100 % comme à 150 %, et toujours identique à l'icône.
+//
+// Le résultat est mis en cache pour la taille courante : le coût (un DrawIconEx
+// 256² et 65 536 pixels moyennés) n'est payé qu'une fois par DPI.
+#define UI_LOGO_SRC 256
+
+static void logo_build(UiApp *a, HDC dc, i32 px) {
+    // logo_px mémorise la taille *tentée*, pas seulement celle qui a réussi :
+    // sans ressource icône (binaire de test), on ne rappelle pas LoadImage à
+    // chaque frame pour se voir répondre NULL.
+    if (a->logo_px == px) return;
+    if (a->logo_bmp) {
+        DeleteObject(a->logo_bmp);
+        a->logo_bmp = NULL;
+    }
+    a->logo_px = px;
+    if (px <= 0 || px > UI_LOGO_SRC) return;
+    HICON ico = (HICON)LoadImageW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1), IMAGE_ICON, UI_LOGO_SRC,
+                                  UI_LOGO_SRC, LR_DEFAULTCOLOR);
+    if (!ico) return;  // pas de ressource (binaire de test) : l'appelant se rabat
+    void *sbits = NULL;
+    HBITMAP src = dib_create(dc, UI_LOGO_SRC, UI_LOGO_SRC, &sbits);
+    HDC sdc = src ? CreateCompatibleDC(dc) : NULL;
+    if (sdc) {
+        HGDIOBJ so = SelectObject(sdc, src);
+        fill_rect(sdc, rect(0, 0, UI_LOGO_SRC, UI_LOGO_SRC), UI_PANEL);
+        DrawIconEx(sdc, 0, 0, ico, UI_LOGO_SRC, UI_LOGO_SRC, 0, NULL, DI_NORMAL);
+        GdiFlush();
+        void *dbits = NULL;
+        HBITMAP dst = dib_create(dc, px, px, &dbits);
+        if (dst) {
+            const u8 *s = (const u8 *)sbits;
+            u8 *d = (u8 *)dbits;
+            for (i32 y = 0; y < px; y++) {
+                i32 y0 = y * UI_LOGO_SRC / px, y1 = (y + 1) * UI_LOGO_SRC / px;
+                for (i32 x = 0; x < px; x++) {
+                    i32 x0 = x * UI_LOGO_SRC / px, x1 = (x + 1) * UI_LOGO_SRC / px;
+                    i32 sb = 0, sg = 0, sr = 0, n = (y1 - y0) * (x1 - x0);
+                    for (i32 j = y0; j < y1; j++) {
+                        const u8 *row = s + ((isize)j * UI_LOGO_SRC + x0) * 4;
+                        for (i32 i = x0; i < x1; i++, row += 4) {
+                            sb += row[0];
+                            sg += row[1];
+                            sr += row[2];
+                        }
+                    }
+                    u8 *o = d + ((isize)y * px + x) * 4;
+                    o[0] = (u8)(sb / n);
+                    o[1] = (u8)(sg / n);
+                    o[2] = (u8)(sr / n);
+                    o[3] = 255;
+                }
+            }
+            a->logo_bmp = dst;
+        }
+        SelectObject(sdc, so);
+        DeleteDC(sdc);
+    }
+    if (src) DeleteObject(src);
+    DestroyIcon(ico);
+}
+
+// logo_draw pose le logo dans un carré. Les pixels sont déjà composés sur
+// UI_PANEL : le logo ne va que sur la carte de connexion, dont c'est le fond.
+static void logo_draw(UiApp *a, HDC dc, Rect r) {
+    logo_build(a, dc, r.w);
+    if (!a->logo_bmp) {
+        i32 d = r.w / 2;
+        fill_circle(dc, rect(r.x + (r.w - d) / 2, r.y + (r.h - d) / 2, d, d), UI_ACCENT);
+        return;
+    }
+    HDC mdc = CreateCompatibleDC(dc);
+    if (!mdc) return;
+    HGDIOBJ ob = SelectObject(mdc, a->logo_bmp);
+    BitBlt(dc, r.x, r.y, r.w, r.h, mdc, 0, 0, SRCCOPY);
+    SelectObject(mdc, ob);
+    DeleteDC(mdc);
 }
 
 static void screen_connect(UiApp *a, HDC dc, i64 now_ms) {
@@ -1043,10 +1305,10 @@ static void screen_connect(UiApp *a, HDC dc, i64 now_ms) {
     i32 x = card.x + pad, w = card.w - 2 * pad;
     i32 y = card.y + pad;
 
-    // Marque : une pastille d'accent puis le nom.
-    i32 dot = S(a, 12);
-    fill_round(dc, rect(x, y + S(a, 14), dot, dot), dot / 2, UI_ACCENT);
-    draw_text(a, dc, rect(x + dot + S(a, 10), y, w, S(a, 40)), "vibesync", UI_TEXT, a->f_huge,
+    // Marque : l'icône de l'application, puis le nom.
+    i32 logo = S(a, 32);
+    logo_draw(a, dc, rect(x, y + S(a, 6), logo, logo));
+    draw_text(a, dc, rect(x + logo + S(a, 10), y, w, S(a, 40)), "vibesync", UI_TEXT, a->f_huge,
               DT_LEFT | DT_TOP | DT_SINGLELINE);
     i32 gs = S(a, 34);
     if (gear_button(a, dc, rect(x + w - gs, y + S(a, 4), gs, gs))) a->act_settings_open = 1;

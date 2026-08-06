@@ -1923,8 +1923,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show) {
 
     // Mode capture : rendu des deux écrans en PNG, puis sortie.
     {
-        Str8 dir;
+        Str8 dir, dpi_arg;
         if (cmd_opt(cl, "--capture", &dir)) {
+            // « --dpi 144 » force l'échelle de la capture : c'est le seul moyen
+            // de vérifier le rendu à 150 % sans changer l'écran de la machine.
+            if (cmd_opt(cl, "--dpi", &dpi_arg)) {
+                i64 v = 0;
+                if (str_to_i64(dpi_arg, &v) && v >= 96 && v <= 384) ui_set_dpi(&app->ui, (i32)v);
+            }
             capture_screens(app, str8_copy(scratch, dir));
             char msg[128];
             snprintf(msg, sizeof(msg), "captures ecrites en %lld ms\n",

@@ -287,6 +287,12 @@ typedef struct {
     i32 dpi;
     i32 width, height;
     HFONT f_body, f_small, f_bold, f_title, f_huge;
+    // Logo de l'écran de connexion : l'icône de l'application (ressource 1 de
+    // l'exe) réduite une fois pour toutes à la taille du DPI courant. NULL tant
+    // qu'elle n'a pas été construite, ou si la ressource manque (binaire de
+    // test) — le dessin retombe alors sur une pastille d'accent.
+    HBITMAP logo_bmp;
+    i32 logo_px;
     HWND hwnd;
     Arena *scratch;  // arène de frame (conversions UTF-16, mises en forme)
     b32 need_timer;  // vrai si la frame veut être rafraîchie régulièrement
