@@ -143,6 +143,10 @@ public struct Engine {
     public private(set) var fileDurationSec: Double = 0
     public private(set) var fileSizeBytes: Int64 = 0
     public private(set) var haveFile: Bool = false
+    /// §Chargement de fichier : `setFile` n'est envoyé qu'une fois l'état
+    /// « en pause » effectivement observé (VLC démarre la lecture tout seul à
+    /// l'ouverture ; le driver force pause + position 0, cette course est réelle).
+    public private(set) var fileDeclared: Bool = false
 
     // tâches périodiques
     private var lastPing: Nanos? = nil
@@ -316,8 +320,9 @@ public struct Engine {
         if let r = selfReady {
             ready = r
         }
-        // Re-déclarer notre état après un (re)join.
-        if haveFile {
+        // Re-déclarer notre état après un (re)join — seulement si le fichier a
+        // déjà été reconnu comme chargé (§Chargement de fichier).
+        if haveFile && fileDeclared {
             out.append(.server(.setFile(name: fileName,
                                         durationSec: fileDurationSec,
                                         sizeBytes: fileSizeBytes)))
@@ -330,12 +335,16 @@ public struct Engine {
 
     // MARK: - Lecteur
 
+    /// Un fichier vient d'être ouvert dans VLC. Aucun `setFile` n'est émis ici :
+    /// c'est le driver qui force pause + position 0, et le fichier n'est déclaré
+    /// qu'une fois cette pause observée (§Chargement de fichier).
     @discardableResult
     public mutating func openFile(name: String, sizeBytes: Int64) -> [Decision] {
         fileName = name
         fileDurationSec = 0
         fileSizeBytes = sizeBytes
         haveFile = true
+        fileDeclared = false
         status = VLCStatus()
         haveStatus = false
         expect = Expectation()
@@ -343,12 +352,17 @@ public struct Engine {
         buffering = false
         vlcError = false
         appliedRate = 1
-        return [.server(.setFile(name: name, durationSec: 0, sizeBytes: sizeBytes))]
+        return []
     }
 
-    /// Envoie setFile dès qu'un fichier (et sa durée) est connu.
+    /// Envoie setFile dès que le fichier est chargé, en pause, et sa durée connue.
     private mutating func declareFile(_ st: VLCStatus, _ out: inout [Decision]) {
         if !st.loaded || st.lengthSec <= 0 {
+            return
+        }
+        // Tant que la pause forcée du chargement n'a pas été observée, on ne
+        // déclare rien : la durée et le nom rapportés ne sont pas fiables.
+        if !fileDeclared && st.state != .paused {
             return
         }
         var name = st.fileName
@@ -361,6 +375,7 @@ public struct Engine {
         fileName = name
         fileDurationSec = st.lengthSec
         haveFile = true
+        fileDeclared = true
         out.append(.server(.setFile(name: name,
                                     durationSec: st.lengthSec,
                                     sizeBytes: fileSizeBytes)))
@@ -517,10 +532,21 @@ public struct Engine {
                 acts.append(VLCCommand(.seek, expected))
                 correcting = .seek
             }
-        } else {
-            if status.state == .paused {
-                acts.append(VLCCommand(.resume))
+        } else if status.state == .paused {
+            // §Départ et reprise de lecture : la salle passe en lecture alors
+            // que VLC est en pause. On cale d'abord VLC sur la position de
+            // référence (seek au-delà de 0,3 s d'écart) PUIS on lance la
+            // lecture — le nudge à 5 %/s mettrait 10 s à résorber 0,5 s.
+            nudging = false
+            if absDrift >= Sync.startSeekSec {
+                acts.append(VLCCommand(.seek, expected))
+                correcting = .seek
             }
+            acts.append(VLCCommand(.resume))
+            if abs(appliedRate - base) > 1e-3 || abs(status.rate - base) > 1e-3 {
+                acts.append(VLCCommand(.rate, base))
+            }
+        } else {
             var target = base
             var wantRate = false
             if absDrift >= Sync.hardSeekSec {

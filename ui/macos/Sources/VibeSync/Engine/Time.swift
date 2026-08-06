@@ -56,6 +56,9 @@ public enum Sync {
     public static let nudgeSlow: Double = 0.95
     public static let nudgeExitSec: Double = 0.03
     public static let userSeekSec: Double = 3.0
+    /// Départ/reprise de lecture : on cale VLC sur la position de référence
+    /// avant de lancer la lecture plutôt que de compter sur le nudge (5 %/s).
+    public static let startSeekSec: Double = 0.3
     public static let graceWindow: Nanos = 500 * 1_000_000
     public static let userHold: Nanos = 2000 * 1_000_000
     public static let pausedSeekSec: Double = 0.6

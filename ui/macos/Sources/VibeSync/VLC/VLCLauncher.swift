@@ -106,7 +106,15 @@ public enum VLCLauncher {
         client.waitReady(timeoutSec: timeoutSec) { result in
             switch result {
             case .success:
-                completion(.success(handle))
+                // §Chargement de fichier : VLC démarre la lecture tout seul à
+                // l'ouverture. On force pause + position 0 avant de rendre la
+                // main ; le moteur ne déclarera le fichier (`setFile`) qu'une
+                // fois cette pause effectivement observée.
+                client.apply(VLCCommand(.pause)) { _ in
+                    client.apply(VLCCommand(.seek, 0)) { _ in
+                        completion(.success(handle))
+                    }
+                }
             case .failure(let err):
                 handle.terminate()
                 completion(.failure(err))
