@@ -17,12 +17,15 @@ socket RC — à valider par une recherche avant d'implémenter.
 
 ## Critères d'acceptation
 
-- [ ] Recherche : faisabilité OSD via RC/marq (ou alternative 0-dépendance),
-      rapport dans docs/research/
-- [ ] Si faisable : spec amendée, implémentation Go de référence + port C (+ Swift),
-      messages français sobres, désactivable dans les réglages
-- [ ] Si infaisable proprement : décision documentée (ADR court) + repli (toasts app)
+- [x] Recherche : RC/marq et HTTP infaisables sur VLC 3.x (testé en réel) —
+      `research/2026-08-06-recherche-osd-vlc.md`
+- [x] Décision documentée : ADR-009 — OSD par fenêtre overlay maison sur VLC
+- [ ] Implémentation Windows (ui/win32) : overlay layered topmost cliquable-au-travers,
+      messages « X a mis pause / a avancé à HH:MM:SS », fondu, réglage on/off
+- [ ] Implémentation macOS (ui/macos) au moment du polissage Mac
 
 ## Journal du ticket
 
 - 2026-08-06 : créé.
+- 2026-08-06 : recherche faite (verdict infaisable en natif VLC), ADR-009 acté :
+  overlay maison. Implémentation à planifier après VS-017/018.
