@@ -85,6 +85,14 @@ Source de vérité du protocole client↔serveur. Les types Go correspondants vi
   la position attendue puis affinage par nudge. Jamais de nudge en pause : seek
   uniquement, et seulement si `|drift| ≥ 0,6 s` (le seek HTTP de VLC est arrondi à
   la seconde ; sous ce seuil il serait un no-op ou une oscillation).
+- **Chargement de fichier** : au lancement de VLC sur un fichier, le driver force
+  immédiatement pause + position 0 et ne déclare le fichier chargé (`setFile`)
+  qu'une fois l'état « en pause » effectivement observé — VLC démarre la lecture
+  automatiquement à l'ouverture, cette course est réelle.
+- **Départ et reprise de lecture** : quand un `roomState` fait passer de pause à
+  lecture, le client cale d'abord VLC sur la position de référence (seek si
+  l'écart est ≥ 0,3 s) puis lance la lecture — on ne compte pas sur le nudge pour
+  résorber un écart de départ (5 %/s : 0,5 s coûterait 10 s de convergence).
 - **Hold post-action** : après l'envoi d'un `control` issu d'une action utilisateur
   locale, le moteur suspend toute correction (nudge/seek) pendant 2 s. Le hold n'est
   levé que par l'**écho** du serveur (`roomState` avec `setBy` = soi) ou par

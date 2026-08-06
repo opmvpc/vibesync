@@ -1,0 +1,539 @@
+#include "vlc.h"
+
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+
+#include <string.h>
+
+const char *vlc_error_text(VlcError e) {
+    switch (e) {
+        case VLC_OK: return "ok";
+        case VLC_ERR_NOT_FOUND: return "exécutable VLC introuvable (installez VLC ou renseignez VIBESYNC_VLC)";
+        case VLC_ERR_SPAWN: return "démarrage de VLC impossible";
+        case VLC_ERR_SOCKET: return "socket indisponible";
+        case VLC_ERR_CONNECT: return "interface HTTP de VLC injoignable";
+        case VLC_ERR_SEND: return "envoi vers VLC impossible";
+        case VLC_ERR_RECV: return "réponse de VLC illisible";
+        case VLC_ERR_HTTP: return "statut HTTP inattendu";
+        case VLC_ERR_AUTH: return "authentification refusée par l'interface HTTP";
+        case VLC_ERR_JSON: return "status.json illisible";
+        case VLC_ERR_TIMEOUT: return "interface HTTP de VLC muette";
+    }
+    return "erreur inconnue";
+}
+
+// ------------------------------------------------------------------ base64 ---
+
+isize base64_encode(const u8 *in, isize n, char *out, isize cap) {
+    static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    isize need = 4 * ((n + 2) / 3);
+    if (cap < need + 1) return 0;
+    isize o = 0;
+    isize i = 0;
+    while (i + 3 <= n) {
+        u32 v = ((u32)in[i] << 16) | ((u32)in[i + 1] << 8) | in[i + 2];
+        out[o++] = tbl[(v >> 18) & 63];
+        out[o++] = tbl[(v >> 12) & 63];
+        out[o++] = tbl[(v >> 6) & 63];
+        out[o++] = tbl[v & 63];
+        i += 3;
+    }
+    isize rest = n - i;
+    if (rest == 1) {
+        u32 v = (u32)in[i] << 16;
+        out[o++] = tbl[(v >> 18) & 63];
+        out[o++] = tbl[(v >> 12) & 63];
+        out[o++] = '=';
+        out[o++] = '=';
+    } else if (rest == 2) {
+        u32 v = ((u32)in[i] << 16) | ((u32)in[i + 1] << 8);
+        out[o++] = tbl[(v >> 18) & 63];
+        out[o++] = tbl[(v >> 12) & 63];
+        out[o++] = tbl[(v >> 6) & 63];
+        out[o++] = '=';
+    }
+    out[o] = 0;
+    return o;
+}
+
+// -------------------------------------------------------------------- HTTP ---
+
+static b32 header_value(Str8 headers, const char *name, Str8 *out) {
+    Str8 key = str8_from_cstr(name);
+    isize i = 0;
+    while (i < headers.len) {
+        isize eol = i;
+        while (eol < headers.len && headers.data[eol] != '\n') eol++;
+        Str8 line = str8_sub(headers, i, eol - i);
+        if (line.len > 0 && line.data[line.len - 1] == '\r') line.len--;
+        isize colon = str8_find_char(line, ':', 0);
+        if (colon > 0) {
+            Str8 k = str8_trim(str8_sub(line, 0, colon));
+            if (k.len == key.len) {
+                b32 same = 1;
+                for (isize j = 0; j < k.len; j++) {
+                    u8 a = k.data[j], b = key.data[j];
+                    if (a >= 'A' && a <= 'Z') a = (u8)(a + 32);
+                    if (b >= 'A' && b <= 'Z') b = (u8)(b + 32);
+                    if (a != b) {
+                        same = 0;
+                        break;
+                    }
+                }
+                if (same) {
+                    *out = str8_trim(str8_sub(line, colon + 1, -1));
+                    return 1;
+                }
+            }
+        }
+        i = eol + 1;
+    }
+    return 0;
+}
+
+static b32 hex_to_i64(Str8 s, i64 *out) {
+    s = str8_trim(s);
+    // Une extension de chunk (« 1a;foo ») est tolérée.
+    isize semi = str8_find_char(s, ';', 0);
+    if (semi >= 0) s = str8_sub(s, 0, semi);
+    s = str8_trim(s);
+    if (s.len == 0 || s.len > 15) return 0;
+    i64 v = 0;
+    for (isize i = 0; i < s.len; i++) {
+        u8 c = s.data[i];
+        i64 nib;
+        if (c >= '0' && c <= '9') nib = c - '0';
+        else if (c >= 'a' && c <= 'f') nib = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') nib = c - 'A' + 10;
+        else return 0;
+        v = v * 16 + nib;
+    }
+    *out = v;
+    return 1;
+}
+
+static b32 dechunk(Arena *a, Str8 in, Str8 *out) {
+    Builder b;
+    builder_init(&b, a, in.len + 1);
+    isize i = 0;
+    for (;;) {
+        isize eol = i;
+        while (eol < in.len && in.data[eol] != '\n') eol++;
+        if (eol >= in.len) return 0;
+        i64 size = 0;
+        if (!hex_to_i64(str8_sub(in, i, eol - i), &size)) return 0;
+        i = eol + 1;
+        if (size == 0) break;
+        if (i + size > in.len) return 0;
+        builder_bytes(&b, in.data + i, (isize)size);
+        i += (isize)size;
+        // CRLF de fin de bloc
+        while (i < in.len && (in.data[i] == '\r' || in.data[i] == '\n')) i++;
+    }
+    *out = builder_result(&b);
+    return 1;
+}
+
+b32 http_parse_response(Arena *a, Str8 raw, int *status_code, Str8 *body) {
+    *status_code = 0;
+    *body = str8_lit("");
+    if (raw.len < 12) return 0;
+    if (!str8_starts_with(raw, str8_lit("HTTP/"))) return 0;
+    isize sp = str8_find_char(raw, ' ', 0);
+    if (sp < 0 || sp + 4 > raw.len) return 0;
+    i64 code = 0;
+    if (!str_to_i64(str8_sub(raw, sp + 1, 3), &code)) return 0;
+    *status_code = (int)code;
+
+    // Fin des en-têtes : \r\n\r\n (ou \n\n, tolérance).
+    isize hdr_end = -1;
+    isize skip = 0;
+    for (isize i = 0; i + 1 < raw.len; i++) {
+        if (raw.data[i] == '\n' && raw.data[i + 1] == '\n') {
+            hdr_end = i;
+            skip = 2;
+            break;
+        }
+        if (i + 3 < raw.len && raw.data[i] == '\r' && raw.data[i + 1] == '\n' && raw.data[i + 2] == '\r' &&
+            raw.data[i + 3] == '\n') {
+            hdr_end = i;
+            skip = 4;
+            break;
+        }
+    }
+    if (hdr_end < 0) return 0;
+    Str8 headers = str8_sub(raw, 0, hdr_end);
+    Str8 rest = str8_sub(raw, hdr_end + skip, -1);
+
+    Str8 te;
+    if (header_value(headers, "Transfer-Encoding", &te) && te.len >= 7) {
+        // « chunked » éventuellement précédé d'autres codages
+        b32 chunked = 0;
+        for (isize i = 0; i + 7 <= te.len; i++) {
+            if (memcmp(te.data + i, "chunked", 7) == 0 || memcmp(te.data + i, "Chunked", 7) == 0) {
+                chunked = 1;
+                break;
+            }
+        }
+        if (chunked) return dechunk(a, rest, body);
+    }
+    Str8 cl;
+    if (header_value(headers, "Content-Length", &cl)) {
+        i64 n = 0;
+        if (!str_to_i64(cl, &n) || n < 0) return 0;
+        if (n > rest.len) return 0;  // réponse tronquée
+        *body = str8_sub(rest, 0, (isize)n);
+        return 1;
+    }
+    *body = rest;  // fermeture de connexion = fin du corps
+    return 1;
+}
+
+Str8 vlc_build_request(Arena *a, Str8 path, Str8 auth_b64, int port) {
+    Builder b;
+    builder_init(&b, a, 256);
+    builder_cstr(&b, "GET ");
+    builder_str(&b, path);
+    builder_cstr(&b, " HTTP/1.1\r\nHost: " VLC_HOST ":");
+    builder_i64(&b, port);
+    builder_cstr(&b, "\r\nAuthorization: Basic ");
+    builder_str(&b, auth_b64);
+    builder_cstr(&b, "\r\nUser-Agent: vibesync\r\nAccept: application/json\r\nConnection: close\r\n\r\n");
+    return builder_result(&b);
+}
+
+// ---------------------------------------------------------- socket Winsock ---
+
+static b32 g_wsa_ready = 0;
+
+static b32 winsock_init(void) {
+    if (g_wsa_ready) return 1;
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 0;
+    g_wsa_ready = 1;
+    return 1;
+}
+
+// http_get exécute une requête complète vers l'interface locale de VLC.
+static VlcError http_get(VlcClient *c, Arena *scratch, Str8 path, Str8 *body_out) {
+    if (!winsock_init()) return VLC_ERR_SOCKET;
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return VLC_ERR_SOCKET;
+
+    DWORD timeout = 2000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&timeout, sizeof(timeout));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout, sizeof(timeout));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((u16)c->port);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(s, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        closesocket(s);
+        return VLC_ERR_CONNECT;
+    }
+
+    Str8 req = vlc_build_request(scratch, path, str8_from_cstr(c->auth_b64), c->port);
+    isize sent = 0;
+    while (sent < req.len) {
+        int n = send(s, (const char *)req.data + sent, (int)(req.len - sent), 0);
+        if (n <= 0) {
+            closesocket(s);
+            return VLC_ERR_SEND;
+        }
+        sent += n;
+    }
+    shutdown(s, SD_SEND);
+
+    Builder resp;
+    builder_init(&resp, scratch, VS_KB(16));
+    char chunk[4096];
+    for (;;) {
+        int n = recv(s, chunk, (int)sizeof(chunk), 0);
+        if (n == 0) break;
+        if (n < 0) {
+            closesocket(s);
+            return VLC_ERR_RECV;
+        }
+        builder_bytes(&resp, chunk, n);
+        if (resp.len > VS_MB(4)) break;  // borne dure : VLC ne renvoie que du JSON court
+    }
+    closesocket(s);
+
+    int code = 0;
+    Str8 body;
+    if (!http_parse_response(scratch, builder_result(&resp), &code, &body)) return VLC_ERR_RECV;
+    if (code == 401) return VLC_ERR_AUTH;
+    if (code != 200) return VLC_ERR_HTTP;
+    *body_out = body;
+    return VLC_OK;
+}
+
+// -------------------------------------------------------------- status.json ---
+
+static f64 clamp01(f64 v) {
+    if (!f64_is_finite(v) || v < 0) return 0;
+    if (v > 1) return 1;
+    return v;
+}
+
+static void lower_ascii(Str8 s, char *out, isize cap) {
+    isize n = VS_MIN(s.len, cap - 1);
+    for (isize i = 0; i < n; i++) {
+        u8 c = s.data[i];
+        out[i] = (char)((c >= 'A' && c <= 'Z') ? c + 32 : c);
+    }
+    out[n] = 0;
+}
+
+// meta_file_name reprend l'ordre de préférence de la référence Go.
+static Str8 meta_file_name(const JsonValue *root) {
+    const JsonValue *info = json_get(root, "information");
+    const JsonValue *cat = json_get(info, "category");
+    const JsonValue *meta = json_get(cat, "meta");
+    if (!meta) return str8_lit("");
+    static const char *keys[] = {"filename", "title", "now_playing"};
+    for (isize i = 0; i < (isize)(sizeof(keys) / sizeof(keys[0])); i++) {
+        Str8 v = json_get_str(meta, keys[i], str8_lit(""));
+        if (str8_trim(v).len > 0) return v;
+    }
+    return str8_lit("");
+}
+
+b32 vlc_parse_status(Arena *scratch, Str8 body, VsStatus *out) {
+    JsonError err = JSON_OK;
+    JsonValue *root = json_parse(scratch, body, &err);
+    if (!root || root->kind != JSON_OBJECT) return 0;
+
+    memset(out, 0, sizeof(*out));
+    out->state = VS_PLAY_STOPPED;
+
+    f64 length = json_get_num(root, "length", 0);
+    if (f64_is_finite(length) && length > 0) out->length_sec = length;
+
+    f64 rate = json_get_num(root, "rate", 0);
+    out->rate = (f64_is_finite(rate) && rate > 0) ? rate : 1;
+
+    char st[32];
+    lower_ascii(json_get_str(root, "state", str8_lit("")), st, sizeof(st));
+    if (strcmp(st, "playing") == 0) out->state = VS_PLAY_PLAYING;
+    else if (strcmp(st, "paused") == 0) out->state = VS_PLAY_PAUSED;
+    else out->state = VS_PLAY_STOPPED;
+
+    if (out->length_sec > 0) {
+        // Position fine : `time` n'a qu'une résolution d'une seconde.
+        out->position_sec = clamp01(json_get_num(root, "position", 0)) * out->length_sec;
+    } else {
+        f64 t = json_get_num(root, "time", 0);
+        if (f64_is_finite(t) && t > 0) out->position_sec = t;
+    }
+    strbuf_set(&out->file_name, meta_file_name(root));
+    return 1;
+}
+
+// ------------------------------------------------------------ localisation ---
+
+static b32 file_exists(const u16 *path) {
+    DWORD attrs = GetFileAttributesW((LPCWSTR)path);
+    return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+// env_var lit une variable d'environnement en UTF-8 (chaîne vide si absente).
+// Le résultat vit dans l'arène de l'appelant.
+static Str8 env_var(Arena *a, const char *name) {
+    u16 *wname = utf8_to_utf16(a, str8_from_cstr(name), NULL);
+    DWORD n = GetEnvironmentVariableW((LPCWSTR)wname, NULL, 0);
+    if (n == 0) return str8_lit("");
+    u16 *buf = arena_push_array(a, u16, (isize)n + 1);
+    DWORD got = GetEnvironmentVariableW((LPCWSTR)wname, (LPWSTR)buf, n);
+    if (got == 0 || got > n) return str8_lit("");
+    return utf16_to_utf8(a, buf);
+}
+
+static b32 try_candidate(Arena *a, Str8 path, Str8 *out) {
+    if (path.len == 0) return 0;
+    TempArena t = temp_begin(a);
+    u16 *w = utf8_to_utf16(a, path, NULL);
+    b32 ok = file_exists(w);
+    temp_end(t);
+    if (!ok) return 0;
+    *out = str8_copy(a, path);
+    return 1;
+}
+
+b32 vlc_locate(Arena *a, Str8 *out_path) {
+    Str8 forced = env_var(a, "VIBESYNC_VLC");
+    if (forced.len > 0) return try_candidate(a, forced, out_path);
+
+    if (try_candidate(a, str8_lit("C:\\Program Files\\VideoLAN\\VLC\\vlc.exe"), out_path)) return 1;
+    if (try_candidate(a, str8_lit("C:\\Program Files (x86)\\VideoLAN\\VLC\\vlc.exe"), out_path)) return 1;
+
+    static const char *vars[] = {"ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"};
+    for (isize i = 0; i < (isize)(sizeof(vars) / sizeof(vars[0])); i++) {
+        Str8 base = env_var(a, vars[i]);
+        if (base.len == 0) continue;
+        Str8 cand = str8_cat(a, base, str8_lit("\\VideoLAN\\VLC\\vlc.exe"));
+        if (try_candidate(a, cand, out_path)) return 1;
+    }
+    Str8 local = env_var(a, "LOCALAPPDATA");
+    if (local.len > 0) {
+        if (try_candidate(a, str8_cat(a, local, str8_lit("\\Programs\\VideoLAN\\VLC\\vlc.exe")), out_path)) return 1;
+        if (try_candidate(a, str8_cat(a, local, str8_lit("\\Programs\\VLC\\vlc.exe")), out_path)) return 1;
+    }
+    return 0;
+}
+
+// ----------------------------------------------------------------- lancement ---
+
+void vlc_client_init(VlcClient *c, int port, Str8 password) {
+    memset(c, 0, sizeof(*c));
+    c->port = port;
+    isize n = VS_MIN(password.len, (isize)sizeof(c->password) - 1);
+    memcpy(c->password, password.data, (size_t)n);
+    c->password[n] = 0;
+    // Basic auth : utilisateur vide, mot de passe = celui de l'interface.
+    u8 raw[128];
+    isize m = 0;
+    raw[m++] = ':';
+    for (isize i = 0; i < n && m < (isize)sizeof(raw); i++) raw[m++] = (u8)c->password[i];
+    base64_encode(raw, m, c->auth_b64, (isize)sizeof(c->auth_b64));
+}
+
+// free_port réserve puis relâche un port libre sur la loopback.
+static int free_port(void) {
+    if (!winsock_init()) return 0;
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return 0;
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (bind(s, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        closesocket(s);
+        return 0;
+    }
+    int len = (int)sizeof(addr);
+    if (getsockname(s, (struct sockaddr *)&addr, &len) != 0) {
+        closesocket(s);
+        return 0;
+    }
+    int port = ntohs(addr.sin_port);
+    closesocket(s);
+    return port;
+}
+
+VlcError vlc_launch(Arena *scratch, VlcClient *c, Str8 binary, Str8 file_path, i64 timeout_ms) {
+    if (binary.len == 0 || file_path.len == 0) return VLC_ERR_NOT_FOUND;
+    int port = free_port();
+    if (port == 0) return VLC_ERR_SOCKET;
+    u8 rnd[16];
+    char password[33];
+    if (!vs_random_bytes(rnd, (isize)sizeof(rnd))) return VLC_ERR_SPAWN;
+    vs_hex_encode(rnd, (isize)sizeof(rnd), password);
+    vlc_client_init(c, port, str8_from_cstr(password));
+
+    TempArena t = temp_begin(scratch);
+    Builder cmd;
+    builder_init(&cmd, scratch, 1024);
+    builder_cstr(&cmd, "\"");
+    builder_str(&cmd, binary);
+    builder_cstr(&cmd, "\" --extraintf=http --http-host=" VLC_HOST " --http-port=");
+    builder_i64(&cmd, port);
+    builder_cstr(&cmd, " --http-password=");
+    builder_cstr(&cmd, password);
+    builder_cstr(&cmd, " --no-video-title-show --no-one-instance \"");
+    builder_str(&cmd, file_path);
+    builder_cstr(&cmd, "\"");
+
+    u16 *wcmd = utf8_to_utf16(scratch, builder_result(&cmd), NULL);
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si));
+    memset(&pi, 0, sizeof(pi));
+    si.cb = sizeof(si);
+    BOOL ok = CreateProcessW(NULL, (LPWSTR)wcmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
+    temp_end(t);
+    if (!ok) return VLC_ERR_SPAWN;
+    CloseHandle(pi.hThread);
+    c->process = pi.hProcess;
+
+    // Attente de l'interface HTTP (VLC met un instant à démarrer).
+    if (timeout_ms <= 0) timeout_ms = 20000;
+    i64 deadline = vs_now_ns() + timeout_ms * 1000000LL;
+    for (;;) {
+        VsStatus st;
+        TempArena tt = temp_begin(scratch);
+        VlcError err = vlc_status(c, scratch, &st);
+        temp_end(tt);
+        if (err == VLC_OK) return VLC_OK;
+        if (err == VLC_ERR_AUTH) return err;
+        if (vs_now_ns() > deadline) return VLC_ERR_TIMEOUT;
+        Sleep(100);
+    }
+}
+
+void vlc_close(VlcClient *c) {
+    if (c->process) {
+        if (!c->keep_alive) {
+            TerminateProcess((HANDLE)c->process, 0);
+            WaitForSingleObject((HANDLE)c->process, 2000);
+        }
+        CloseHandle((HANDLE)c->process);
+        c->process = NULL;
+    }
+}
+
+// ----------------------------------------------------------------- commandes ---
+
+VlcError vlc_status(VlcClient *c, Arena *scratch, VsStatus *out) {
+    Str8 body;
+    VlcError err = http_get(c, scratch, str8_lit("/requests/status.json"), &body);
+    if (err != VLC_OK) return err;
+    if (!vlc_parse_status(scratch, body, out)) return VLC_ERR_JSON;
+    return VLC_OK;
+}
+
+static VlcError command(VlcClient *c, Arena *scratch, const char *name, const char *value) {
+    Builder path;
+    builder_init(&path, scratch, 128);
+    builder_cstr(&path, "/requests/status.json?command=");
+    builder_cstr(&path, name);
+    if (value && value[0]) {
+        builder_cstr(&path, "&val=");
+        builder_cstr(&path, value);
+    }
+    Str8 body;
+    return http_get(c, scratch, builder_result(&path), &body);
+}
+
+VlcError vlc_pause(VlcClient *c, Arena *scratch) { return command(c, scratch, "pl_forcepause", NULL); }
+VlcError vlc_resume(VlcClient *c, Arena *scratch) { return command(c, scratch, "pl_forceresume", NULL); }
+
+VlcError vlc_seek(VlcClient *c, Arena *scratch, f64 position_sec) {
+    // L'API HTTP de VLC n'accepte que des secondes entières.
+    if (!f64_is_finite(position_sec) || position_sec < 0) position_sec = 0;
+    char val[24];
+    i64_to_str((i64)f64_round(position_sec), val, (isize)sizeof(val));
+    return command(c, scratch, "seek", val);
+}
+
+VlcError vlc_set_rate(VlcClient *c, Arena *scratch, f64 rate) {
+    if (!f64_is_finite(rate) || rate <= 0) rate = 1;
+    char val[40];
+    f64_to_str(rate, val, (isize)sizeof(val));
+    return command(c, scratch, "rate", val);
+}
+
+VlcError vlc_apply(VlcClient *c, Arena *scratch, VsCmd cmd) {
+    switch (cmd.kind) {
+        case VS_CMD_PAUSE: return vlc_pause(c, scratch);
+        case VS_CMD_RESUME: return vlc_resume(c, scratch);
+        case VS_CMD_SEEK: return vlc_seek(c, scratch, cmd.value);
+        case VS_CMD_RATE: return vlc_set_rate(c, scratch, cmd.value);
+    }
+    return VLC_OK;
+}

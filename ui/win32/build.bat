@@ -1,0 +1,62 @@
+@echo off
+rem build.bat — construction du client Windows handmade (VS-014).
+rem   build.bat        release  : build\vibesync.exe (-O2 -s, warnings stricts)
+rem   build.bat test   tests    : build\vibesync_tests.exe puis EXECUTION
+rem   build.bat asan   tests sous AddressSanitizer
+setlocal
+set "ROOT=%~dp0"
+set "CC=C:\Users\thibs\tools\llvm-mingw\bin\x86_64-w64-mingw32-clang.exe"
+if not exist "%CC%" set "CC=x86_64-w64-mingw32-clang.exe"
+
+set "STD=-std=c11 -ffp-contract=off"
+set "WARN=-Wall -Wextra -Werror -Wshadow -Wvla -Wstrict-prototypes -Wmissing-prototypes"
+set "LIBS=-lwinhttp -lws2_32 -lbcrypt"
+set "CORE=%ROOT%src\base.c %ROOT%src\json.c %ROOT%src\protocol.c %ROOT%src\engine.c %ROOT%src\vlc.c %ROOT%src\net.c"
+set "VECTORS=%ROOT%..\..\test\vectors"
+if not exist "%ROOT%build" mkdir "%ROOT%build"
+
+if /I "%~1"=="test" goto :test
+if /I "%~1"=="asan" goto :asan
+if /I "%~1"=="clean" goto :clean
+if "%~1"=="" goto :release
+echo cible inconnue "%~1" (cibles : ^<vide^>, test, asan, clean)
+exit /b 2
+
+:release
+echo [release] vibesync.exe
+"%CC%" %STD% %WARN% -O2 -s -o "%ROOT%build\vibesync.exe" %CORE% "%ROOT%src\main.c" %LIBS%
+if errorlevel 1 exit /b 1
+for %%F in ("%ROOT%build\vibesync.exe") do echo         %%~zF octets
+exit /b 0
+
+:test
+echo [test] compilation
+"%CC%" %STD% %WARN% -O1 -g -o "%ROOT%build\vibesync_tests.exe" %CORE% "%ROOT%src\test_main.c" %LIBS%
+if errorlevel 1 exit /b 1
+echo [test] execution
+"%ROOT%build\vibesync_tests.exe" "%VECTORS%"
+if errorlevel 1 (
+  echo [test] ECHEC
+  exit /b 1
+)
+echo [test] OK
+exit /b 0
+
+:asan
+echo [asan] compilation
+"%CC%" %STD% %WARN% -O1 -g -fsanitize=address -fno-omit-frame-pointer -o "%ROOT%build\vibesync_tests_asan.exe" %CORE% "%ROOT%src\test_main.c" %LIBS%
+if errorlevel 1 exit /b 1
+echo [asan] execution
+set "PATH=C:\Users\thibs\tools\llvm-mingw\bin;%PATH%"
+"%ROOT%build\vibesync_tests_asan.exe" "%VECTORS%"
+if errorlevel 1 (
+  echo [asan] ECHEC
+  exit /b 1
+)
+echo [asan] OK
+exit /b 0
+
+:clean
+if exist "%ROOT%build" rmdir /s /q "%ROOT%build"
+echo [clean] fait
+exit /b 0
