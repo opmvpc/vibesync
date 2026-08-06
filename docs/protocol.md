@@ -15,8 +15,10 @@ Source de vérité du protocole client↔serveur. Les types Go correspondants vi
 
 ## Modèle
 
-- **Salle (room)** : créée à la volée au premier `hello` qui la nomme, détruite quand
-  vide. État autoritatif : `{paused bool, positionSec float64, rate float64,
+- **Salle (room)** : créée à la volée au premier `hello` qui la nomme. Quand elle se
+  vide, elle est **conservée avec son état** (position, pause) pendant
+  `VIBESYNC_ROOM_LINGER` (défaut 30 min) puis détruite — un retour dans la fenêtre
+  reprend la séance là où elle en était (crash, coupure, redémarrage du client). État autoritatif : `{paused bool, positionSec float64, rate float64,
   refServerMs int64, setBy string}`. Position courante d'une salle en lecture =
   `positionSec + (nowServerMs - refServerMs)/1000 × rate`.
 - **Utilisateur** : id serveur (`u<n>`), pseudo, ready, fichier déclaré, dernière
@@ -57,6 +59,10 @@ Source de vérité du protocole client↔serveur. Les types Go correspondants vi
    l'émetteur, qui reconnaît son propre `setBy`).
 2. Un `report` avec `buffering=true` ou en retard de > 4 s sur la position de
    référence pendant > 2 s → **pause automatique** de la salle + `toast` warn.
+   Garde-fous : jamais de pause auto dans une salle à un seul membre ; au plus une
+   pause auto toutes les 5 s par salle ; les reports de l'auteur d'un `control`
+   sont ignorés pour la pause auto pendant les 2 s qui suivent ce control (son
+   propre seek le fait « bufferiser » mécaniquement).
 3. Déconnexion d'un membre en lecture → pause automatique + `toast`.
 4. Un nouvel arrivant reçoit `welcome` avec l'état courant → son client se cale dessus.
 5. Fichiers : si `durationSec` diffère de > 2 s entre membres → `toast` warn (pas de
@@ -105,6 +111,9 @@ Source de vérité du protocole client↔serveur. Les types Go correspondants vi
   pendant une reconnexion, toute correction est suspendue et l'état de référence
   est invalidé jusqu'au `welcome` suivant. Hystérésis du nudge : engagé quand
   `|drift| > 0,1 s`, il ne se désengage que quand `|drift| < 0,03 s`.
+- **Buffering** : la détection (position figée > 700 ms en lecture) est suspendue
+  pendant 2 s après tout seek (commandé ou utilisateur) et après chaque transition
+  play/pause — un seek fige mécaniquement la position le temps que VLC cherche.
 - **Assainissement** : toute donnée entrante est validée — valeurs non finies
   rejetées ; fraction VLC bornée à [0,1] ; positions bornées à [0, durée] (durée
   connue) ; `rate` serveur hors [0,25, 4] rejeté ; seek utilisateur borné à
