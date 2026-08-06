@@ -15,6 +15,7 @@
 #include "json.h"
 #include "net.h"
 #include "protocol.h"
+#include "secret.h"
 #include "ui.h"
 #include "vlc.h"
 
@@ -1550,6 +1551,146 @@ static void test_conn_policy(void) {
     CHECK(c.phase == CONN_WAITING, "coupure en cours de session → reconnexion");
 }
 
+// --------------------------------- mot de passe mémorisé (VS-025, DPAPI) ---
+
+static void test_secret(Arena *a) {
+    section("secret (DPAPI)");
+    TempArena top = temp_begin(a);
+
+    // Aller-retour : accents et octets non ASCII compris.
+    const char *plains[] = {"s3cret", "mot de passe très long avec des accents éàü et des espaces", "x",
+                            "!@#$%^&*()_+-={}[]|\\:;\"'<>,.?/"};
+    for (isize i = 0; i < VS_ARRAY_COUNT(plains); i++) {
+        Str8 hex, back;
+        if (!secret_protect(a, S(plains[i]), &hex)) {
+            failf("chiffrement refusé pour « %s »", plains[i]);
+            g_checks++;
+            continue;
+        }
+        // Le blob ne doit jamais contenir le clair en toutes lettres.
+        CHECK(hex.len > 0 && (hex.len & 1) == 0, "blob hexadécimal de longueur paire (%lld)",
+              (long long)hex.len);
+        b32 hexish = 1;
+        for (isize k = 0; k < hex.len; k++) {
+            u8 c = hex.data[k];
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) hexish = 0;
+        }
+        CHECK(hexish, "blob strictement hexadécimal minuscule");
+        u8 *raw = NULL;
+        isize raw_len = 0;
+        CHECK(secret_hex_decode(a, hex, &raw, &raw_len), "blob redécodable");
+        // Le clair ne doit pas se retrouver tel quel dans le blob. Sous 4
+        // octets, la recherche n'a aucune valeur : une aiguille si courte se
+        // retrouve par hasard dans quelques centaines d'octets chiffrés.
+        Str8 needle = S(plains[i]);
+        if (needle.len >= 4) {
+            b32 found = 0;
+            for (isize k = 0; raw && k + needle.len <= raw_len; k++) {
+                if (memcmp(raw + k, needle.data, (size_t)needle.len) == 0) found = 1;
+            }
+            CHECK(!found, "le clair « %s » n'apparaît pas dans le blob chiffré", plains[i]);
+        }
+
+        CHECK(secret_unprotect(a, hex, &back), "déchiffrement de « %s »", plains[i]);
+        CHECK(str8_eq(back, S(plains[i])), "aller-retour exact : « %.*s »", (int)back.len, back.data);
+    }
+
+    // Deux chiffrements du même clair diffèrent (DPAPI sale son entrée).
+    {
+        Str8 h1, h2;
+        if (secret_protect(a, S("pareil"), &h1) && secret_protect(a, S("pareil"), &h2)) {
+            CHECK(!str8_eq(h1, h2), "deux blobs du même clair ne sont pas identiques");
+        }
+    }
+
+    // Clair vide : refusé (rien à mémoriser).
+    {
+        Str8 hex;
+        CHECK(!secret_protect(a, S(""), &hex), "clair vide refusé");
+    }
+
+    // Blobs invalides : échec propre, jamais de plantage ni de sortie remplie.
+    {
+        Str8 ref;
+        CHECK(secret_protect(a, S("s3cret"), &ref), "blob de référence");
+        struct {
+            const char *hex;
+            const char *why;
+        } bad[] = {
+            {"", "blob vide"},
+            {"abc", "longueur impaire"},
+            {"zz", "caractère non hexadécimal"},
+            {"00112233445566778899aabbccddeeff", "octets aléatoires"},
+            {"deadbeef", "blob trop court"},
+        };
+        for (isize i = 0; i < VS_ARRAY_COUNT(bad); i++) {
+            Str8 out = S("sentinelle");
+            CHECK(!secret_unprotect(a, S(bad[i].hex), &out), "%s rejeté", bad[i].why);
+            CHECK(str8_eq(out, S("sentinelle")), "%s : la sortie n'est pas touchée", bad[i].why);
+        }
+        // Blob authentique mais corrompu au milieu : DPAPI doit le refuser.
+        u8 *copy = arena_push_array(a, u8, ref.len);
+        memcpy(copy, ref.data, (size_t)ref.len);
+        copy[ref.len / 2] ^= 0x0f;  // reste hexadécimal, mais le contenu change
+        if (copy[ref.len / 2] > 'f') copy[ref.len / 2] = '0';
+        Str8 out = S("sentinelle");
+        CHECK(!secret_unprotect(a, str8(copy, ref.len), &out), "blob corrompu rejeté");
+        // Mauvaise entropie applicative : un blob DPAPI d'une autre appli ne
+        // doit pas être lisible par nous. On le simule en tronquant.
+        CHECK(!secret_unprotect(a, str8_sub(ref, 0, ref.len - 2), &out), "blob tronqué rejeté");
+    }
+
+    // secret_wipe efface réellement.
+    {
+        u8 buf[32];
+        memset(buf, 0xab, sizeof(buf));
+        secret_wipe(buf, (isize)sizeof(buf));
+        b32 clean = 1;
+        for (isize i = 0; i < (isize)sizeof(buf); i++) {
+            if (buf[i] != 0) clean = 0;
+        }
+        CHECK(clean, "secret_wipe met le tampon à zéro");
+        secret_wipe(NULL, 16);  // ne doit pas planter
+        secret_wipe(buf, 0);
+    }
+
+    // --- règles du fichier ini ---
+    section("ini : secret");
+    {
+        Ini ini;
+        ini_clear(&ini);
+        ini_set(a, &ini, "serveur", S("wss://x/ws"));
+        ini_set(a, &ini, "password_enc", S("00ff"));
+        ini_set(a, &ini, "salle", S("salon"));
+        CHECK(ini.count == 3, "trois entrées");
+        CHECK(ini_remove(&ini, "password_enc"), "suppression de password_enc");
+        CHECK(ini.count == 2, "l'entrée a disparu (%lld)", (long long)ini.count);
+        CHECK(ini_get(&ini, "password_enc", S("absent")).len == 6, "clé introuvable après suppression");
+        // Les autres clés gardent leur valeur et leur ordre.
+        CHECK(str8_eq(ini_get(&ini, "serveur", S("")), S("wss://x/ws")) &&
+                  str8_eq(ini_get(&ini, "salle", S("")), S("salon")),
+              "les autres réglages sont intacts");
+        CHECK(!ini_remove(&ini, "password_enc"), "seconde suppression sans effet");
+        CHECK(!ini_remove(&ini, "jamais_vu"), "clé inconnue : rien à supprimer");
+        // Le fichier écrit ne doit plus mentionner la clé.
+        Str8 text = ini_write(a, &ini);
+        b32 mentions = 0;
+        for (isize i = 0; i + 12 <= text.len; i++) {
+            if (memcmp(text.data + i, "password_enc", 12) == 0) mentions = 1;
+        }
+        CHECK(!mentions, "vibesync.ini n'écrit plus password_enc");
+    }
+    // Un ini existant sans entrée de mot de passe reste lisible tel quel.
+    {
+        Ini ini;
+        CHECK(ini_parse(a, S("serveur=wss://x/ws\npseudo=thibault\n"), &ini), "ini d'une version antérieure");
+        CHECK(ini_get(&ini, "password_enc", S("")).len == 0, "aucun secret mémorisé");
+        CHECK(ini_get(&ini, "retenir_mdp", S("1")).len == 1, "case cochée par défaut");
+    }
+
+    temp_end(top);
+}
+
 // --------------------------------------------- faux VLC HTTP (sur socket) ---
 //
 // Sert /requests/status.json comme le vrai VLC, pour exercer le chemin réseau
@@ -2424,6 +2565,7 @@ int main(int argc, char **argv) {
     test_conn_address(a);
     test_semver();
     test_conn_policy();
+    test_secret(a);
     test_vlc_live(a);
     test_net_live(a);
     test_net_queue_saturation(a);

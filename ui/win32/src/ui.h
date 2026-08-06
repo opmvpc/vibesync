@@ -195,6 +195,9 @@ typedef struct {
 
     // ---- saisie ----
     UiText f_server, f_name, f_room, f_password, f_chat;
+    // Mémorisation du mot de passe (VS-025) : l'état est persisté, le secret
+    // lui-même est chiffré par DPAPI côté main.c.
+    b32 remember_password;
 
     // ---- panneau Réglages (superposé à l'écran courant) ----
     b32 settings_open;
@@ -223,6 +226,7 @@ typedef struct {
     b32 act_use_wss;           // accepte la bascule ws:// → wss://
     b32 act_update_download;
     b32 act_update_dismiss;
+    b32 act_remember_changed;  // la case « se souvenir » vient de basculer
 
     // focus_request : main.c désigne le champ à corriger après une erreur.
     UiFieldRef focus_request;

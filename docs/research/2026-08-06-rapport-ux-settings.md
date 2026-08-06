@@ -116,3 +116,52 @@ refusé → message précis, focus sur le champ, bouton réactivé, et **capture
 identique 8 secondes plus tard** — plus aucune boucle ; bon mot de passe →
 salle avec `client v0.2.0 · serveur v9.9.9 · protocole v1` et la bannière de
 mise à jour.
+
+---
+
+# Mot de passe mémorisé (VS-025)
+
+`secret.c` : DPAPI `CryptProtectData`/`CryptUnprotectData`, portée du compte
+Windows, entropie applicative constante `"vibesync.v1"` (elle cloisonne nos
+blobs de ceux d'une autre appli DPAPI, elle ne remplace pas la clé de l'OS),
+`CRYPTPROTECT_UI_FORBIDDEN` — jamais d'invite surprise. Le blob part en
+hexadécimal dans `password_enc=`. Zéro ligne de cryptographie maison.
+
+**Un seul point d'écriture.** `ini_flush()` remplace tous les appels directs à
+`ini_save_file` : il chiffre (ou supprime) `password_enc`, écrit `retenir_mdp`,
+et retire systématiquement une éventuelle clé `password` en clair héritée. Le
+panneau Réglages passe par la même porte — un chemin qui oublierait de chiffrer
+n'existe plus par construction, plutôt que par vigilance.
+
+**UX.** Case « Se souvenir du mot de passe (chiffré par Windows) », cochée par
+défaut, dessinée à la main (coche en deux segments), pilotable au clavier.
+Décocher efface l'entrée **immédiatement**, pas à la fermeture. Blob
+indéchiffrable (autre compte, autre machine, corruption) → champ vide, aucun
+message, une ligne `OutputDebugString`.
+
+**Hygiène mémoire.** `app->password` passe d'une copie en arène à un `StrBuf`
+effaçable ; `SecureZeroMemory` sur le `hello` encodé dès l'envoi (il portait le
+clair), sur le tampon rendu par DPAPI avant `LocalFree`, sur le clair
+déchiffré une fois recopié dans le champ, à la déconnexion et à la sortie.
+Limite assumée : tant qu'il est affiché, le mot de passe vit dans `UiText`.
+
+## QA
+
+Tests : aller-retour sur 4 clairs (accents, ponctuation), blob strictement
+hexadécimal, **le clair n'apparaît pas dans le blob** (vérifié sur les aiguilles
+≥ 4 octets — sous ce seuil la recherche se déclenche par hasard, le premier jet
+du test était faux), deux chiffrements du même clair diffèrent, clair vide
+refusé, 7 formes de blobs invalides rejetées sans toucher la sortie,
+`secret_wipe`, et les règles ini (`ini_remove`, clé absente du fichier écrit,
+ini d'une version antérieure).
+
+**1 166 vérifications, 0 échec** (`test` et `asan`), 20 exécutions consécutives
+sans intermittence. Chiffres établis sur les **12 vecteurs commités** : un 13ᵉ
+vecteur non suivi (`13-reprise-salle-vierge.json`) est apparu pendant la
+session et échoue — il vise `engine.c`, hors de ce lot. **236 544 octets
+(231 Ko)**, 46 % du budget.
+
+**Essai réel** : saisie du mot de passe → connexion → fermeture ; l'ini contient
+`password_enc=01000000d08c9ddf…` et **ni le clair ni de clé `password=`** ;
+relance → champ prérempli masqué, case cochée ; décochage → `retenir_mdp=0` et
+`password_enc` **disparue** du fichier.

@@ -62,6 +62,17 @@ b32 ini_set(Arena *a, Ini *ini, const char *key, Str8 value) {
     return put(a, ini, str8_from_cstr(key), value);
 }
 
+b32 ini_remove(Ini *ini, const char *key) {
+    Str8 k = str8_from_cstr(key);
+    for (isize i = 0; i < ini->count; i++) {
+        if (!str8_eq(ini->entries[i].key, k)) continue;
+        for (isize j = i; j + 1 < ini->count; j++) ini->entries[j] = ini->entries[j + 1];
+        ini->count--;
+        return 1;
+    }
+    return 0;
+}
+
 Str8 ini_write(Arena *a, const Ini *ini) {
     Builder b;
     builder_init(&b, a, 512);

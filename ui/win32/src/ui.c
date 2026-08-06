@@ -748,6 +748,58 @@ static b32 field(UiApp *a, HDC dc, Rect r, UiText *t, const char *placeholder, u
     return submitted;
 }
 
+// checkbox : case à cocher dessinée à la main (coche en deux traits). Renvoie 1
+// si l'état vient de changer.
+static b32 checkbox(UiApp *a, HDC dc, Rect r, const char *text, b32 *value, u64 id) {
+    b32 hover = !a->input_locked && rect_hit(r, a->mouse_x, a->mouse_y);
+    if (hover) a->hot = id;
+    b32 changed = 0;
+    if (hover && a->mouse_pressed) {
+        a->active = id;
+        a->focus = id;
+    }
+    if (a->active == id && a->mouse_released) {
+        a->active = 0;
+        if (hover) {
+            *value = !*value;
+            changed = 1;
+        }
+    }
+    // Espace ou Entrée quand la case a le focus : accessible au clavier.
+    if (a->focus == id) {
+        for (isize i = 0; i < a->key_count; i++) {
+            if (a->keys[i].vk == VK_SPACE || a->keys[i].vk == VK_RETURN) {
+                *value = !*value;
+                changed = 1;
+            }
+        }
+        if (changed) a->key_count = 0;
+    }
+
+    i32 box = S(a, 16);
+    Rect b = rect(r.x, r.y + (r.h - box) / 2, box, box);
+    u32 bg = *value ? UI_ACCENT : (hover ? UI_PANEL_HI : mix(UI_PANEL, UI_BG, 90));
+    fill_round(dc, b, S(a, 4), bg);
+    stroke_round(dc, b, S(a, 4), *value ? UI_ACCENT_HI : (hover ? UI_MUTED : UI_LINE), 1);
+    if (a->focus == id) stroke_round(dc, rect_inset(b, -2), S(a, 6), UI_ACCENT_HI, 1);
+    if (*value) {
+        // Coche : deux segments, nets à tous les DPI.
+        HPEN pen = CreatePen(PS_SOLID, VS_MAX(2, S(a, 2)), cr(0xffffffu));
+        HGDIOBJ op = SelectObject(dc, pen);
+        POINT pts[3] = {
+            {b.x + box / 4, b.y + box / 2},
+            {b.x + box * 45 / 100, b.y + box * 70 / 100},
+            {b.x + box * 78 / 100, b.y + box * 30 / 100},
+        };
+        Polyline(dc, pts, 3);
+        SelectObject(dc, op);
+        DeleteObject(pen);
+    }
+    draw_text(a, dc, rect(b.x + box + S(a, 9), r.y, r.w - box - S(a, 9), r.h), text,
+              hover ? UI_TEXT : UI_MUTED, a->f_small, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    return changed;
+}
+
 static void label(UiApp *a, HDC dc, Rect r, const char *text) {
     draw_text(a, dc, r, text, UI_MUTED, a->f_small, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 }
@@ -858,6 +910,7 @@ void ui_init(UiApp *app) {
     ui_text_set(&app->f_server, str8_lit("ws://127.0.0.1:8080/ws"));
     ui_text_set(&app->f_room, str8_lit("salon"));
     snprintf(app->version_client, sizeof(app->version_client), "%s", VS_VERSION);
+    app->remember_password = 1;  // cochée par défaut ; l'ini peut la décocher
 }
 
 static void free_fonts(UiApp *app) {
@@ -924,6 +977,7 @@ enum {
     ID_USE_WSS,
     ID_UPDATE,
     ID_UPDATE_CLOSE,
+    ID_REMEMBER,
 };
 
 // gear_button dessine le bouton engrenage (discret, même rendu partout).
@@ -971,7 +1025,9 @@ static void screen_connect(UiApp *a, HDC dc, i64 now_ms) {
     i32 fh = S(a, 38);   // hauteur d'un champ
     i32 gap = S(a, 14);
     i32 hint_h = S(a, 20);  // ligne de joignabilité / d'aide sous le serveur
-    i32 card_h = S(a, 118) + 4 * (S(a, 18) + fh + gap) + hint_h + S(a, 46) + S(a, 46);
+    // Marges + en-tête, 4 champs, la ligne de joignabilité, la case à cocher,
+    // le bouton et le message d'état. La ligne d'aide n'existe qu'au besoin.
+    i32 card_h = S(a, 118) + 4 * (S(a, 18) + fh + gap) + hint_h + S(a, 28) + S(a, 46) + S(a, 46);
     if (a->server_hint[0]) card_h += hint_h;
     Rect card = rect((a->width - card_w) / 2, VS_MAX(S(a, 16), (a->height - card_h) / 2), card_w, card_h);
     panel(a, dc, card);
@@ -1039,8 +1095,14 @@ static void screen_connect(UiApp *a, HDC dc, i64 now_ms) {
         if (field(a, dc, rect(x, y, w, fh), fields[i].t, fields[i].ph, fields[i].id, fields[i].pwd, now_ms)) {
             submit = 1;
         }
-        y += fh + gap;
+        y += fh + (fields[i].pwd ? S(a, 6) : gap);
     }
+
+    if (checkbox(a, dc, rect(x, y, w, S(a, 22)), "Se souvenir du mot de passe (chiffré par Windows)",
+                 &a->remember_password, ID_REMEMBER)) {
+        a->act_remember_changed = 1;
+    }
+    y += S(a, 22) + gap;
 
     // --- Connexion : pendant une tentative, Annuler rend la main ---
     b32 busy = a->connecting || a->retrying_wait;

@@ -16,6 +16,7 @@
 #include "engine.h"
 #include "health.h"
 #include "ini.h"
+#include "secret.h"
 #include "json.h"
 #include "net.h"
 #include "protocol.h"
@@ -317,7 +318,10 @@ typedef struct {
     i32 bw, bh;
 
     char session[VS_SESSION_TOKEN_LEN + 1];
-    Str8 url, name, room, password;
+    Str8 url, name, room;
+    // Le mot de passe vit dans un tampon fixe, pas dans l'arène : on peut
+    // l'effacer (SecureZeroMemory) sans laisser de copie derrière soi.
+    StrBuf password;
     b32 ws_open;
     Conn conn;  // politique de reconnexion (conn.c) : source unique de vérité
     HealthWorker health;
@@ -378,7 +382,25 @@ static void settings_load(App *app) {
     if (v.len) ui_text_set(&app->ui.f_name, v);
     v = ini_get(&app->ini, "salle", str8_lit(""));
     if (v.len) ui_text_set(&app->ui.f_room, v);
-    // Le mot de passe n'est volontairement pas mémorisé.
+
+    // Mot de passe : cochée par défaut, décochable ; le secret n'existe sur
+    // disque que sous forme de blob DPAPI.
+    v = ini_get(&app->ini, "retenir_mdp", str8_lit("1"));
+    app->ui.remember_password = !(v.len == 1 && v.data[0] == '0');
+    v = ini_get(&app->ini, "password_enc", str8_lit(""));
+    if (app->ui.remember_password && v.len > 0) {
+        TempArena t = temp_begin(app->scratch);
+        Str8 plain;
+        if (secret_unprotect(app->scratch, v, &plain)) {
+            ui_text_set(&app->ui.f_password, plain);
+            secret_wipe(plain.data, plain.len);  // le champ en a sa copie
+        } else {
+            // Blob d'un autre compte/machine ou corrompu : champ vide, sans
+            // message. L'utilisateur retape, on réenregistrera au bon format.
+            OutputDebugStringA("vibesync: password_enc indéchiffrable, ignoré\n");
+        }
+        temp_end(t);
+    }
 
     // Détection automatique de VLC, mesurée avant d'appliquer le réglage.
     app->vlc_auto = str8_lit("");
@@ -389,15 +411,41 @@ static void settings_load(App *app) {
     apply_vlc_path(app, ini_get(&app->ini, "vlc", str8_lit("")));
 }
 
+// ini_flush est le SEUL point d'écriture de vibesync.ini. Il applique les
+// règles du secret avant chaque écriture, ce qui rend structurellement
+// impossible qu'un chemin de code oublie de chiffrer ou laisse un clair.
+static b32 ini_flush(App *app) {
+    UiApp *ui = &app->ui;
+    ini_set(app->perm, &app->ini, "retenir_mdp", ui->remember_password ? str8_lit("1") : str8_lit("0"));
+    if (ui->remember_password && ui->f_password.len > 0) {
+        Str8 hex;
+        if (secret_protect(app->perm, ui_text_str(&ui->f_password), &hex)) {
+            ini_set(app->perm, &app->ini, "password_enc", hex);
+        } else {
+            ini_remove(&app->ini, "password_enc");  // pas de chiffrement, pas d'écriture
+        }
+    } else {
+        // Décochée, ou aucun mot de passe : l'entrée DISPARAÎT du fichier.
+        ini_remove(&app->ini, "password_enc");
+    }
+    // Filet : un « password= » en clair hérité d'une version antérieure ou
+    // ajouté à la main est retiré à la première écriture.
+    ini_remove(&app->ini, "password");
+
+    TempArena t = temp_begin(app->scratch);
+    Str8 text = ini_write(app->scratch, &app->ini);
+    b32 ok = ini_save_file(app->scratch, ini_path(app->scratch), text);
+    temp_end(t);
+    return ok;
+}
+
 // settings_save réécrit le fichier en CONSERVANT les clés qu'on ne gère pas
 // ici (chemin VLC en particulier) : app->ini est la référence, pas un ini neuf.
 static void settings_save(App *app) {
     ini_set(app->perm, &app->ini, "serveur", ui_text_str(&app->ui.f_server));
     ini_set(app->perm, &app->ini, "pseudo", ui_text_str(&app->ui.f_name));
     ini_set(app->perm, &app->ini, "salle", ui_text_str(&app->ui.f_room));
-    TempArena t = temp_begin(app->scratch);
-    ini_save_file(app->scratch, ini_path(app->scratch), ini_write(app->scratch, &app->ini));
-    temp_end(t);
+    ini_flush(app);
 }
 
 // --- panneau Réglages ---
@@ -431,9 +479,7 @@ static b32 settings_apply(App *app) {
     ini_set(app->perm, &app->ini, "pseudo", str8_trim(ui_text_str(&ui->f_set_name)));
     ini_set(app->perm, &app->ini, "salle", str8_trim(ui_text_str(&ui->f_set_room)));
     ini_set(app->perm, &app->ini, "vlc", vlc);
-    TempArena t = temp_begin(app->scratch);
-    b32 ok = ini_save_file(app->scratch, ini_path(app->scratch), ini_write(app->scratch, &app->ini));
-    temp_end(t);
+    b32 ok = ini_flush(app);  // même point d'écriture : mêmes règles de secret
     if (!ok) {
         snprintf(ui->settings_msg, sizeof(ui->settings_msg), "vibesync.ini non modifiable.");
         ui->settings_msg_error = 1;
@@ -772,9 +818,12 @@ static void pump_net(App *app) {
             case NET_EV_CONNECTED: {
                 app->ws_open = 1;
                 TempArena t = temp_begin(app->scratch);
-                Str8 hello = proto_encode_hello(app->scratch, app->name, app->room, app->password,
-                                                str8_from_cstr(app->session));
+                Str8 hello = proto_encode_hello(app->scratch, app->name, app->room,
+                                                strbuf_str(&app->password), str8_from_cstr(app->session));
                 b32 ok = net_send_text(app->net, hello);
+                // Le hello encodé porte le mot de passe en clair : il est
+                // effacé dès l'envoi, avant même de rendre la mémoire.
+                secret_wipe(hello.data, hello.len);
                 temp_end(t);
                 if (!ok) {
                     net_close(app->net);
@@ -848,7 +897,7 @@ static void do_connect(App *app) {
     app->url = norm;
     app->name = str8_copy(app->perm, name);
     app->room = str8_copy(app->perm, room);
-    app->password = str8_copy(app->perm, ui_text_str(&ui->f_password));
+    strbuf_set(&app->password, ui_text_str(&ui->f_password));
     settings_save(app);
 
     conn_start(&app->conn, vs_now_ns());
@@ -876,6 +925,9 @@ static void do_cancel_connect(App *app) {
 static void do_disconnect(App *app) {
     net_close(app->net);
     app->ws_open = 0;
+    // Plus de session : le clair conservé pour les reconnexions ne sert plus.
+    secret_wipe(app->password.data, (isize)sizeof(app->password.data));
+    app->password.len = 0;
     engine_disconnected(&app->engine);
     conn_cancel(&app->conn);
     app->ui.screen = UI_SCREEN_CONNECT;
@@ -980,6 +1032,16 @@ static void handle_actions(App *app) {
             ui->health_tls_hint = 0;
             probe_health(app);  // vérifier tout de suite que la bascule marche
         }
+        redraw(app);
+    }
+    if (ui->act_remember_changed) {
+        ui->act_remember_changed = 0;
+        // Décocher doit effacer le secret TOUT DE SUITE, pas à la fermeture :
+        // l'utilisateur qui décoche veut que ce soit fait.
+        settings_save(app);
+        ui_toast(ui, ui->remember_password ? "Mot de passe mémorisé, chiffré par Windows."
+                                           : "Mot de passe oublié.",
+                 0, now_ms());
         redraw(app);
     }
     if (ui->act_update_dismiss) {
@@ -1418,6 +1480,7 @@ static void capture_screens(App *app, Str8 dir) {
     ui_text_set(&ui->f_name, str8_lit("thibault"));
     ui_text_set(&ui->f_room, str8_lit("soirée-film"));
     ui_text_set(&ui->f_password, str8_lit("secret"));
+    ui->remember_password = 1;
     ui->screen = UI_SCREEN_CONNECT;
 
     // Sélection à la souris, pour de vrai : une frame de mesure, puis un
@@ -1658,6 +1721,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show) {
     }
 
     settings_save(app);
+    // Dernier geste d'hygiène : plus aucun clair en mémoire à la sortie.
+    secret_wipe(app->password.data, (isize)sizeof(app->password.data));
+    secret_wipe(app->ui.f_password.data, (isize)sizeof(app->ui.f_password.data));
     worker_stop(&app->vlc);
     health_stop(&app->health);
     net_destroy(app->net);

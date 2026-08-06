@@ -28,6 +28,10 @@ b32 ini_parse(Arena *a, Str8 text, Ini *out);
 Str8 ini_get(const Ini *ini, const char *key, Str8 def);
 // ini_set ajoute ou remplace une valeur (copiée dans `a`).
 b32 ini_set(Arena *a, Ini *ini, const char *key, Str8 value);
+// ini_remove supprime une clé si elle existe. Renvoie 1 si quelque chose a été
+// retiré. Sert à effacer un secret mémorisé : la clé doit DISPARAÎTRE du
+// fichier, pas se retrouver avec une valeur vide.
+b32 ini_remove(Ini *ini, const char *key);
 // ini_write sérialise, prêt à être écrit sur disque (lignes CRLF).
 Str8 ini_write(Arena *a, const Ini *ini);
 
