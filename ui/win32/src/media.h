@@ -9,6 +9,7 @@
 #define VS_MEDIA_H
 
 #include "base.h"
+#include "platform.h"
 
 #define MEDIA_MAX_DIRS 8
 // Bornes de sécurité : au-delà, on rend ce qu'on a trouvé et on le dit.
@@ -30,6 +31,13 @@ typedef struct {
 // le nombre de correspondances est rendu pour pouvoir le tracer).
 // Les points de reparse (jonctions, liens) sont ignorés : pas de boucle.
 b32 media_find(Arena *scratch, const StrBuf *dirs, isize dir_count, Str8 name, MediaFind *out);
+
+// media_find_with est la même recherche, sur une primitive de parcours donnée
+// (media_core.c, portable). media_find n'est que ce parcours-là appliqué à
+// celui de la plateforme : c'est le point d'extraction d'ADR-010, et ce qui
+// permet de tester l'algorithme borné sans toucher au disque.
+b32 media_find_with(Arena *scratch, const VsDirOps *ops, const StrBuf *dirs, isize dir_count, Str8 name,
+                    MediaFind *out);
 
 // media_default_dir renvoie le dossier Téléchargements de l'utilisateur
 // (FOLDERID_Downloads), repli sur %USERPROFILE%\Downloads.

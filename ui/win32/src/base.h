@@ -1,8 +1,16 @@
 // base.h — socle handmade : types, assert, arènes mémoire, chaînes UTF-8.
 //
-// Aucune dépendance en dehors de <stdint.h>/<stddef.h> et, dans base.c, de
-// l'API Win32 (VirtualAlloc) et de l'UCRT (snprintf/strtod, livrés avec
-// Windows 10). Toute allocation passe par une arène : pas un seul malloc.
+// Aucune dépendance en dehors de <stdint.h>/<stddef.h> et, dans les
+// implémentations, de l'UCRT (snprintf/strtod, livrés avec Windows 10) et de
+// l'API du système. Toute allocation passe par une arène : pas un seul malloc.
+//
+// ADR-010 — cet en-tête est COMMUN aux deux clients natifs ; il ne déclare que
+// des prototypes, jamais de type du système. Deux implémentations :
+//   base_core.c   portable pur (chaînes, constructeur, nombres, UTF-8)
+//   base_win32.c  plateforme  (arènes VirtualAlloc, horloge, aléa, journal,
+//                 conversions UTF-16 — le côté portable n'en voit jamais)
+// Les sections marquées « frontière plateforme » sont à réimplémenter telles
+// quelles pour macOS (phase 2, VS-031).
 #ifndef VS_BASE_H
 #define VS_BASE_H
 
@@ -42,6 +50,7 @@ typedef ptrdiff_t isize;
 #define VS_UNUSED(x) ((void)(x))
 
 // vs_fatal écrit un diagnostic sur stderr et termine le process (code 3).
+// [frontière plateforme]
 void vs_fatal(const char *file, int line, const char *fmt, ...);
 #define VS_ASSERT(c)                                                     \
     do {                                                                 \
@@ -49,6 +58,10 @@ void vs_fatal(const char *file, int line, const char *fmt, ...);
     } while (0)
 
 // ---------------------------------------------------------------- arènes ---
+//
+// [frontière plateforme] — toute cette section est implémentée par le fichier
+// plateforme (VirtualAlloc sous Windows, mmap ailleurs). L'API, elle, est
+// portable et c'est la seule que voit le code commun.
 
 typedef struct Arena Arena;
 
@@ -147,21 +160,31 @@ f64 f64_abs(f64 v);
 
 // -------------------------------------------------------------- unicode ---
 
+// utf8_validate vérifie qu'une tranche est de l'UTF-8 bien formé.
+b32 utf8_validate(Str8 s);
+// utf8_encode écrit un point de code (1..4 octets) ; renvoie la taille.
+isize utf8_encode(u32 cp, u8 *out);
+// utf8_decode lit un point de code à l'offset `at` ; renvoie le nombre
+// d'octets consommés, 0 si la séquence est invalide (`*cp` reçoit alors
+// U+FFFD). Exposé parce que la conversion UTF-16 de la plateforme s'en sert.
+isize utf8_decode(Str8 s, isize at, u32 *cp);
+
+// [frontière plateforme] — les conversions UTF-16 n'existent que du côté
+// système : la couche commune ne manipule QUE de l'UTF-8 (risque n°1 de
+// l'analyse ADR-010).
+//
 // utf8_to_utf16 renvoie une chaîne UTF-16 terminée par 0 (arène). Les octets
 // invalides deviennent U+FFFD. `out_len` (optionnel) reçoit la longueur.
 u16 *utf8_to_utf16(Arena *a, Str8 s, isize *out_len);
 // utf16_to_utf8 convertit une chaîne UTF-16 terminée par 0.
 Str8 utf16_to_utf8(Arena *a, const u16 *w);
-// utf8_validate vérifie qu'une tranche est de l'UTF-8 bien formé.
-b32 utf8_validate(Str8 s);
-// utf8_encode écrit un point de code (1..4 octets) ; renvoie la taille.
-isize utf8_encode(u32 cp, u8 *out);
 
 // ----------------------------------------------------------------- temps ---
 
 #define VS_TIME_ZERO INT64_MIN
 
 // vs_now_ns est l'horloge murale en nanosecondes depuis l'epoch Unix.
+// [frontière plateforme]
 i64 vs_now_ns(void);
 // vs_ns_to_unix_ms convertit en millisecondes epoch (division plancher).
 i64 vs_ns_to_unix_ms(i64 ns);
@@ -173,12 +196,14 @@ f64 vs_ns_seconds(i64 dur_ns);
 
 // vs_random_bytes remplit `out` depuis le générateur du système
 // (BCryptGenRandom, RNG préféré de l'OS). 0 en cas d'échec.
+// [frontière plateforme]
 b32 vs_random_bytes(u8 *out, isize n);
 // vs_hex_encode écrit 2n caractères hexadécimaux minuscules + NUL.
 void vs_hex_encode(const u8 *bytes, isize n, char *out);
 
 // ------------------------------------------------------------------ sortie ---
 
+// [frontière plateforme]
 void vs_write_stderr(Str8 s);
 
 // ----------------------------------------------------------------- journal ---
@@ -195,6 +220,7 @@ void vs_write_stderr(Str8 s);
 // écritures sont sérialisées par un verrou interne, et la rotation décide sur
 // une taille lue sous ce même verrou. Aucun secret n'y est jamais écrit — ni
 // mot de passe de salle, ni mot de passe d'interface VLC.
+// [frontière plateforme]
 void vs_log(const char *fmt, ...);
 
 #endif // VS_BASE_H

@@ -22,7 +22,16 @@ set "WARN=-Wall -Wextra -Werror -Wshadow -Wvla -Wstrict-prototypes -Wmissing-pro
 set "LIBS=-lwinhttp -lws2_32 -lbcrypt -lgdi32 -luser32 -lole32 -luuid -lshell32 -lcrypt32"
 rem Chaque chemin est entre guillemets : un checkout dans un dossier contenant
 rem des espaces doit compiler sans bricolage.
-set "CORE="%ROOT%src\base.c" "%ROOT%src\json.c" "%ROOT%src\protocol.c" "%ROOT%src\engine.c" "%ROOT%src\vlc.c" "%ROOT%src\net.c" "%ROOT%src\ini.c" "%ROOT%src\conn.c" "%ROOT%src\health.c" "%ROOT%src\secret.c" "%ROOT%src\media.c" "%ROOT%src\ui.c""
+rem
+rem CORE_SHARED = le C PORTABLE (ADR-010) : aucun windows.h, aucun wchar_t, tout
+rem texte en UTF-8. C'est exactement la liste que la cible SwiftPM VSCore
+rem compilera en phase 2 (VS-031) ; elle ne doit accueillir que des fichiers qui
+rem compilent tels quels sur macOS.
+set "CORE_SHARED="%ROOT%src\base_core.c" "%ROOT%src\json.c" "%ROOT%src\protocol.c" "%ROOT%src\engine.c" "%ROOT%src\conn.c" "%ROOT%src\vlc_core.c" "%ROOT%src\ini_core.c" "%ROOT%src\media_core.c""
+rem CORE_WIN32 = ce qui ne quittera jamais Windows : arenes/journal/UTF-16,
+rem Winsock, WinHTTP, DPAPI, GDI.
+set "CORE_WIN32="%ROOT%src\base_win32.c" "%ROOT%src\vlc_win32.c" "%ROOT%src\net.c" "%ROOT%src\ini_win32.c" "%ROOT%src\health.c" "%ROOT%src\secret.c" "%ROOT%src\media_win32.c" "%ROOT%src\ui.c""
+set "CORE=%CORE_SHARED% %CORE_WIN32%"
 set "VECTORS=%ROOT%..\..\test\vectors"
 if not exist "%ROOT%build" mkdir "%ROOT%build"
 
@@ -48,7 +57,7 @@ exit /b 0
 
 :test
 echo [test] compilation
-"%CC%" %STD% %WARN% -O1 -g -o "%ROOT%build\vibesync_tests.exe" %CORE% "%ROOT%src\test_main.c" %LIBS%
+"%CC%" %STD% %WARN% -O1 -g -o "%ROOT%build\vibesync_tests.exe" %CORE% "%ROOT%src\test_main.c" "%ROOT%src\test_core.c" "%ROOT%src\test_win32.c" %LIBS%
 if errorlevel 1 exit /b 1
 echo [test] execution
 "%ROOT%build\vibesync_tests.exe" "%VECTORS%"
@@ -61,7 +70,7 @@ exit /b 0
 
 :asan
 echo [asan] compilation
-"%CC%" %STD% %WARN% -O1 -g -fsanitize=address -fno-omit-frame-pointer -o "%ROOT%build\vibesync_tests_asan.exe" %CORE% "%ROOT%src\test_main.c" %LIBS%
+"%CC%" %STD% %WARN% -O1 -g -fsanitize=address -fno-omit-frame-pointer -o "%ROOT%build\vibesync_tests_asan.exe" %CORE% "%ROOT%src\test_main.c" "%ROOT%src\test_core.c" "%ROOT%src\test_win32.c" %LIBS%
 if errorlevel 1 exit /b 1
 echo [asan] execution
 set "PATH=C:\Users\thibs\tools\llvm-mingw\bin;%PATH%"
