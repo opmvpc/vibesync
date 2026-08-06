@@ -74,16 +74,53 @@ type BufferingDetector struct {
 	lastPos   float64
 	lastAt    time.Time
 	buffering bool
+	// suspendUntil : instant jusqu'auquel la détection est neutralisée. Un seek
+	// (ou une transition play/pause) fige mécaniquement la position le temps que
+	// VLC cherche : sans cette fenêtre, chaque action de l'utilisateur passerait
+	// pour un buffering (docs/protocol.md §Comportements client, Buffering).
+	suspendUntil time.Time
 }
 
 // Reset oublie l'historique (après un seek, un changement de fichier…).
 func (b *BufferingDetector) Reset() {
 	b.have = false
 	b.buffering = false
+	// Sans cet oubli, un stall entamé avant le Reset ferait basculer en
+	// buffering dès la deuxième observation qui suit.
+	b.stallFrom = time.Time{}
+}
+
+// Suspend oublie le stall en cours et neutralise la détection jusqu'à now+d.
+// Une suspension déjà en cours et plus lointaine n'est jamais raccourcie.
+//
+// Le verdict courant, lui, est conservé : envoyer un seek ne prouve pas que la
+// lecture est repartie. Sans cela, le seek de correction que le moteur envoie
+// justement parce que le lecteur décroche effacerait le diagnostic à chaque
+// fois, et un vrai buffering ne serait jamais remonté.
+func (b *BufferingDetector) Suspend(now time.Time, d time.Duration) {
+	b.have = false
+	b.stallFrom = time.Time{}
+	if until := now.Add(d); until.After(b.suspendUntil) {
+		b.suspendUntil = until
+	}
+}
+
+// Suspended dit si la détection est encore neutralisée à cet instant.
+func (b *BufferingDetector) Suspended(now time.Time) bool {
+	return !b.suspendUntil.IsZero() && now.Before(b.suspendUntil)
 }
 
 // Observe intègre une observation et renvoie l'état de buffering courant.
 func (b *BufferingDetector) Observe(st Status, now time.Time) bool {
+	if b.Suspended(now) {
+		// On continue d'ancrer la position pour que la reprise de la détection
+		// ne voie pas d'un coup tout le saut accumulé pendant la suspension.
+		// Aucun nouveau diagnostic n'est posé, l'ancien n'est pas levé.
+		b.have = true
+		b.lastPos, b.lastAt = st.PositionSec, now
+		b.stallFrom = time.Time{}
+		return b.buffering
+	}
 	window := b.Window
 	if window <= 0 {
 		window = 700 * time.Millisecond

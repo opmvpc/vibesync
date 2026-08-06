@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -682,6 +683,94 @@ func TestReportSignaleLeBuffering(t *testing.T) {
 	}
 }
 
+// reportsBuffering dit si l'un des reports envoyés annonce un buffering.
+func reportsBuffering(envs []protocol.Envelope) bool {
+	for _, env := range envs {
+		if env.Type != protocol.TypeReport {
+			continue
+		}
+		if r, err := protocol.DecodeData[protocol.Report](env); err == nil && r.Buffering {
+			return true
+		}
+	}
+	return false
+}
+
+// VS-017 : l'utilisateur manipule VLC (rafale de seeks, pause/reprise). La
+// position se fige mécaniquement à chaque fois — rien de tout cela ne doit
+// remonter comme un buffering, sinon le serveur met la salle en pause et écrase
+// l'action de l'utilisateur.
+func TestSeeksUtilisateurNeRemontentPasDeBuffering(t *testing.T) {
+	h := newHarness(t)
+	h.openFile("ep1.mkv", 3600)
+	h.connect(h.playing(500))
+	h.fake.SeekTo(500)
+	h.fake.Play()
+	h.ticks(10)
+	h.conn.take()
+
+	// Rafale de seeks : à chaque saut, VLC fige sa position le temps de
+	// chercher — plus longtemps que les 700 ms du détecteur.
+	pos := 500.0
+	for range 3 {
+		pos -= 30
+		h.fake.SetStalled(true)
+		h.fake.SeekTo(pos)
+		h.ticks(6) // 1,2 s figées
+		h.fake.SetStalled(false)
+		h.ticks(4)
+	}
+	if reportsBuffering(h.conn.take()) {
+		t.Fatal("les seeks de l'utilisateur ont été remontés comme un buffering")
+	}
+	if h.e.Snapshot().VLC.Buffering {
+		t.Fatal("buffering affiché à l'UI alors que l'utilisateur manipulait VLC")
+	}
+
+	// Même chose pour une pause/reprise faite à la main : la position est figée
+	// par construction, et la reprise met un instant à démarrer.
+	h.fake.Pause()
+	h.ticks(6)
+	h.fake.SetStalled(true)
+	h.fake.Play()
+	h.ticks(5)
+	h.fake.SetStalled(false)
+	h.ticks(4)
+	if reportsBuffering(h.conn.take()) {
+		t.Fatal("une pause/reprise manuelle a été remontée comme un buffering")
+	}
+}
+
+// … mais un vrai blocage, lui, doit toujours être remonté (pas de régression).
+func TestBufferingReelRemonteMalgreLaSuspension(t *testing.T) {
+	h := newHarness(t)
+	h.openFile("ep1.mkv", 3600)
+	h.connect(h.playing(500))
+	h.fake.SeekTo(500)
+	h.fake.Play()
+	h.ticks(10)
+
+	// Seek utilisateur, écho du serveur, puis lecture normale : la fenêtre de
+	// suspension s'est refermée bien avant le blocage.
+	h.fake.SeekTo(480)
+	h.ticks(2)
+	echo := h.playing(480)
+	echo.SetBy = "u1"
+	h.server(protocol.TypeRoomState, echo)
+	h.ticks(15)
+	h.conn.take()
+
+	h.fake.SetStalled(true)
+	h.ticks(20) // 4 s : bien au-delà de la fenêtre de suspension
+
+	if !reportsBuffering(h.conn.take()) {
+		t.Fatal("un blocage durable doit finir par être remonté au serveur")
+	}
+	if !h.e.Snapshot().VLC.Buffering {
+		t.Fatal("buffering absent de l'état exposé à l'UI")
+	}
+}
+
 func TestControlsUI(t *testing.T) {
 	h := newHarness(t)
 	h.openFile("ep1.mkv", 1200)
@@ -797,6 +886,82 @@ func TestMessageInconnuIgnore(t *testing.T) {
 	}
 	if _, fatal := h.e.handleRaw([]byte(`pas du json`)); fatal {
 		t.Fatal("un message illisible ne doit pas être fatal")
+	}
+}
+
+// drainToasts vide le canal d'événements et rend les toasts reçus.
+func drainToasts(ch <-chan Event) []protocol.Toast {
+	var out []protocol.Toast
+	for {
+		select {
+		case ev := <-ch:
+			if ev.Kind == EventToast && ev.Toast != nil {
+				out = append(out, *ev.Toast)
+			}
+		default:
+			return out
+		}
+	}
+}
+
+// VS-023 : le welcome porte la version du serveur ; plus récente que la nôtre,
+// elle donne un toast d'invitation — jamais un blocage.
+func TestWelcomeAnnonceUneNouvelleVersion(t *testing.T) {
+	cases := []struct {
+		nom          string
+		client       string
+		serveur      string
+		veutBanniere bool
+	}{
+		{"serveur plus récent", "0.1.0", "0.2.0", true},
+		{"versions identiques", "0.2.0", "0.2.0", false},
+		{"serveur plus ancien", "0.3.0", "0.2.0", false},
+		{"client dev", DevVersion, "0.2.0", false},
+		{"serveur muet", "0.1.0", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.nom, func(t *testing.T) {
+			h := newHarness(t)
+			h.e.cfg.Version = tc.client
+			events, unsub := h.e.Subscribe()
+			defer unsub()
+			drainToasts(events)
+
+			h.server(protocol.TypeWelcome, protocol.Welcome{
+				SelfID: "u1", Room: "salon", State: h.paused(0),
+				ServerVersion: tc.serveur, DownloadURL: "https://exemple.test/dl",
+			})
+
+			var banniere bool
+			for _, toast := range drainToasts(events) {
+				if strings.Contains(strings.ToLower(toast.Text), "nouvelle version") {
+					if toast.Level != protocol.LevelInfo {
+						t.Fatalf("le toast de mise à jour doit rester informatif: %+v", toast)
+					}
+					if !strings.Contains(toast.Text, "https://exemple.test/dl") {
+						t.Fatalf("le toast doit porter le lien de téléchargement: %+v", toast)
+					}
+					banniere = true
+				}
+			}
+			if banniere != tc.veutBanniere {
+				t.Fatalf("bannière = %v, attendue %v (client %q, serveur %q)",
+					banniere, tc.veutBanniere, tc.client, tc.serveur)
+			}
+
+			// Dans tous les cas, l'UI voit les deux versions et le lien.
+			snap := h.e.Snapshot()
+			if snap.Version != tc.client || snap.ServerVersion != tc.serveur {
+				t.Fatalf("versions absentes de l'état exposé à l'UI: %+v", snap)
+			}
+			if snap.DownloadURL != "https://exemple.test/dl" {
+				t.Fatalf("lien de téléchargement absent: %q", snap.DownloadURL)
+			}
+			// Une version, même dépassée, ne coupe jamais la connexion.
+			if snap.Phase != PhaseConnected {
+				t.Fatalf("phase = %q, la version ne doit rien bloquer", snap.Phase)
+			}
+		})
 	}
 }
 

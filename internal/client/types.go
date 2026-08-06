@@ -38,6 +38,13 @@ const (
 	// PausedSeekSec : en pause, seek uniquement à partir de ce drift (le seek
 	// HTTP est arrondi à la seconde : en deçà il n'améliorerait rien).
 	PausedSeekSec = 0.6
+	// BufferingSuspend : durée pendant laquelle la détection de buffering est
+	// neutralisée après tout seek (commandé ou utilisateur) et après chaque
+	// transition play/pause. Un seek fige mécaniquement la position le temps que
+	// VLC cherche : sans cette fenêtre, le moteur crie « buffering » à chaque
+	// manipulation et le serveur met la salle en pause (VS-017,
+	// docs/protocol.md §Comportements client, Buffering).
+	BufferingSuspend = 2 * time.Second
 	// MinRate / MaxRate bornent le rate accepté dans un roomState (§Assainissement).
 	MinRate = 0.25
 	MaxRate = 4.0
@@ -47,6 +54,10 @@ const (
 
 	offsetSamples = 5
 )
+
+// DevVersion est la version d'un binaire construit sans injection de VERSION :
+// illisible en semver, donc jamais comparée (aucune bannière de mise à jour).
+const DevVersion = "dev"
 
 // ConnectRequest est la demande de connexion venue de l'UI.
 type ConnectRequest struct {
@@ -82,7 +93,12 @@ type VLCSnapshot struct {
 
 // Snapshot est l'état complet poussé à l'UI.
 type Snapshot struct {
-	Phase         Phase           `json:"phase"`
+	Phase Phase `json:"phase"`
+	// Version est celle de ce client, ServerVersion celle annoncée par le
+	// serveur dans le welcome, DownloadURL l'adresse d'une version à jour.
+	Version       string          `json:"version"`
+	ServerVersion string          `json:"serverVersion"`
+	DownloadURL   string          `json:"downloadUrl"`
 	ServerURL     string          `json:"serverUrl"`
 	Room          string          `json:"room"`
 	Name          string          `json:"name"`

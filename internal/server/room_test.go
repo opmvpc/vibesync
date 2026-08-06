@@ -262,6 +262,114 @@ func TestReportBufferingDeclenchePauseImmediate(t *testing.T) {
 	}
 }
 
+// --- Garde-fous de la pause automatique (VS-017, §Comportements serveur 2) ---
+
+func TestPauseAutoJamaisSeulEnSalle(t *testing.T) {
+	room, clk := newTestRoom()
+	alice, recA := joinTest(t, room, "Alice")
+	room.handleSetReady(alice, protocol.SetReady{Ready: true})
+	room.handleControl(alice, protocol.Control{Action: protocol.ActionPlay, PositionSec: 0})
+	recA.reset()
+
+	// Buffering franc puis retard massif et soutenu : personne à attendre.
+	clk.Advance(3 * time.Second)
+	room.handleReport(alice, protocol.Report{PositionSec: 3, Buffering: true})
+	clk.Advance(20 * time.Second)
+	room.handleReport(alice, protocol.Report{PositionSec: 3})
+	clk.Advance(20 * time.Second)
+	room.handleReport(alice, protocol.Report{PositionSec: 3})
+
+	if st := room.State(); st.Paused {
+		t.Fatalf("aucune pause auto attendue seul en salle: %+v", st)
+	}
+	if containsSub(toastsOf(recA), "pause auto") {
+		t.Fatalf("toast de pause auto émis seul en salle: %v", toastsOf(recA))
+	}
+}
+
+func TestPauseAutoEspaceeDeCinqSecondes(t *testing.T) {
+	room, clk := newTestRoom()
+	alice, _ := joinTest(t, room, "Alice")
+	bob, _ := joinTest(t, room, "Bob")
+	room.handleSetReady(alice, protocol.SetReady{Ready: true})
+	room.handleSetReady(bob, protocol.SetReady{Ready: true})
+	room.handleControl(alice, protocol.Control{Action: protocol.ActionPlay, PositionSec: 0})
+
+	clk.Advance(3 * time.Second)
+	room.handleReport(bob, protocol.Report{PositionSec: 3, Buffering: true})
+	if !room.State().Paused {
+		t.Fatal("première pause auto attendue")
+	}
+
+	// Relance immédiate puis rechute : trop tôt pour une nouvelle pause auto,
+	// sinon la salle se fige plus vite que l'utilisateur ne peut relancer.
+	room.handleControl(alice, protocol.Control{Action: protocol.ActionPlay, PositionSec: 3})
+	clk.Advance(time.Second)
+	room.handleReport(bob, protocol.Report{PositionSec: 3, Buffering: true})
+	if room.State().Paused {
+		t.Fatal("deuxième pause auto à 1 s d'intervalle : le garde-fou des 5 s n'a pas joué")
+	}
+
+	// Passé le délai, la protection reprend son office.
+	clk.Advance(autoPauseCooldown)
+	room.handleReport(bob, protocol.Report{PositionSec: 3, Buffering: true})
+	if !room.State().Paused {
+		t.Fatal("pause auto attendue une fois les 5 s écoulées")
+	}
+}
+
+func TestPauseAutoIgnoreLesReportsDeLAuteurDuControl(t *testing.T) {
+	room, clk := newTestRoom()
+	alice, _ := joinTest(t, room, "Alice")
+	bob, _ := joinTest(t, room, "Bob")
+	room.handleSetReady(alice, protocol.SetReady{Ready: true})
+	room.handleSetReady(bob, protocol.SetReady{Ready: true})
+	room.handleControl(alice, protocol.Control{Action: protocol.ActionPlay, PositionSec: 0})
+
+	// Bob saute lui-même dans la timeline : son lecteur se fige le temps de
+	// chercher, ce n'est pas un buffering à faire payer à la salle.
+	clk.Advance(3 * time.Second)
+	room.handleControl(bob, protocol.Control{Action: protocol.ActionSeek, PositionSec: 900})
+	clk.Advance(500 * time.Millisecond)
+	room.handleReport(bob, protocol.Report{PositionSec: 900, Buffering: true})
+	if room.State().Paused {
+		t.Fatal("le report de l'auteur du seek ne doit pas mettre la salle en pause")
+	}
+
+	// Le retard consécutif au seek est lui aussi neutralisé pendant la fenêtre.
+	clk.Advance(time.Second)
+	room.handleReport(bob, protocol.Report{PositionSec: 800})
+	if !bob.lateSince.IsZero() {
+		t.Fatal("le retard de l'auteur du control ne doit pas être comptabilisé")
+	}
+
+	// Au-delà de controlGrace, un vrai buffering compte de nouveau.
+	clk.Advance(controlGrace)
+	room.handleReport(bob, protocol.Report{PositionSec: 900, Buffering: true})
+	if !room.State().Paused {
+		t.Fatal("pause auto attendue une fois la fenêtre du control écoulée")
+	}
+}
+
+func TestFormatTimecode(t *testing.T) {
+	cases := map[float64]string{
+		0:       "00:00:00",
+		9.4:     "00:00:09",
+		59.6:    "00:01:00",
+		3729:    "01:02:09",
+		-12:     "00:00:00",
+		36000.2: "10:00:00",
+	}
+	for sec, want := range cases {
+		if got := formatTimecode(sec); got != want {
+			t.Fatalf("formatTimecode(%v) = %q, attendu %q", sec, got, want)
+		}
+	}
+	if got := formatTimecode(math.NaN()); got != "00:00:00" {
+		t.Fatalf("formatTimecode(NaN) = %q", got)
+	}
+}
+
 func TestReportRetardDoitDurerPourDeclencherLaPause(t *testing.T) {
 	room, clk := newTestRoom()
 	alice, _ := joinTest(t, room, "Alice")

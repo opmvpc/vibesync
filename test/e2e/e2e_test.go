@@ -50,6 +50,28 @@ func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
+// --- Horloge serveur : temps réel, décalable d'un saut ---
+
+// skewClock donne l'heure réelle augmentée d'un décalage que le test peut
+// avancer d'un coup. Le reste du système garde donc son comportement temporel
+// normal ; seul « et maintenant, deux minutes plus tard » est simulé.
+type skewClock struct {
+	mu   sync.Mutex
+	skew time.Duration
+}
+
+func (c *skewClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return time.Now().Add(c.skew)
+}
+
+func (c *skewClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.skew += d
+}
+
 // --- Dialer instrumenté : permet de couper brutalement une session ---
 
 type recordingDialer struct {
@@ -170,6 +192,12 @@ func (p *peer) dials() int {
 	return p.dialCount()
 }
 
+// reconnect rouvre une session pour ce pair (même pseudo, même salle, même
+// jeton : le moteur le conserve pour toute la vie du processus).
+func (p *peer) reconnect() {
+	p.eng.Connect(client.ConnectRequest{URL: p.fx.url, Name: p.name, Room: p.fx.room})
+}
+
 func (p *peer) ready() bool {
 	for _, u := range p.snap().Users {
 		if u.Name == p.name {
@@ -186,14 +214,19 @@ type fixture struct {
 	url   string
 	room  string
 	start time.Time
+	// clock est l'horloge du serveur : sert à simuler une longue absence.
+	clock *skewClock
 
 	mu    sync.Mutex
 	peers []*peer
 }
 
-func newFixture(t *testing.T) *fixture {
+func newFixture(t *testing.T) *fixture { return newFixtureWith(t, server.Config{}) }
+
+func newFixtureWith(t *testing.T, cfg server.Config) *fixture {
 	t.Helper()
-	srv := server.New(server.Config{}, server.WithLogger(quietLogger()))
+	clock := &skewClock{}
+	srv := server.New(cfg, server.WithLogger(quietLogger()), server.WithClock(clock))
 	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	room := strings.NewReplacer("/", "-", " ", "-").Replace(t.Name())
@@ -202,6 +235,7 @@ func newFixture(t *testing.T) *fixture {
 		url:   "ws://" + strings.TrimPrefix(ts.URL, "http://") + "/ws",
 		room:  room,
 		start: time.Now(),
+		clock: clock,
 	}
 }
 
@@ -584,6 +618,122 @@ func TestE2E(t *testing.T) {
 			time.Since(start).Round(time.Millisecond))
 		f.holds(2*time.Second, "la synchronisation tient après le départ décalé", func() bool {
 			return pairDrift(a, b) < driftMax && a.vlcState() == "playing" && b.vlcState() == "playing"
+		})
+	})
+
+	// VS-017, reproduction du bug terrain : Thibault manipulait VLC (seek,
+	// pause, retour) et voyait ses commandes écrasées par des « Pause auto : X
+	// bufferise ». Le seek fige la position, le détecteur criait au buffering,
+	// le serveur mettait la salle en pause.
+	t.Run("09-seeks-utilisateur-sans-pause-auto", func(t *testing.T) {
+		f := newFixture(t)
+		a, b := joinBoth(f, filmDuration, filmDuration)
+		markReady(f, a, b)
+		startPlayback(f, a, a, b)
+		f.waitFor("lecture engagée", func() bool { return a.pos() > 1 && b.pos() > 1 })
+
+		// Loin dans le film : les sauts en arrière ne butent pas sur le début.
+		a.eng.Seek(1200)
+		f.waitFor("les deux lecteurs sont vers 1200 s", func() bool {
+			return a.pos() > 1150 && b.pos() > 1150
+		})
+		aucunePauseAuto := func() bool {
+			for _, p := range f.list() {
+				if p.hasToast(protocol.LevelWarn, "pause auto") {
+					return false
+				}
+			}
+			return true
+		}
+
+		// Rafale de seeks faits directement dans VLC. Chaque saut fige la
+		// position le temps que le lecteur cherche — plus longtemps que les
+		// 700 ms du détecteur de buffering, c'est tout le problème de VS-017.
+		for range 3 {
+			b.fake.SetStalled(true)
+			b.fake.SeekTo(b.pos() - 30)
+			f.holds(1200*time.Millisecond, "aucune pause auto pendant la recherche", aucunePauseAuto)
+			b.fake.SetStalled(false)
+			f.holds(800*time.Millisecond, "aucune pause auto une fois la recherche finie", aucunePauseAuto)
+		}
+
+		if !aucunePauseAuto() {
+			f.t.Fatalf("pause auto déclenchée par les seeks de l'utilisateur\n%s", f.dump())
+		}
+		f.waitFor("la lecture n'a jamais été interrompue", func() bool {
+			return a.vlcState() == "playing" && b.vlcState() == "playing" && !a.snap().Paused
+		})
+
+		// Deuxième temps : hors de toute fenêtre de seek, un vrai blocage doit
+		// toujours figer la salle — la suspension est bornée, pas définitive.
+		f.waitUpTo(convergeTimeout, "les deux lecteurs se sont recalés après la rafale", func() bool {
+			return math.Abs(a.snap().DriftSec) < 0.3 && math.Abs(b.snap().DriftSec) < 0.3
+		})
+		f.holds(1500*time.Millisecond, "plus aucune correction en cours", func() bool {
+			return a.vlcState() == "playing" && b.vlcState() == "playing"
+		})
+
+		b.fake.SetStalled(true)
+		f.waitFor("B diagnostique son blocage", func() bool { return b.snap().VLC.Buffering })
+		f.waitFor("A reçoit le toast de pause auto", func() bool {
+			return a.hasToast(protocol.LevelWarn, "bufferise")
+		})
+		f.waitFor("la salle est en pause pour tout le monde", func() bool {
+			return a.snap().Paused && b.snap().Paused
+		})
+	})
+
+	// VS-021 : tout le monde crashe en pleine séance et revient deux minutes
+	// plus tard — la salle a gardé le timecode.
+	t.Run("10-reprise-de-seance-apres-crash", func(t *testing.T) {
+		f := newFixture(t)
+		a, b := joinBoth(f, filmDuration, filmDuration)
+		markReady(f, a, b)
+		startPlayback(f, a, a, b)
+		f.waitFor("lecture engagée", func() bool { return a.pos() > 2 && b.pos() > 2 })
+
+		// Crash de B : le serveur met la salle en pause (déconnexion en lecture).
+		b.eng.Disconnect()
+		f.waitFor("A est seul et la salle est figée", func() bool {
+			s := a.snap()
+			return len(s.Users) == 1 && s.Paused && a.vlcState() == "paused"
+		})
+		want := a.snap().RoomPosition
+		if want < 2 {
+			t.Fatalf("position de séance inattendue avant le crash: %v\n%s", want, f.dump())
+		}
+
+		// Crash de A : la salle se vide, la séance est mise de côté.
+		a.eng.Disconnect()
+		f.waitFor("A est déconnecté", func() bool { return a.snap().Phase == client.PhaseIdle })
+
+		// Deux minutes passent, personne n'est là.
+		f.clock.Advance(2 * time.Minute)
+
+		a.reconnect()
+		f.waitFor("A est de retour", func() bool { return a.snap().Phase == client.PhaseConnected })
+		b.reconnect()
+		f.waitFor("les deux sont de retour", func() bool {
+			return len(a.snap().Users) == 2 && len(b.snap().Users) == 2 &&
+				b.snap().Phase == client.PhaseConnected
+		})
+
+		for _, p := range []*peer{a, b} {
+			s := p.snap()
+			if !s.Paused {
+				t.Fatalf("%s : la séance reprise doit être en pause\n%s", p.name, f.dump())
+			}
+			if math.Abs(s.RoomPosition-want) > 1 {
+				t.Fatalf("%s : position reprise %.2f s, attendue %.2f s (à la seconde près)\n%s",
+					p.name, s.RoomPosition, want, f.dump())
+			}
+		}
+		if !a.hasToast(protocol.LevelInfo, "séance reprise à") {
+			t.Fatalf("le revenant doit être informé du timecode retrouvé\n%s", f.dump())
+		}
+		// Les lecteurs eux-mêmes retournent au bon endroit.
+		f.waitUpTo(convergeTimeout, "les deux VLC sont recalés sur la séance retrouvée", func() bool {
+			return math.Abs(a.pos()-want) < 1 && math.Abs(b.pos()-want) < 1
 		})
 	})
 

@@ -141,10 +141,13 @@ func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug}))
 }
 
+// testBuildInfo est ce que les salles de test annoncent dans leur welcome.
+var testBuildInfo = buildInfo{version: "1.2.3", downloadURL: "https://exemple.test/dl"}
+
 // newTestRoom construit une salle isolée avec horloge injectée.
 func newTestRoom() (*Room, *fakeClock) {
 	clk := newFakeClock()
-	return newRoom("salon", clk, testLogger()), clk
+	return newRoom("salon", clk, testLogger(), testBuildInfo), clk
 }
 
 // joinTest ajoute un membre à la salle et renvoie son enregistreur.

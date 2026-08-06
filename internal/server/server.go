@@ -3,6 +3,7 @@
 package server
 
 import (
+	"context"
 	"crypto/sha256"
 	"log/slog"
 	"net/http"
@@ -20,6 +21,14 @@ const (
 	defaultMaxClients  = 200
 	defaultMaxRooms    = 50
 	defaultMaxRoomSize = 20
+	// defaultRoomLinger : fenêtre pendant laquelle une salle vide est conservée
+	// avec son état pour qu'un retour reprenne la séance (§Modèle, VS-021).
+	defaultRoomLinger = 30 * time.Minute
+	// defaultVersion : version annoncée par un binaire construit sans ldflags.
+	// Illisible en semver, donc jamais prise pour une release plus récente.
+	defaultVersion = "dev"
+	// defaultDownloadURL : où envoyer un client trop ancien (VS-023).
+	defaultDownloadURL = "https://github.com/opmvpc/vibesync/releases/latest"
 
 	// Budget de messages par connexion : ~20 msg/s, rafale de 40.
 	msgRatePerSec = 20
@@ -41,7 +50,23 @@ type Config struct {
 	MaxRooms int
 	// MaxRoomSize est le nombre maximal de membres par salle (défaut 20).
 	MaxRoomSize int
+	// Version est la version applicative du serveur (fichier VERSION du repo,
+	// injecté au build par ldflags). Annoncée dans chaque welcome ; défaut "dev".
+	Version string
+	// DownloadURL est l'adresse proposée aux clients trop anciens (défaut :
+	// page des releases GitHub, env VIBESYNC_DOWNLOAD_URL).
+	DownloadURL string
+	// RoomLinger est la fenêtre de reprise d'une salle vide : son état est
+	// conservé (gelé en pause) pendant cette durée avant destruction (défaut
+	// 30 min). RoomLingerDisabled — ou toute valeur négative — rétablit la
+	// destruction immédiate.
+	RoomLinger time.Duration
 }
+
+// RoomLingerDisabled, placé dans Config.RoomLinger, détruit les salles dès
+// qu'elles se vident : aucune reprise de séance n'est alors possible.
+// ConfigFromEnv ne produit jamais cette valeur.
+const RoomLingerDisabled time.Duration = -1
 
 // Server expose les routes HTTP et détient le hub de salles.
 type Server struct {
@@ -93,6 +118,15 @@ func New(cfg Config, opts ...Option) *Server {
 	if cfg.MaxRoomSize <= 0 {
 		cfg.MaxRoomSize = defaultMaxRoomSize
 	}
+	if cfg.RoomLinger == 0 {
+		cfg.RoomLinger = defaultRoomLinger
+	}
+	if strings.TrimSpace(cfg.Version) == "" {
+		cfg.Version = defaultVersion
+	}
+	if strings.TrimSpace(cfg.DownloadURL) == "" {
+		cfg.DownloadURL = defaultDownloadURL
+	}
 	s := &Server{
 		cfg:   cfg,
 		clock: systemClock{},
@@ -105,12 +139,27 @@ func New(cfg Config, opts ...Option) *Server {
 	for _, opt := range opts {
 		opt(s)
 	}
-	s.hub = newHub(s.clock, s.log, cfg.MaxRooms, cfg.MaxRoomSize)
+	s.hub = newHub(s.clock, s.log, cfg.MaxRooms, cfg.MaxRoomSize, cfg.RoomLinger,
+		buildInfo{version: cfg.Version, downloadURL: cfg.DownloadURL})
 	return s
 }
 
+// Version renvoie la version applicative annoncée par ce serveur.
+func (s *Server) Version() string { return s.cfg.Version }
+
 // Addr renvoie l'adresse d'écoute configurée.
 func (s *Server) Addr() string { return s.cfg.Addr }
+
+// StartGC démarre le ramasse-miettes des salles en attente de reprise et rend
+// la main aussitôt ; il s'arrête à l'annulation du contexte. Sans cet appel, les
+// salles vides ne sont recyclées qu'à l'arrivée suivante (le plafond de salles
+// reste donc correct, mais la mémoire d'un serveur inactif ne se libère pas).
+func (s *Server) StartGC(ctx context.Context) {
+	if s.cfg.RoomLinger <= 0 {
+		return
+	}
+	go s.hub.gcLoop(ctx)
+}
 
 // Handler renvoie le routeur HTTP (`/ws` et `/healthz`).
 func (s *Server) Handler() http.Handler {
@@ -163,8 +212,10 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	c.readPump()
 }
 
-// ConfigFromEnv lit VIBESYNC_ADDR, VIBESYNC_PASSWORD et les plafonds anti-abus
-// VIBESYNC_MAX_CLIENTS, VIBESYNC_MAX_ROOMS, VIBESYNC_MAX_ROOM_SIZE.
+// ConfigFromEnv lit VIBESYNC_ADDR, VIBESYNC_PASSWORD, les plafonds anti-abus
+// VIBESYNC_MAX_CLIENTS, VIBESYNC_MAX_ROOMS, VIBESYNC_MAX_ROOM_SIZE, la fenêtre
+// de reprise VIBESYNC_ROOM_LINGER et VIBESYNC_DOWNLOAD_URL. La version, elle,
+// est injectée au build : elle est fournie par l'appelant (Config.Version).
 func ConfigFromEnv() Config {
 	cfg := Config{
 		Addr:        strings.TrimSpace(os.Getenv("VIBESYNC_ADDR")),
@@ -172,6 +223,11 @@ func ConfigFromEnv() Config {
 		MaxClients:  envInt("VIBESYNC_MAX_CLIENTS", defaultMaxClients),
 		MaxRooms:    envInt("VIBESYNC_MAX_ROOMS", defaultMaxRooms),
 		MaxRoomSize: envInt("VIBESYNC_MAX_ROOM_SIZE", defaultMaxRoomSize),
+		RoomLinger:  envDuration("VIBESYNC_ROOM_LINGER", defaultRoomLinger),
+		DownloadURL: strings.TrimSpace(os.Getenv("VIBESYNC_DOWNLOAD_URL")),
+	}
+	if cfg.DownloadURL == "" {
+		cfg.DownloadURL = defaultDownloadURL
 	}
 	if cfg.Addr == "" {
 		cfg.Addr = ":8080"
@@ -192,6 +248,22 @@ func envInt(key string, def int) int {
 		return def
 	}
 	return n
+}
+
+// envDuration lit une durée au format Go (« 30m », « 2h », « 90s ») ; toute
+// valeur absente, illisible ou ≤ 0 rend la valeur par défaut — mêmes règles que
+// les plafonds entiers.
+func envDuration(key string, def time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return def
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		slog.Default().Warn("valeur d'environnement ignorée", "cle", key, "valeur", raw, "defaut", def)
+		return def
+	}
+	return d
 }
 
 // LogLevelFromEnv traduit VIBESYNC_LOG (debug|info|warn|error) ; info par défaut.

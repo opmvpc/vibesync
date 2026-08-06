@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/thibsix/vibesync/internal/protocol"
@@ -164,6 +165,9 @@ func (e *Engine) handleRaw(raw []byte) (string, bool) {
 			if w.Room != "" {
 				e.req.Room = w.Room
 			}
+			if t := e.versionToastLocked(w); t != nil {
+				events = append(events, Event{Kind: EventToast, Toast: t})
+			}
 			// Le welcome est la référence d'une session neuve : aucun hold ni
 			// roomState en attente ne lui survit.
 			e.userHoldUntil = time.Time{}
@@ -303,6 +307,26 @@ func sanitizeRoomState(rs protocol.RoomState) (protocol.RoomState, bool) {
 		return rs, false
 	}
 	return rs, true
+}
+
+// versionToastLocked enregistre ce que le serveur dit de lui-même et, s'il
+// tourne une version applicative plus récente que la nôtre, rend le toast
+// d'invitation à mettre à jour (VS-023). Purement informatif : la compatibilité
+// dure reste celle du protocole, tranchée par le serveur au hello.
+func (e *Engine) versionToastLocked(w protocol.Welcome) *protocol.Toast {
+	e.serverVersion = w.ServerVersion
+	e.downloadURL = w.DownloadURL
+	if !NewerVersion(w.ServerVersion, e.cfg.Version) {
+		return nil
+	}
+	text := fmt.Sprintf("Nouvelle version disponible : %s (vous avez %s)",
+		w.ServerVersion, e.cfg.Version)
+	if w.DownloadURL != "" {
+		text += " — " + w.DownloadURL
+	}
+	e.log.Info("nouvelle version disponible", "serveur", w.ServerVersion,
+		"client", e.cfg.Version, "url", w.DownloadURL)
+	return &protocol.Toast{Level: protocol.LevelInfo, Text: text}
 }
 
 // readyFromUsersLocked resynchronise notre drapeau ready avec la vue serveur.

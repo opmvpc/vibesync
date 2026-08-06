@@ -242,7 +242,7 @@ func TestZombieMuetApresReprise(t *testing.T) {
 // TestRepriseIgnoreLePlafondDeSalle : une salle pleine doit quand même laisser
 // un de ses membres reprendre sa place (la taille ne change pas).
 func TestRepriseIgnoreLePlafondDeSalle(t *testing.T) {
-	hub := newHub(newFakeClock(), testLogger(), 4, 2)
+	hub := newHub(newFakeClock(), testLogger(), 4, 2, RoomLingerDisabled, testBuildInfo)
 	if _, _, _, err := hub.join("salon", "alice", "jeton-alice", 0, &recorder{}); err != nil {
 		t.Fatalf("join alice: %v", err)
 	}

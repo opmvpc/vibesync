@@ -131,6 +131,18 @@ func (e *Engine) userActionLocked(act string, pos float64, now time.Time) {
 	e.graceUntil = now.Add(GraceWindow)
 	e.userHoldUntil = now.Add(UserHold)
 	e.pendingRS = nil
+	// Seek ou transition play/pause faite à la main dans VLC : la position se
+	// fige le temps que VLC obéisse, ce n'est pas un buffering.
+	e.suspendBufferingLocked(now)
+}
+
+// suspendBufferingLocked neutralise la détection de buffering pendant
+// BufferingSuspend : seek (commandé ou utilisateur) et transitions play/pause
+// figent mécaniquement la position (docs/protocol.md §Comportements client,
+// Buffering). Un buffering déjà diagnostiqué n'est pas levé pour autant : il ne
+// retombera qu'une fois la position réellement repartie.
+func (e *Engine) suspendBufferingLocked(now time.Time) {
+	e.bufDetect.Suspend(now, BufferingSuspend)
 }
 
 // expireUserHoldLocked lève le hold post-action à échéance. Faute d'écho du
@@ -259,16 +271,18 @@ func (e *Engine) armLocked(acts []action, now time.Time) []action {
 			e.expect.pos = e.expect.predict(now)
 			e.expect.paused = true
 			e.expect.at = now
+			e.suspendBufferingLocked(now)
 			hold = true
 		case actResume:
 			e.expect.pos = e.expect.predict(now)
 			e.expect.paused = false
 			e.expect.at = now
+			e.suspendBufferingLocked(now)
 			hold = true
 		case actSeek:
 			e.expect.pos = math.Round(a.val) // VLC arrondit à la seconde
 			e.expect.at = now
-			e.bufDetect.Reset()
+			e.suspendBufferingLocked(now)
 			hold = true
 		case actRate:
 			e.expect.pos = e.expect.predict(now)

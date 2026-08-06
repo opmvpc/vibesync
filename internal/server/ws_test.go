@@ -27,6 +27,13 @@ type testRig struct {
 
 func newRig(t *testing.T, cfg Config) *testRig {
 	t.Helper()
+	if cfg.RoomLinger == 0 {
+		// Par défaut le harnais garde l'ancien comportement — salle détruite dès
+		// qu'elle se vide — pour que `waitRoomDestroyed` reste une barrière de
+		// synchronisation fiable. Les tests de reprise de séance demandent
+		// explicitement leur fenêtre.
+		cfg.RoomLinger = RoomLingerDisabled
+	}
 	clk := newFakeClock()
 	srv := New(cfg, WithClock(clk), WithLogger(testLogger()))
 	rig := &testRig{srv: srv, clock: clk, destroyed: make(chan string, 16)}
@@ -57,6 +64,21 @@ func (r *testRig) waitRoomDestroyed(t *testing.T, name string) {
 			t.Fatalf("salle %q non détruite à temps", name)
 		}
 	}
+}
+
+// waitRoomEmpty attend que la salle n'ait plus aucun membre (elle peut alors
+// survivre en attente de reprise : `waitRoomDestroyed` ne conviendrait pas).
+func (r *testRig) waitRoomEmpty(t *testing.T, name string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		room := r.srv.hub.room(name)
+		if room == nil || room.size() == 0 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("salle %q toujours occupée", name)
 }
 
 func (r *testRig) wsURL() string {
@@ -281,6 +303,38 @@ func TestIntegrationHelloWelcome(t *testing.T) {
 	}
 }
 
+// VS-023 : le welcome annonce la version du serveur et où trouver un client à
+// jour. Champs purement informatifs — la compatibilité dure reste le numéro de
+// protocole, refusé au hello.
+func TestIntegrationWelcomePorteLaVersionEtLeLienDeTelechargement(t *testing.T) {
+	rig := newRig(t, Config{Version: "1.4.2", DownloadURL: "https://exemple.test/dl"})
+	c := rig.dial(t)
+	welcome := c.hello("Alice", "salon")
+	if welcome.ServerVersion != "1.4.2" {
+		t.Fatalf("version du serveur attendue 1.4.2, obtenue %q", welcome.ServerVersion)
+	}
+	if welcome.DownloadURL != "https://exemple.test/dl" {
+		t.Fatalf("lien de téléchargement attendu, obtenu %q", welcome.DownloadURL)
+	}
+	if rig.srv.Version() != "1.4.2" {
+		t.Fatalf("Version() = %q", rig.srv.Version())
+	}
+}
+
+// Sans injection au build : « dev » et le lien par défaut, pour un binaire
+// compilé à la main comme pour les tests.
+func TestIntegrationWelcomeVersionParDefaut(t *testing.T) {
+	rig := newRig(t, Config{})
+	c := rig.dial(t)
+	welcome := c.hello("Alice", "salon")
+	if welcome.ServerVersion != defaultVersion {
+		t.Fatalf("version par défaut attendue %q, obtenue %q", defaultVersion, welcome.ServerVersion)
+	}
+	if welcome.DownloadURL != defaultDownloadURL {
+		t.Fatalf("lien par défaut attendu %q, obtenu %q", defaultDownloadURL, welcome.DownloadURL)
+	}
+}
+
 func TestIntegrationVersionMismatch(t *testing.T) {
 	rig := newRig(t, Config{})
 	c := rig.dial(t)
@@ -500,11 +554,19 @@ func TestIntegrationReportBufferingDeclenchePauseAuto(t *testing.T) {
 	rig := newRig(t, Config{})
 	a := rig.dial(t)
 	a.hello("Alice", "salon")
+	// Deux membres : une salle à un seul occupant ne se met jamais en pause
+	// automatiquement (§Comportements serveur 2, garde-fous).
+	b := rig.dial(t)
+	b.hello("Bob", "salon")
 	a.send(protocol.TypeSetReady, protocol.SetReady{Ready: true})
+	b.send(protocol.TypeSetReady, protocol.SetReady{Ready: true})
+	a.sync()
+	b.sync()
 	a.send(protocol.TypeControl, protocol.Control{Action: protocol.ActionPlay, PositionSec: 0})
 	a.sync()
+	b.sync()
 
-	a.send(protocol.TypeReport, protocol.Report{PositionSec: 0, Buffering: true})
+	b.send(protocol.TypeReport, protocol.Report{PositionSec: 0, Buffering: true})
 	st := mustData[protocol.RoomState](t, a.waitFor(protocol.TypeRoomState))
 	if !st.Paused || st.SetBy != setByServer {
 		t.Fatalf("pause auto attendue, obtenu %+v", st)
@@ -512,6 +574,29 @@ func TestIntegrationReportBufferingDeclenchePauseAuto(t *testing.T) {
 	toast := mustData[protocol.Toast](t, a.waitFor(protocol.TypeToast))
 	if !strings.Contains(toast.Text, "bufferise") {
 		t.Fatalf("toast de buffering attendu, obtenu %+v", toast)
+	}
+}
+
+// Le bug terrain VS-017 : seul dans sa salle, Thibault manipulait VLC et
+// récoltait des « Pause auto : opmvpc bufferise » qui écrasaient ses commandes.
+func TestIntegrationSeulEnSalleAucunePauseAuto(t *testing.T) {
+	rig := newRig(t, Config{})
+	a := rig.dial(t)
+	a.hello("Alice", "salon")
+	a.send(protocol.TypeSetReady, protocol.SetReady{Ready: true})
+	a.send(protocol.TypeControl, protocol.Control{Action: protocol.ActionPlay, PositionSec: 0})
+	a.sync()
+
+	// Buffering franc, puis retard massif et soutenu : rien ne doit bouger.
+	a.send(protocol.TypeReport, protocol.Report{PositionSec: 0, Buffering: true})
+	rig.clock.Advance(20 * time.Second)
+	a.send(protocol.TypeReport, protocol.Report{PositionSec: 0})
+	rig.clock.Advance(20 * time.Second)
+	a.send(protocol.TypeReport, protocol.Report{PositionSec: 0})
+	a.sync()
+
+	if st := rig.srv.hub.room("salon").State(); st.Paused {
+		t.Fatalf("aucune pause auto attendue dans une salle à un seul membre: %+v", st)
 	}
 }
 
@@ -647,6 +732,55 @@ func TestIntegrationNouvelArrivantRecoitLEtatCourant(t *testing.T) {
 	}
 }
 
+// Fenêtre de reprise (VS-021) : bout en bout, un revenant récupère la séance
+// interrompue et le toast qui lui dit où elle en était.
+func TestIntegrationSalleEnLingerReprendLaSeance(t *testing.T) {
+	rig := newRig(t, Config{RoomLinger: 30 * time.Minute})
+	a := rig.dial(t)
+	a.hello("Alice", "salon")
+	a.send(protocol.TypeSetReady, protocol.SetReady{Ready: true})
+	a.send(protocol.TypeControl, protocol.Control{Action: protocol.ActionPlay, PositionSec: 500})
+	a.sync()
+
+	// Tout plante pendant la séance, en pleine lecture.
+	rig.clock.Advance(10 * time.Second)
+	_ = a.conn.Close()
+	rig.waitRoomEmpty(t, "salon")
+	if rig.srv.hub.room("salon") == nil {
+		t.Fatal("la salle doit survivre au départ du dernier membre")
+	}
+
+	rig.clock.Advance(2 * time.Minute)
+	b := rig.dial(t)
+	welcome := b.helloSession("Alice", "salon", "jeton-alice")
+	if !welcome.State.Paused {
+		t.Fatalf("la séance reprise doit être en pause: %+v", welcome.State)
+	}
+	if welcome.State.PositionSec < 509.9 || welcome.State.PositionSec > 510.1 {
+		t.Fatalf("position reprise attendue ≈510 s, obtenue %v", welcome.State.PositionSec)
+	}
+	toast := mustData[protocol.Toast](t, b.waitFor(protocol.TypeToast))
+	if toast.Level != protocol.LevelInfo || !strings.Contains(toast.Text, "00:08:30") {
+		t.Fatalf("toast « Séance reprise à 00:08:30 » attendu, obtenu %+v", toast)
+	}
+}
+
+func TestIntegrationSalleEnLingerDetruiteApresExpiration(t *testing.T) {
+	rig := newRig(t, Config{RoomLinger: time.Minute})
+	a := rig.dial(t)
+	a.hello("Alice", "salon")
+	_ = a.conn.Close()
+	rig.waitRoomEmpty(t, "salon")
+
+	rig.clock.Advance(2 * time.Minute)
+	rig.srv.hub.gc()
+	rig.waitRoomDestroyed(t, "salon")
+	if rig.srv.hub.roomCount() != 0 {
+		t.Fatalf("plus aucune salle attendue, %d restantes", rig.srv.hub.roomCount())
+	}
+}
+
+// Fenêtre de reprise désactivée par le harnais : la salle disparaît sur-le-champ.
 func TestIntegrationSalleDetruiteQuandVide(t *testing.T) {
 	rig := newRig(t, Config{})
 	a := rig.dial(t)

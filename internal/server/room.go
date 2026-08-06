@@ -19,6 +19,15 @@ const (
 	// lateSustain : durée pendant laquelle le retard doit persister avant la
 	// pause automatique (le buffering, lui, déclenche immédiatement).
 	lateSustain = 2 * time.Second
+	// autoPauseCooldown : intervalle minimal entre deux pauses automatiques
+	// d'une même salle (§Comportements serveur 2, garde-fous). Une salle qui
+	// bufferise vraiment se remet en pause d'elle-même, mais elle ne doit pas
+	// noyer les commandes de l'utilisateur sous les pauses.
+	autoPauseCooldown = 5 * time.Second
+	// controlGrace : après son propre `control`, les reports d'un membre ne
+	// peuvent plus déclencher de pause automatique pendant cette durée — son
+	// seek fige mécaniquement sa position (VS-017, §Comportements serveur 2).
+	controlGrace = 2 * time.Second
 	// durationMismatchSec : écart de durée entre fichiers au-delà duquel on
 	// avertit la salle (sans bloquer).
 	durationMismatchSec = 2.0
@@ -68,7 +77,10 @@ type member struct {
 	rtts        []int64
 	// lateSince : instant depuis lequel le membre est en retard (zéro sinon).
 	lateSince time.Time
-	out       sink
+	// lastControlAt : instant du dernier `control` accepté de ce membre ; ses
+	// reports sont neutres vis-à-vis de la pause auto pendant controlGrace.
+	lastControlAt time.Time
+	out           sink
 	// evicted marque un membre remplacé par une reprise de session : sa
 	// connexion agonise peut-être encore, mais elle ne doit plus rien changer.
 	evicted bool
@@ -89,12 +101,20 @@ func (m *member) snapshot() protocol.User {
 	return u
 }
 
+// buildInfo est ce que le serveur dit de lui-même à chaque arrivant : sa
+// version applicative et où télécharger un client à jour (VS-023). Immuable.
+type buildInfo struct {
+	version     string
+	downloadURL string
+}
+
 // Room est une salle : état autoritatif + membres. Tous les accès passent par
 // mu, ce qui sérialise complètement le traitement des messages d'une salle.
 type Room struct {
 	name  string
 	clock Clock
 	log   *slog.Logger
+	info  buildInfo
 
 	mu        sync.Mutex
 	state     protocol.RoomState
@@ -102,14 +122,22 @@ type Room struct {
 	nextID    int
 	started   bool // un play a déjà été accepté → le ready-gate est levé
 	lastUsers time.Time
+	// lastAutoPause : dernière pause automatique, pour l'espacement minimal
+	// (autoPauseCooldown).
+	lastAutoPause time.Time
+	// emptySince : instant où la salle s'est vidée (zéro tant qu'elle a des
+	// membres). Une salle vide est conservée avec son état — figé en pause —
+	// pendant la fenêtre de reprise du hub, puis détruite (§Modèle, VS-021).
+	emptySince time.Time
 }
 
-func newRoom(name string, clock Clock, log *slog.Logger) *Room {
+func newRoom(name string, clock Clock, log *slog.Logger, info buildInfo) *Room {
 	now := clock.Now()
 	return &Room{
 		name:  name,
 		clock: clock,
 		log:   log,
+		info:  info,
 		state: protocol.RoomState{
 			Paused:      true,
 			PositionSec: 0,
@@ -173,6 +201,11 @@ func (r *Room) join(name, session string, latencyMs int64, out sink) (*member, s
 		break
 	}
 
+	// Salle en attente de reprise (vide mais conservée) : cet arrivant reprend la
+	// séance interrompue, son welcome porte l'état gelé (§Modèle, VS-021).
+	resumed := len(r.members) == 0 && !r.emptySince.IsZero()
+	r.emptySince = time.Time{}
+
 	r.nextID++
 	m := &member{
 		id:        fmt.Sprintf("u%d", r.nextID),
@@ -185,11 +218,21 @@ func (r *Room) join(name, session string, latencyMs int64, out sink) (*member, s
 
 	now := r.clock.Now()
 	m.out.send(protocol.TypeWelcome, protocol.Welcome{
-		SelfID: m.id,
-		Room:   r.name,
-		State:  r.state,
-		Users:  r.usersLocked(),
+		SelfID:        m.id,
+		Room:          r.name,
+		State:         r.state,
+		Users:         r.usersLocked(),
+		ServerVersion: r.info.version,
+		DownloadURL:   r.info.downloadURL,
 	})
+	if resumed {
+		m.out.send(protocol.TypeToast, protocol.Toast{
+			Level: protocol.LevelInfo,
+			Text:  fmt.Sprintf("Séance reprise à %s", formatTimecode(r.state.PositionSec)),
+		})
+		r.log.Info("séance reprise", "room", r.name, "user", m.id,
+			"positionSec", r.state.PositionSec)
+	}
 	text := fmt.Sprintf("%s a rejoint la salle", m.name)
 	if replaced != nil {
 		// Ni départ ni arrivée : le membre n'a jamais vraiment quitté la salle.
@@ -254,6 +297,40 @@ func (r *Room) leave(m *member) bool {
 	r.broadcastUsersLocked(now)
 	r.log.Info("membre parti", "room", r.name, "user", m.id, "restants", len(r.members))
 	return len(r.members) == 0
+}
+
+// markEmpty fait entrer une salle qui vient de se vider en « linger » : la
+// séance est gelée à sa position courante, en pause, et l'instant est noté pour
+// le ramasse-miettes du hub (§Modèle, VS-021). Renvoie false si un membre est
+// arrivé entre-temps — la salle reste vivante et rien n'est touché.
+func (r *Room) markEmpty(now time.Time) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.members) > 0 {
+		return false
+	}
+	if !r.state.Paused {
+		// Personne ne regarde plus : sans ce gel, la position de référence
+		// continuerait de courir et la reprise retomberait n'importe où.
+		r.state.PositionSec = r.positionAtLocked(msOf(now))
+		r.state.Paused = true
+		r.state.Rate = 1
+		r.state.RefServerMs = msOf(now)
+		r.state.SetBy = setByServer
+	}
+	if r.emptySince.IsZero() {
+		// Idempotent : la fin d'agonie d'une connexion zombie ne doit pas
+		// repousser la fin de la fenêtre de reprise.
+		r.emptySince = now
+	}
+	return true
+}
+
+// expired dit si la fenêtre de reprise de cette salle vide est écoulée.
+func (r *Room) expired(now time.Time, linger time.Duration) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.members) == 0 && !r.emptySince.IsZero() && now.Sub(r.emptySince) >= linger
 }
 
 // --- Handlers de messages ---
@@ -400,6 +477,10 @@ func (r *Room) handleControl(m *member, msg protocol.Control) {
 		return
 	}
 
+	// L'auteur d'un control va mécaniquement voir sa position figée le temps que
+	// VLC obéisse : ses reports ne déclenchent plus de pause auto pendant
+	// controlGrace (§Comportements serveur, point 2).
+	m.lastControlAt = now
 	r.resetLatenessLocked()
 	r.broadcastLocked(protocol.TypeRoomState, r.state)
 	r.log.Debug("control appliqué", "room", r.name, "user", m.id, "action", msg.Action,
@@ -419,7 +500,7 @@ func (r *Room) handleReport(m *member, msg protocol.Report) {
 	m.positionSec = sanitizeFloat(msg.PositionSec)
 	m.buffering = msg.Buffering
 
-	if r.state.Paused {
+	if r.state.Paused || !r.autoPauseAllowedLocked(m, now) {
 		m.lateSince = time.Time{}
 		r.broadcastUsersThrottledLocked(now)
 		return
@@ -475,9 +556,32 @@ func (r *Room) positionAtLocked(nowMs int64) float64 {
 	return r.state.PositionSec + float64(nowMs-r.state.RefServerMs)/1000*r.state.Rate
 }
 
+// autoPauseAllowedLocked applique les garde-fous de la pause automatique
+// déclenchée par un `report` (§Comportements serveur, point 2) :
+//
+//	a) jamais de pause auto dans une salle à un seul membre — personne à
+//	   attendre, et c'est le cas qui écrasait les commandes de l'utilisateur
+//	   testant seul (VS-017) ;
+//	b) au plus une pause auto toutes les autoPauseCooldown par salle ;
+//	c) les reports de l'auteur d'un `control` sont neutres pendant controlGrace
+//	   après ce control (son propre seek le fait « bufferiser »).
+//
+// La pause automatique sur déconnexion (point 3) n'est pas concernée : elle
+// répond à un départ, pas à un état rapporté.
+func (r *Room) autoPauseAllowedLocked(m *member, now time.Time) bool {
+	if len(r.members) < 2 {
+		return false
+	}
+	if !r.lastAutoPause.IsZero() && now.Sub(r.lastAutoPause) < autoPauseCooldown {
+		return false
+	}
+	return m.lastControlAt.IsZero() || now.Sub(m.lastControlAt) >= controlGrace
+}
+
 // autoPauseLocked fige la salle à sa position courante et prévient tout le monde.
 func (r *Room) autoPauseLocked(now time.Time, reason string) {
 	nowMs := msOf(now)
+	r.lastAutoPause = now
 	r.state.PositionSec = r.positionAtLocked(nowMs)
 	r.state.Paused = true
 	r.state.Rate = 1
@@ -543,6 +647,15 @@ func sanitizeFloat(v float64) float64 {
 		return maxPositionSec
 	}
 	return v
+}
+
+// formatTimecode rend une position en HH:MM:SS (toast de reprise de séance).
+func formatTimecode(sec float64) string {
+	if math.IsNaN(sec) || sec < 0 {
+		sec = 0
+	}
+	total := int64(math.Round(math.Min(sec, maxPositionSec)))
+	return fmt.Sprintf("%02d:%02d:%02d", total/3600, total/60%60, total%60)
 }
 
 func truncate(s string, max int) string {

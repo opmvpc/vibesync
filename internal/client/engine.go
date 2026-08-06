@@ -47,6 +47,10 @@ type Config struct {
 	MaxBackoff     time.Duration
 	// KeepVLCOpen : ne pas fermer VLC quand le client s'arrête.
 	KeepVLCOpen bool
+	// Version est la version applicative de ce client (fichier VERSION du repo,
+	// injectée au build). Défaut "dev" : illisible en semver, donc jamais de
+	// proposition de mise à jour — le client Go est un harnais, pas un livrable.
+	Version string
 }
 
 func (c *Config) applyDefaults() {
@@ -76,6 +80,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MaxBackoff <= 0 {
 		c.MaxBackoff = 10 * time.Second
+	}
+	if c.Version == "" {
+		c.Version = DevVersion
 	}
 }
 
@@ -143,6 +150,9 @@ type Engine struct {
 	haveOffset bool
 	offsetMs   int64
 	latency    int64
+	// versions annoncées par le serveur dans le welcome (VS-023)
+	serverVersion string
+	downloadURL   string
 	// état de salle
 	roomState protocol.RoomState
 	haveState bool
@@ -329,6 +339,9 @@ func (e *Engine) snapshotLocked() Snapshot {
 	copy(users, e.users)
 	s := Snapshot{
 		Phase:         e.phase,
+		Version:       e.cfg.Version,
+		ServerVersion: e.serverVersion,
+		DownloadURL:   e.downloadURL,
 		ServerURL:     e.req.URL,
 		Room:          e.req.Room,
 		Name:          e.req.Name,
@@ -466,8 +479,12 @@ func (e *Engine) OpenFile(ctx context.Context, path string) error {
 	e.status = vlc.Status{}
 	e.haveStatus = false
 	e.expect = expectation{}
+	// Média neuf : le diagnostic du précédent ne vaut plus rien. Ouvrir un
+	// fichier enchaîne pause + seek 0 + démarrage, autant de raisons mécaniques
+	// de voir la position figée : on suspend aussi la détection.
 	e.bufDetect.Reset()
 	e.buffering = false
+	e.suspendBufferingLocked(e.cfg.Clock.Now())
 	e.vlcErr = ""
 	e.vlcOK = true
 	e.appliedRat = 1
@@ -531,6 +548,9 @@ func (e *Engine) userControl(act string, pos float64, usePos bool) {
 	// (roomState setBy = soi) ou l'expiration.
 	e.userHoldUntil = now.Add(UserHold)
 	e.pendingRS = nil
+	// Même raison que pour une action faite dans VLC : le seek (ou la
+	// transition) qui va suivre fige la position, ce n'est pas un buffering.
+	e.suspendBufferingLocked(now)
 	e.mu.Unlock()
 	e.flush()
 }
