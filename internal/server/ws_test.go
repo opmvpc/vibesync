@@ -829,12 +829,20 @@ func TestIntegrationDebitNormalNonAffecte(t *testing.T) {
 	c := rig.dial(t)
 	c.hello("Alice", "salon")
 
-	// 10 messages par seconde simulée pendant 6 s : sous la limite de 20/s.
+	// 10 messages par seconde simulée pendant 12 s : sous la limite de 20/s.
+	//
+	// La barrière après chaque envoi n'est pas cosmétique : sans elle, rien ne
+	// garantit que le serveur traite un report avant que le test n'avance
+	// l'horloge du suivant. Les écritures partent en rafale dans le tampon TCP,
+	// le serveur peut les consommer toutes au même instant simulé — et le seau
+	// à jetons, plafonné à msgRateBurst, refuse alors la fin de la rafale
+	// (« flood détecté »). Le débit *observé par le serveur* doit être piloté,
+	// pas seulement le débit d'écriture.
 	for i := 0; i < 60; i++ {
-		rig.clock.Advance(100 * time.Millisecond)
+		rig.clock.Advance(200 * time.Millisecond)
 		c.send(protocol.TypeReport, protocol.Report{PositionSec: float64(i)})
+		c.sync() // le report ci-dessus est traité avant le prochain tic d'horloge
 	}
-	c.sync()
 	if users := rig.srv.hub.room("salon").Users(); users[0].PositionSec != 59 {
 		t.Fatalf("tous les reports doivent avoir été traités, dernier %v", users[0].PositionSec)
 	}

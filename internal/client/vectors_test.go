@@ -42,6 +42,13 @@ type vectorEvent struct {
 	AtMs int64           `json:"atMs"`
 	Type string          `json:"type"`
 	Data json.RawMessage `json:"data,omitempty"`
+	// KeepOutput dit au rejeu quoi faire des messages émis en réaction immédiate
+	// à cet événement : false (défaut, champ absent) = ils ne font pas partie de
+	// la trace et sont jetés ; true = ils sont conservés et apparaissent dans le
+	// `toServer` du premier pas qui suit. Sans ce drapeau, deux vecteurs aux
+	// événements identiques attendraient des traces différentes et aucune règle
+	// de rejeu unique ne pourrait satisfaire les deux.
+	KeepOutput bool `json:"keepOutput,omitempty"`
 }
 
 type vectorCommand struct {
@@ -74,9 +81,13 @@ type vectorVLC struct {
 }
 
 type vector struct {
-	Doc            string        `json:"_doc"`
-	Name           string        `json:"name"`
-	Description    string        `json:"description"`
+	Doc         string `json:"_doc"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	// Scenario détaille, quand c'est nécessaire, les préconditions que
+	// `initialVLC` ne porte pas : état du transport, de la connexion, du
+	// fichier. Absent quand le scénario se lit entièrement dans les événements.
+	Scenario       string        `json:"scenario,omitempty"`
 	PollIntervalMs int64         `json:"pollIntervalMs"`
 	InitialVLC     vectorVLC     `json:"initialVLC"`
 	Events         []vectorEvent `json:"events"`
@@ -132,6 +143,7 @@ type vecBuilder struct {
 type vecSetup struct {
 	name        string
 	description string
+	scenario    string
 	file        string
 	durationSec float64
 	positionSec float64
@@ -187,6 +199,7 @@ func newVecBuilder(t *testing.T, s vecSetup) *vecBuilder {
 		t: t, h: h, rec: rec, start: clock.Now(),
 		vec: &vector{
 			Doc: vectorsDoc, Name: s.name, Description: s.description,
+			Scenario:       s.scenario,
 			PollIntervalMs: PollInterval.Milliseconds(),
 			InitialVLC: vectorVLC{
 				FileName:    s.file,
@@ -225,7 +238,9 @@ func (b *vecBuilder) eventKeep(msgType string, data any) {
 	if err != nil {
 		b.t.Fatal(err)
 	}
-	b.vec.Events = append(b.vec.Events, vectorEvent{AtMs: b.atMs(), Type: msgType, Data: raw})
+	b.vec.Events = append(b.vec.Events, vectorEvent{
+		AtMs: b.atMs(), Type: msgType, Data: raw, KeepOutput: true,
+	})
 	b.h.server(msgType, data)
 }
 
@@ -510,10 +525,23 @@ func TestVectors(t *testing.T) {
 	b = newVecBuilder(t, vecSetup{
 		name: "13-reprise-salle-vierge", file: "ep1.mkv", durationSec: 7200,
 		positionSec: 1800, playing: true,
-		description: "Le serveur redémarre : welcome d'une salle vierge (setBy vide, " +
-			"position 0) alors que VLC est loin dans le film. Le client émet UNE " +
-			"reprise control seek à sa position au lieu de se laisser ramener à 0, " +
-			"puis adopte l'écho du serveur.",
+		description: "Le serveur redémarre et revient sans mémoire : welcome d'une " +
+			"salle vierge (setBy vide, position 0). Le client, qui connaissait déjà " +
+			"la séance de CETTE salle, émet UNE reprise control seek à la dernière " +
+			"position de salle connue au lieu de se laisser ramener à 0, puis adopte " +
+			"l'écho du serveur.",
+		scenario: "Préconditions du moteur au premier événement : session serveur " +
+			"déjà établie (le hello est passé, la connexion est ouverte), aucun état " +
+			"de salle connu, aucune mesure d'offset d'horloge. Fichier ep1.mkv déjà " +
+			"ouvert dans le lecteur, durée 7200 s, taille 15 octets (c'est elle que " +
+			"portent les setFile de la trace), position 1800 s, lecture en cours, " +
+			"rate 1. Déroulé : (1) welcome + pong d'une salle en lecture à 1800 s — " +
+			"c'est ce passage qui rend la reprise possible plus tard, un premier join " +
+			"ne proposerait jamais rien ; (2) la connexion tombe et 5 s s'écoulent " +
+			"sans serveur, le lecteur continue seul ; (3) le serveur revient avec une " +
+			"salle vierge — ce welcome et son pong portent \"keepOutput\": true, la " +
+			"reprise qu'ils déclenchent fait partie de la trace ; (4) le serveur " +
+			"renvoie la reprise en écho (setBy = u1) et le moteur s'aligne dessus.",
 	})
 	b.welcome(b.h.playing(1800))
 	b.run(4)
@@ -524,21 +552,34 @@ func TestVectors(t *testing.T) {
 	// émis en réaction au welcome — la reprise en fait partie.
 	b.welcomeKeep(protocol.RoomState{Paused: true, PositionSec: 0, Rate: 1, RefServerMs: 1})
 	b.run(6)
-	// Le serveur applique la reprise et la renvoie en écho (setBy = nous).
-	reprise := b.h.paused(b.vlcPosition())
+	// Le serveur applique la reprise telle quelle et la renvoie en écho
+	// (setBy = nous) : la position de l'écho est EXACTEMENT celle du control
+	// émis, pas une valeur voisine reconstruite après coup.
+	reprise := b.h.paused(b.lastControlPosition())
 	reprise.SetBy = "u1"
 	b.event(protocol.TypeRoomState, reprise)
 	b.run(4)
 	b.check()
 }
 
-// vlcPosition est la dernière position de VLC observée par le moteur : sert à
-// fabriquer un écho serveur cohérent avec la reprise que le client vient
-// d'émettre.
-func (b *vecBuilder) vlcPosition() float64 {
-	b.h.e.mu.Lock()
-	defer b.h.e.mu.Unlock()
-	return round3(b.h.e.status.PositionSec)
+// lastControlPosition rend la position du dernier `control` que le moteur a
+// envoyé dans ce scénario : de quoi fabriquer un écho serveur fidèle.
+func (b *vecBuilder) lastControlPosition() float64 {
+	for i := len(b.vec.Trace) - 1; i >= 0; i-- {
+		for j := len(b.vec.Trace[i].ToServer) - 1; j >= 0; j-- {
+			msg := b.vec.Trace[i].ToServer[j]
+			if msg.Type != protocol.TypeControl {
+				continue
+			}
+			var c protocol.Control
+			if err := json.Unmarshal(msg.Data, &c); err != nil {
+				b.t.Fatalf("control illisible dans la trace: %v", err)
+			}
+			return c.PositionSec
+		}
+	}
+	b.t.Fatal("aucun control dans la trace : le scénario n'a pas produit de reprise")
+	return 0
 }
 
 // TestVectorsGoldenComplets vérifie la forme des fichiers committés.

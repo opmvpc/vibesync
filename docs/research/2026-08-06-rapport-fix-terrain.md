@@ -81,3 +81,55 @@ retrait ; test de non-régression dédié.
 ecrasement`. Le harnais sait désormais redémarrer le serveur : `trackingListener`
 coupe les connexions hijackées, que `httptest.Close` oublie, et le dialer résout
 l'adresse à chaque tentative.
+
+## Post-review terra
+
+**1. File de chat liée à la salle.** Elle portait bien son contenu d'une salle à
+l'autre. Elle est maintenant étiquetée `chatQueueRoom` : jetée sans envoi sur
+changement de salle et sur `Disconnect` (départ volontaire), livrée seulement si
+le `welcome` concerne sa salle. Elle ne survit donc plus qu'aux reconnexions
+automatiques. L'e2e 12 simulait la coupure par `Disconnect` — c'était devenu un
+faux positif : il coupe désormais le réseau du seul pair concerné
+(`couperReseau`, dialer dérouté vers un port mort), le serveur restant debout.
+
+**2. Reprise vierge.** Elle ne repose plus sur la position VLC brute mais sur une
+mémoire de séance (`resumeRoom`/`resumePos`), alimentée à chaque tick tant qu'on
+est connecté avec un état valide et gelée à la coupure. Un premier join
+n'émet donc jamais rien, et un changement de salle efface la mémoire. Piège
+traité : le `welcome` vierge écrasait cette mémoire avant qu'on s'en serve — la
+décision est prise avant l'adoption de l'état. Commentaire du « second client »
+corrigé : les deux peuvent émettre, le dernier gagne.
+
+**3. Anti-masquage.** `BufferingDetector.MinSuspendGap` (1 s) : une suspension
+n'est plus ni prolongée ni ré-armée avant 1 s de vision. Propriété testée —
+lecteur figé + moteur qui corrige en boucle → diagnostic en 1,8 s ; sans la
+règle, jamais (vérifié en neutralisant, 5 seeks de correction). Effet de bord
+assumé : une action utilisateur tombant dans la seconde qui suit une suspension
+n'est pas protégée — c'est le prix du diagnostic, et le garde-fou serveur
+(reports de l'auteur d'un control ignorés 2 s) couvre ce trou.
+
+**4. Vecteur 13.** `keepOutput` ajouté à `vectorEvent` (omitempty) : le golden dit
+enfin laquelle des deux conventions du générateur s'applique — c'est ce qui
+rendait 12 et 13 structurellement indistinguables. Champ `scenario` (omitempty)
+pour les préconditions que `initialVLC` ne porte pas (transport, taille de
+fichier, déroulé). Écho serveur = position exacte du control émis, relue dans la
+trace. Régénération : seul 13 change, les 12 autres sont inchangés au octet près
+(ni `_doc` ni struct partagé n'ont bougé — `keepOutput` et `scenario` sont
+documentés dans le code et dans le scénario de 13).
+
+**5. Versions.** `cmd/vibesync` a sa variable `appVersion` (ldflags), un
+`--version`, et la passe au moteur (vérifié : `0.2.0` injecté, `dev` sinon).
+`NewerVersion` respecte l'ordre semver des pré-releases : `1.2.3-rc1 < 1.2.3`,
+métadonnées `+build` hors de l'ordre, deux pré-releases du même triplet non
+départagées (pas de bannière plutôt qu'un faux ordre sur `rc10` vs `rc2`).
+
+**6. Flake `TestIntegrationDebitNormalNonAffecte`.** Cause réelle : course entre
+les avances d'horloge du test et la consommation des messages par le serveur.
+Le test écrivait 60 reports en rafale dans le tampon TCP en avançant l'horloge
+simulée à chaque envoi ; quand le serveur prenait du retard, il traitait la fin
+de la rafale au même instant simulé, le seau à jetons plafonnait à
+`msgRateBurst` (40) et refusait le reste → « flood détecté » → `error` + close
+1000. Diagnostiqué en rejouant avec les logs serveur, pas déduit. Correction :
+barrière `sync()` après chaque report, qui pilote le débit *vu par le serveur*
+et pas seulement le débit d'écriture (200 ms/message, 10 msg/s). Vert en
+`-count=50` (×4).

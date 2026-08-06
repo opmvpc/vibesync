@@ -68,6 +68,12 @@ type BufferingDetector struct {
 	// MinProgressSec est l'avancée minimale considérée comme « ça avance »
 	// rapportée à la durée écoulée (défaut : 25 % du temps écoulé).
 	MinProgressRatio float64
+	// MinSuspendGap est le délai minimal entre la fin d'une suspension et le
+	// début de la suivante (défaut 1 s). Sans ce garde-fou, un moteur qui seeke
+	// en boucle pour rattraper un lecteur figé ré-armerait la suspension à
+	// chaque correction et le buffering ne serait jamais diagnostiqué
+	// (docs/protocol.md §Comportements client, Buffering — anti-masquage).
+	MinSuspendGap time.Duration
 
 	have      bool
 	stallFrom time.Time
@@ -91,19 +97,34 @@ func (b *BufferingDetector) Reset() {
 }
 
 // Suspend oublie le stall en cours et neutralise la détection jusqu'à now+d.
-// Une suspension déjà en cours et plus lointaine n'est jamais raccourcie.
+//
+// Anti-masquage : la demande est ignorée tant qu'on n'est pas à MinSuspendGap
+// de la fin de la suspension précédente. Une suspension n'est donc jamais ni
+// prolongée ni raccourcie, et il reste toujours une fenêtre de vision entre
+// deux — sans quoi un moteur qui corrige en boucle (seek toutes les ~2 s vers
+// un lecteur figé) resterait aveugle indéfiniment.
 //
 // Le verdict courant, lui, est conservé : envoyer un seek ne prouve pas que la
-// lecture est repartie. Sans cela, le seek de correction que le moteur envoie
-// justement parce que le lecteur décroche effacerait le diagnostic à chaque
-// fois, et un vrai buffering ne serait jamais remonté.
+// lecture est repartie.
 func (b *BufferingDetector) Suspend(now time.Time, d time.Duration) {
+	if !b.suspendUntil.IsZero() && now.Before(b.suspendUntil.Add(b.minGap())) {
+		return
+	}
 	b.have = false
 	b.stallFrom = time.Time{}
-	if until := now.Add(d); until.After(b.suspendUntil) {
-		b.suspendUntil = until
-	}
+	b.suspendUntil = now.Add(d)
 }
+
+func (b *BufferingDetector) minGap() time.Duration {
+	if b.MinSuspendGap <= 0 {
+		return defaultSuspendGap
+	}
+	return b.MinSuspendGap
+}
+
+// defaultSuspendGap : fenêtre de vision minimale garantie entre deux
+// suspensions (docs/protocol.md §Buffering).
+const defaultSuspendGap = time.Second
 
 // Suspended dit si la détection est encore neutralisée à cet instant.
 func (b *BufferingDetector) Suspended(now time.Time) bool {

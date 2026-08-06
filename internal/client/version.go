@@ -11,25 +11,42 @@ import (
 // pour proposer un téléchargement — jamais pour bloquer quoi que ce soit.
 //
 // Format accepté : `major[.minor[.patch]]`, chiffres seulement, avec un « v »
-// initial optionnel et un suffixe ignoré (`-rc1`, `+build`). Les composants
-// absents valent 0. Tout le reste (« dev », vide, texte) est illisible : dans
-// le doute, on ne dit rien.
+// initial optionnel, un suffixe de pré-release (`-rc1`) et des métadonnées de
+// build (`+sha`). Les composants absents valent 0. Tout le reste (« dev »,
+// vide, texte) est illisible : dans le doute, on ne dit rien.
+//
+// Ordre : à triplet égal, une pré-release est ANTÉRIEURE à la version nue
+// (1.2.3-rc1 < 1.2.3), comme le veut semver — sinon un serveur en release
+// candidate croirait dépasser la stable qu'il précède. Les métadonnées de build
+// ne comptent pas dans l'ordre. Deux pré-releases du même triplet ne sont pas
+// départagées : pas de bannière (leur ordre alphabétique mentirait sur rc10 vs
+// rc2, et cela ne vaut pas la complexité).
 
 // maxVersionPart borne chaque composant : au-delà, c'est une saisie absurde
 // plutôt qu'une version (et Atoi déborderait sur les entrées très longues).
 const maxVersionPart = 1_000_000
 
-// parseVersion découpe une version en (major, minor, patch).
-func parseVersion(s string) ([3]int, bool) {
-	var out [3]int
+// version est un triplet numérique, plus le fait d'être une pré-release.
+type version struct {
+	parts [3]int
+	pre   bool
+}
+
+// parseVersion découpe une version.
+func parseVersion(s string) (version, bool) {
+	var out version
 	s = strings.TrimSpace(s)
 	s = strings.TrimPrefix(s, "v")
-	// Suffixe de pré-release ou de build : ignoré, il ne participe pas à
-	// l'ordre (« 1.2.3-rc1 » est traitée comme « 1.2.3 »).
-	if i := strings.IndexAny(s, "-+ "); i >= 0 {
+	// Métadonnées de build : hors de l'ordre, on les coupe d'abord.
+	if i := strings.IndexByte(s, '+'); i >= 0 {
 		s = s[:i]
 	}
-	if s == "" {
+	// Pré-release : elle ne change pas le triplet mais le déclasse.
+	if i := strings.IndexByte(s, '-'); i >= 0 {
+		out.pre = len(s) > i+1
+		s = s[:i]
+	}
+	if strings.ContainsAny(s, " \t") || s == "" {
 		return out, false
 	}
 	parts := strings.Split(s, ".")
@@ -44,7 +61,7 @@ func parseVersion(s string) ([3]int, bool) {
 		if err != nil || n < 0 || n > maxVersionPart {
 			return out, false
 		}
-		out[i] = n
+		out.parts[i] = n
 	}
 	return out, true
 }
@@ -58,10 +75,11 @@ func NewerVersion(remote, local string) bool {
 	if !okR || !okL {
 		return false
 	}
-	for i := range r {
-		if r[i] != l[i] {
-			return r[i] > l[i]
+	for i := range r.parts {
+		if r.parts[i] != l.parts[i] {
+			return r.parts[i] > l.parts[i]
 		}
 	}
-	return false
+	// Même triplet : seule une stable dépasse une pré-release.
+	return !r.pre && l.pre
 }

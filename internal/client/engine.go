@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -153,6 +154,13 @@ type Engine struct {
 	// versions annoncées par le serveur dans le welcome (VS-023)
 	serverVersion string
 	downloadURL   string
+	// Mémoire de séance (§Salle vierge) : dernière position de salle connue,
+	// et pour quelle salle. Elle survit aux coupures — c'est tout son intérêt —
+	// mais pas à un changement de salle. Sans elle, aucune reprise n'est
+	// possible : un premier join ne propose jamais rien.
+	resumeRoom  string
+	resumePos   float64
+	resumeKnown bool
 	// état de salle
 	roomState protocol.RoomState
 	haveState bool
@@ -192,9 +200,12 @@ type Engine struct {
 	// sorties
 	outbox [][]byte
 	// chatQueue retient les messages de chat composés hors ligne : eux seuls
-	// sont rejoués (docs/protocol.md §File d'attente hors ligne). Il survit à
-	// invalidateReferenceLocked, contrairement à outbox.
-	chatQueue []string
+	// sont rejoués (docs/protocol.md §File d'attente hors ligne). Elle survit à
+	// invalidateReferenceLocked — donc aux reconnexions automatiques —
+	// contrairement à outbox, mais elle est liée à chatQueueRoom : changer de
+	// salle ou se déconnecter volontairement la jette sans l'envoyer.
+	chatQueue     []string
+	chatQueueRoom string
 
 	subMu sync.Mutex
 	subs  map[chan Event]struct{}
@@ -398,6 +409,10 @@ func (e *Engine) Connect(req ConnectRequest) {
 	e.mu.Lock()
 	e.connGen++
 	gen := e.connGen
+	if strings.TrimSpace(req.Room) != strings.TrimSpace(e.resumeRoom) {
+		// Une séance suivie ailleurs ne se propose pas ici.
+		e.resumeRoom, e.resumePos, e.resumeKnown = "", 0, false
+	}
 	e.req = req
 	e.connCancel = cancel
 	e.phase = PhaseConnecting
@@ -408,9 +423,12 @@ func (e *Engine) Connect(req ConnectRequest) {
 	go e.connLoop(ctx, req, gen)
 }
 
-// Disconnect ferme la connexion serveur (VLC reste ouvert).
+// Disconnect ferme la connexion serveur (VLC reste ouvert). C'est un départ
+// volontaire : les messages composés hors ligne pour cette salle sont jetés —
+// seule une reconnexion automatique les aurait livrés.
 func (e *Engine) Disconnect() {
 	e.mu.Lock()
+	e.dropChatQueueLocked("déconnexion volontaire")
 	e.connGen++ // toute boucle en cours devient obsolète
 	cancel := e.connCancel
 	e.connCancel = nil
@@ -540,6 +558,12 @@ func (e *Engine) Chat(text string) {
 // ChatQueueMax, les plus anciens sont abandonnés : mieux vaut perdre le début
 // d'une longue tirade que de garder indéfiniment ce qui ne partira jamais.
 func (e *Engine) enqueueChatLocked(text string) {
+	if e.chatQueueRoom != e.req.Room {
+		// La file appartient à une autre salle : ce qui y restait n'a rien à
+		// faire ici (et n'a pas à être envoyé ailleurs).
+		e.dropChatQueueLocked("changement de salle")
+		e.chatQueueRoom = e.req.Room
+	}
 	e.chatQueue = append(e.chatQueue, text)
 	if excess := len(e.chatQueue) - ChatQueueMax; excess > 0 {
 		e.log.Warn("file de chat hors ligne pleine, plus anciens messages abandonnés",
@@ -548,18 +572,34 @@ func (e *Engine) enqueueChatLocked(text string) {
 	}
 }
 
+// dropChatQueueLocked jette la file sans rien envoyer.
+func (e *Engine) dropChatQueueLocked(raison string) {
+	if len(e.chatQueue) > 0 {
+		e.log.Info("messages hors ligne abandonnés", "n", len(e.chatQueue),
+			"salle", e.chatQueueRoom, "raison", raison)
+	}
+	e.chatQueue = nil
+	e.chatQueueRoom = ""
+}
+
 // flushChatQueueLocked met en file d'envoi les chats composés hors ligne, dans
 // leur ordre de composition. Appelé au welcome : la salle existe, le hello est
-// passé.
-func (e *Engine) flushChatQueueLocked() {
+// passé. La file n'est livrée que dans la salle pour laquelle elle a été
+// composée — une reconnexion automatique, jamais un changement de salle.
+func (e *Engine) flushChatQueueLocked(room string) {
 	if len(e.chatQueue) == 0 {
 		return
 	}
-	e.log.Info("livraison des messages composés hors ligne", "n", len(e.chatQueue))
+	if e.chatQueueRoom != room {
+		e.dropChatQueueLocked("welcome dans une autre salle")
+		return
+	}
+	e.log.Info("livraison des messages composés hors ligne", "n", len(e.chatQueue), "salle", room)
 	for _, text := range e.chatQueue {
 		e.queueLocked(protocol.TypeChat, protocol.Chat{Text: text})
 	}
 	e.chatQueue = nil
+	e.chatQueueRoom = ""
 }
 
 // Play demande la lecture (action volontaire de l'utilisateur via l'UI).

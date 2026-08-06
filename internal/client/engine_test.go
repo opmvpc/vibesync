@@ -706,19 +706,29 @@ func TestSeeksUtilisateurNeRemontentPasDeBuffering(t *testing.T) {
 	h.connect(h.playing(500))
 	h.fake.SeekTo(500)
 	h.fake.Play()
-	h.ticks(10)
+	// 4 s de lecture calme : le calage du démarrage a suspendu la détection, et
+	// l'anti-masquage impose 1 s de vision derrière chaque suspension avant d'en
+	// accorder une nouvelle. On part donc d'un état vraiment au repos.
+	h.ticks(20)
 	h.conn.take()
 
 	// Rafale de seeks : à chaque saut, VLC fige sa position le temps de
-	// chercher — plus longtemps que les 700 ms du détecteur.
+	// chercher — plus longtemps que les 700 ms du détecteur. Les sauts sont
+	// espacés comme le ferait un utilisateur (~3 s), donc chacun ré-arme bien
+	// sa propre fenêtre de suspension.
 	pos := 500.0
 	for range 3 {
 		pos -= 30
 		h.fake.SetStalled(true)
 		h.fake.SeekTo(pos)
-		h.ticks(6) // 1,2 s figées
+		h.ticks(6) // 1,2 s figées : la recherche
 		h.fake.SetStalled(false)
-		h.ticks(4)
+		// Le serveur accuse réception du seek : la salle suit l'utilisateur, il
+		// n'y a donc pas de correction à empiler par-dessus.
+		echo := h.playing(pos)
+		echo.SetBy = "u1"
+		h.server(protocol.TypeRoomState, echo)
+		h.ticks(11) // 2,2 s de lecture normale
 	}
 	if reportsBuffering(h.conn.take()) {
 		t.Fatal("les seeks de l'utilisateur ont été remontés comme un buffering")
@@ -729,6 +739,7 @@ func TestSeeksUtilisateurNeRemontentPasDeBuffering(t *testing.T) {
 
 	// Même chose pour une pause/reprise faite à la main : la position est figée
 	// par construction, et la reprise met un instant à démarrer.
+	h.ticks(6)
 	h.fake.Pause()
 	h.ticks(6)
 	h.fake.SetStalled(true)
@@ -739,6 +750,47 @@ func TestSeeksUtilisateurNeRemontentPasDeBuffering(t *testing.T) {
 	if reportsBuffering(h.conn.take()) {
 		t.Fatal("une pause/reprise manuelle a été remontée comme un buffering")
 	}
+}
+
+// Propriété exigée par la spec (§Buffering, anti-masquage) : un lecteur
+// durablement figé est diagnostiqué en ≤ 5 s MÊME quand le moteur le seeke en
+// boucle pour le rattraper. C'est le scénario qui aveuglait la détection : le
+// drift atteint le seuil de seek dur toutes les ~2 s, exactement la durée de la
+// suspension.
+func TestBufferingDiagnostiqueMalgreLesCorrectionsEnBoucle(t *testing.T) {
+	h := newHarness(t)
+	h.openFile("ep1.mkv", 7200)
+	h.connect(h.playing(500))
+	h.fake.SeekTo(500)
+	h.fake.Play()
+	h.ticks(5)
+
+	// VLC se fige pour de bon et la salle est loin devant : le moteur va le
+	// seeker en boucle (le seek HTTP « débloque » la position d'un cran, elle se
+	// refige aussitôt, le drift repasse le seuil ~2 s plus tard, et ainsi de
+	// suite). C'est exactement la boucle qui aveuglait la détection.
+	h.fake.SetStalled(true)
+	h.server(protocol.TypeRoomState, h.playing(600))
+	debut := h.clock.Now()
+
+	var diagnostique time.Duration
+	for range 40 { // 8 s simulées
+		h.tick(PollInterval)
+		if h.e.Snapshot().VLC.Buffering {
+			diagnostique = h.clock.Now().Sub(debut)
+			break
+		}
+	}
+	if diagnostique == 0 {
+		t.Fatalf("blocage jamais diagnostiqué (%d seeks de correction entre-temps)", h.fake.Seeks())
+	}
+	if diagnostique > 5*time.Second {
+		t.Fatalf("blocage diagnostiqué en %s, la spec exige ≤ 5 s", diagnostique)
+	}
+	if h.fake.Seeks() == 0 {
+		t.Fatal("scénario sans intérêt : le moteur n'a envoyé aucune correction")
+	}
+	t.Logf("diagnostic en %s malgré %d seeks de correction", diagnostique.Round(time.Millisecond), h.fake.Seeks())
 }
 
 // … mais un vrai blocage, lui, doit toujours être remonté (pas de régression).

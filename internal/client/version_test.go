@@ -17,9 +17,16 @@ func TestNewerVersion(t *testing.T) {
 		{"composants manquants", "0.3", "0.2.9", true},
 		{"composant manquant à droite", "0.2", "0.2.0", false},
 		{"préfixe v toléré", "v1.2.4", "1.2.3", true},
-		{"suffixe de pré-release ignoré", "1.2.4-rc1", "1.2.3", true},
-		{"suffixe ignoré des deux côtés", "1.2.3-rc2", "1.2.3-rc1", false},
-		{"suffixe de build ignoré", "1.2.4+build7", "1.2.3", true},
+		{"pré-release d'un triplet supérieur", "1.2.4-rc1", "1.2.3", true},
+		// Ordre semver : à triplet égal, la pré-release précède la stable.
+		{"pré-release ne dépasse pas la stable", "1.2.3-rc1", "1.2.3", false},
+		{"la stable dépasse la pré-release", "1.2.3", "1.2.3-rc1", true},
+		{"pré-release contre pré-release : on ne tranche pas", "1.2.3-rc2", "1.2.3-rc1", false},
+		{"pré-release plus ancienne", "1.2.2-rc1", "1.2.3", false},
+		{"tiret sans suffixe", "1.2.3-", "1.2.3", false},
+		{"métadonnées de build hors de l'ordre", "1.2.3+build7", "1.2.3", false},
+		{"métadonnées sur un triplet supérieur", "1.2.4+build7", "1.2.3", true},
+		{"métadonnées après pré-release", "1.2.3+b", "1.2.3-rc1", true},
 		{"numéros à plusieurs chiffres", "1.10.0", "1.9.0", true},
 		{"client dev : jamais de bannière", "9.9.9", "dev", false},
 		{"serveur dev", "dev", "1.0.0", false},
@@ -45,7 +52,7 @@ func TestNewerVersion(t *testing.T) {
 // La comparaison doit être antisymétrique : jamais deux versions plus récentes
 // l'une que l'autre.
 func TestNewerVersionAntisymetrique(t *testing.T) {
-	versions := []string{"0.0.1", "0.1.0", "0.2.0", "1.0.0", "1.0.1", "1.2.3-rc1", "v2.0.0"}
+	versions := []string{"0.0.1", "0.1.0", "0.2.0", "1.0.0", "1.0.1", "1.2.3-rc1", "1.2.3", "v2.0.0"}
 	for _, a := range versions {
 		for _, b := range versions {
 			if NewerVersion(a, b) && NewerVersion(b, a) {

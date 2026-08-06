@@ -168,6 +168,9 @@ func (e *Engine) handleRaw(raw []byte) (string, bool) {
 			if t := e.versionToastLocked(w); t != nil {
 				events = append(events, Event{Kind: EventToast, Toast: t})
 			}
+			// Décidé AVANT d'adopter l'état : l'adoption écrase la mémoire de
+			// séance sur laquelle repose la reprise.
+			reprisePos, reprise := e.virginResumeCandidateLocked(w.State, e.req.Room)
 			// Le welcome est la référence d'une session neuve : aucun hold ni
 			// roomState en attente ne lui survit.
 			e.userHoldUntil = time.Time{}
@@ -193,12 +196,12 @@ func (e *Engine) handleRaw(raw []byte) (string, bool) {
 			e.queueLocked(protocol.TypeSetReady, protocol.SetReady{Ready: e.ready})
 			e.queueLocked(protocol.TypePing, protocol.Ping{T: now.UnixMilli()})
 			e.lastPing = now
-			// Salle vierge : proposer notre position avant tout alignement.
-			if t := e.virginResumeLocked(w.State, now); t != nil {
-				events = append(events, Event{Kind: EventToast, Toast: t})
+			// Salle vierge : proposer la séance perdue avant tout alignement.
+			if reprise {
+				events = append(events, Event{Kind: EventToast, Toast: e.virginResumeLocked(reprisePos, now)})
 			}
 			// Les chats composés hors ligne partent maintenant, dans l'ordre.
-			e.flushChatQueueLocked()
+			e.flushChatQueueLocked(e.req.Room)
 		} else {
 			e.log.Debug("welcome illisible", "err", err)
 		}
@@ -321,28 +324,43 @@ func sanitizeRoomState(rs protocol.RoomState) (protocol.RoomState, bool) {
 	return rs, true
 }
 
-// virginResumeLocked traite le cas « salle vierge » (docs/protocol.md §Erreurs
-// et robustesse) : un welcome montrant une salle qui n'a jamais reçu de control
-// (`setBy` vide, position 0) alors que notre lecteur est au-delà de
-// VirginResumeSec signifie que le serveur a perdu la séance — typiquement un
-// redémarrage (auto-deploy). Plutôt que de se laisser ramener à 0, le client
-// propose sa propre position par UN control seek.
+// virginResumeCandidateLocked dit si ce welcome déclenche une reprise « salle
+// vierge » (docs/protocol.md §Erreurs et robustesse), et à quelle position.
+//
+// Conditions cumulatives : la salle n'a jamais reçu de control (`setBy` vide,
+// position 0) ET nous étions déjà connectés à CETTE salle dans ce processus,
+// avec une position de séance connue au-delà de VirginResumeSec. Un premier
+// join ne propose donc jamais rien, quel que soit l'état de VLC — c'est une
+// salle neuve, pas une séance perdue. La position proposée est la dernière
+// position de SALLE connue, jamais la position brute de VLC (qui peut être
+// n'importe où : autre fichier, avance manuelle…).
+//
+// À appeler AVANT d'adopter l'état du welcome, qui écraserait la mémoire.
+func (e *Engine) virginResumeCandidateLocked(rs protocol.RoomState, room string) (float64, bool) {
+	if rs.SetBy != "" || rs.PositionSec != 0 {
+		return 0, false
+	}
+	if !e.resumeKnown || e.resumeRoom == "" || e.resumeRoom != room {
+		return 0, false
+	}
+	if e.resumePos <= VirginResumeSec {
+		return 0, false
+	}
+	return clampPosition(e.resumePos, e.durationLocked()), true
+}
+
+// virginResumeLocked émet la reprise décidée par virginResumeCandidateLocked.
 //
 // C'est un control comme un autre : il arme le hold post-action, ce qui suspend
 // l'alignement sur l'état vierge jusqu'à l'écho du serveur. Une seule reprise
-// par connexion, puisqu'il n'y a qu'un welcome par session. Si un autre client
-// a été plus rapide, `setBy` n'est plus vide et on se range simplement derrière
-// lui : le dernier revenant gagne, et leurs positions sont quasi identiques.
-func (e *Engine) virginResumeLocked(rs protocol.RoomState, now time.Time) *protocol.Toast {
-	if rs.SetBy != "" || rs.PositionSec != 0 {
-		return nil
-	}
-	if !e.haveStatus || !e.status.Loaded() || e.status.PositionSec <= VirginResumeSec {
-		return nil
-	}
-	pos := clampPosition(e.status.PositionSec, e.durationLocked())
+// par connexion, puisqu'il n'y a qu'un welcome par session. Si plusieurs
+// clients reviennent ensemble, chacun émet la sienne et le dernier gagne :
+// leurs positions sont quasi identiques par construction (comportement assumé
+// par la spec).
+func (e *Engine) virginResumeLocked(pos float64, now time.Time) *protocol.Toast {
 	e.userControlLocked(protocol.ActionSeek, pos, now)
-	e.log.Info("salle vierge : reprise proposée au serveur", "positionSec", pos)
+	e.log.Info("salle vierge : reprise de la séance proposée au serveur",
+		"room", e.req.Room, "positionSec", pos)
 	return &protocol.Toast{Level: protocol.LevelInfo, Text: "Reprise à " + formatTimecode(pos)}
 }
 

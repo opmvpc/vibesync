@@ -1,7 +1,8 @@
 {
   "_doc": "Vecteur de conformité du moteur de sync vibesync (golden file, régénéré par `go test ./internal/client -run TestVectors -update`). Horloge simulée : tous les temps sont en millisecondes depuis le début du scénario. `initialVLC` = état complet de VLC au départ ; `events` = entrées injectées (messages serveur, actions de l'utilisateur dans VLC, coupure de session) ; `trace` = une entrée par poll de 200 ms avec l'état observé de VLC, la position attendue calculée, le drift, les commandes envoyées à VLC et les messages envoyés au serveur. Une réimplémentation est conforme si, pour le même `initialVLC` et les mêmes `events`, elle produit les mêmes `vlcCommands` et `toServer` aux mêmes instants.",
   "name": "13-reprise-salle-vierge",
-  "description": "Le serveur redémarre : welcome d'une salle vierge (setBy vide, position 0) alors que VLC est loin dans le film. Le client émet UNE reprise control seek à sa position au lieu de se laisser ramener à 0, puis adopte l'écho du serveur.",
+  "description": "Le serveur redémarre et revient sans mémoire : welcome d'une salle vierge (setBy vide, position 0). Le client, qui connaissait déjà la séance de CETTE salle, émet UNE reprise control seek à la dernière position de salle connue au lieu de se laisser ramener à 0, puis adopte l'écho du serveur.",
+  "scenario": "Préconditions du moteur au premier événement : session serveur déjà établie (le hello est passé, la connexion est ouverte), aucun état de salle connu, aucune mesure d'offset d'horloge. Fichier ep1.mkv déjà ouvert dans le lecteur, durée 7200 s, taille 15 octets (c'est elle que portent les setFile de la trace), position 1800 s, lecture en cours, rate 1. Déroulé : (1) welcome + pong d'une salle en lecture à 1800 s — c'est ce passage qui rend la reprise possible plus tard, un premier join ne proposerait jamais rien ; (2) la connexion tombe et 5 s s'écoulent sans serveur, le lecteur continue seul ; (3) le serveur revient avec une salle vierge — ce welcome et son pong portent \"keepOutput\": true, la reprise qu'ils déclenchent fait partie de la trace ; (4) le serveur renvoie la reprise en écho (setBy = u1) et le moteur s'aligne dessus.",
   "pollIntervalMs": 200,
   "initialVLC": {
     "fileName": "ep1.mkv",
@@ -76,7 +77,8 @@
             "latencyMs": 0
           }
         ]
-      }
+      },
+      "keepOutput": true
     },
     {
       "atMs": 6400,
@@ -84,14 +86,15 @@
       "data": {
         "t": 1785960006400,
         "serverMs": 1785960006400
-      }
+      },
+      "keepOutput": true
     },
     {
       "atMs": 7600,
       "type": "roomState",
       "data": {
         "paused": true,
-        "positionSec": 1807.6,
+        "positionSec": 1800.8,
         "rate": 1,
         "refServerMs": 1785960007600,
         "setBy": "u1"
@@ -197,7 +200,7 @@
           "type": "control",
           "data": {
             "action": "seek",
-            "positionSec": 1806.4000000000003
+            "positionSec": 1800.8
           }
         },
         {
@@ -259,33 +262,37 @@
       "atMs": 7800,
       "vlcState": "playing",
       "vlcPositionSec": 1807.8,
-      "expectedPositionSec": 1807.6,
-      "driftSec": 0.2,
+      "expectedPositionSec": 1800.8,
+      "driftSec": 7,
       "vlcCommands": [
         {
           "cmd": "pause"
+        },
+        {
+          "cmd": "seek",
+          "value": 1801
         }
       ]
     },
     {
       "atMs": 8000,
       "vlcState": "paused",
-      "vlcPositionSec": 1807.8,
-      "expectedPositionSec": 1807.6,
+      "vlcPositionSec": 1801,
+      "expectedPositionSec": 1800.8,
       "driftSec": 0.2
     },
     {
       "atMs": 8200,
       "vlcState": "paused",
-      "vlcPositionSec": 1807.8,
-      "expectedPositionSec": 1807.6,
+      "vlcPositionSec": 1801,
+      "expectedPositionSec": 1800.8,
       "driftSec": 0.2
     },
     {
       "atMs": 8400,
       "vlcState": "paused",
-      "vlcPositionSec": 1807.8,
-      "expectedPositionSec": 1807.6,
+      "vlcPositionSec": 1801,
+      "expectedPositionSec": 1800.8,
       "driftSec": 0.2,
       "toServer": [
         {

@@ -42,6 +42,7 @@ func (e *Engine) tick(now time.Time) {
 		}
 	}
 	e.expireUserHoldLocked(now)
+	e.rememberSessionLocked(now)
 	actions := e.planLocked(now)
 	e.periodicLocked(now)
 	e.mu.Unlock()
@@ -160,6 +161,20 @@ func (e *Engine) expireUserHoldLocked(now time.Time) {
 	e.pendingRS = nil
 	e.log.Debug("hold expiré sans écho, application du roomState mémorisé", "setBy", rs.SetBy)
 	e.adoptRoomStateLocked(rs, now)
+}
+
+// rememberSessionLocked mémorise où en est la séance de la salle courante. Cette
+// mémoire est la seule chose qui autorise une reprise si le serveur revient
+// amnésique (docs/protocol.md §Salle vierge) : elle n'est alimentée que tant
+// qu'on est connecté avec un état de salle valide, elle se fige donc à la
+// dernière position connue quand la connexion tombe.
+func (e *Engine) rememberSessionLocked(now time.Time) {
+	if e.phase != PhaseConnected || !e.haveState || e.req.Room == "" {
+		return
+	}
+	e.resumeRoom = e.req.Room
+	e.resumePos = e.expectedPositionLocked(now)
+	e.resumeKnown = true
 }
 
 // planLocked décide des corrections à appliquer à VLC.

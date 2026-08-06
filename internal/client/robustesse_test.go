@@ -66,6 +66,51 @@ func TestChatHorsLigneMisEnFileEtLivreDansLOrdre(t *testing.T) {
 	}
 }
 
+// La file appartient à la salle pour laquelle elle a été composée : elle ne
+// survit qu'aux reconnexions automatiques vers cette même salle.
+func TestFileDeChatLieeALaSalle(t *testing.T) {
+	t.Run("changement de salle : rien n'est envoyé ailleurs", func(t *testing.T) {
+		h := newHarness(t)
+		h.connect(h.paused(0)) // salle « soirée »
+		h.sessionEnd()
+		h.e.Chat("message pour la soirée")
+		if len(h.e.Snapshot().PendingChats) != 1 {
+			t.Fatal("message non mis en file")
+		}
+
+		h.e.Connect(ConnectRequest{URL: "ws://test/ws", Name: "thib", Room: "cave"})
+		if got := h.e.Snapshot().PendingChats; len(got) != 0 {
+			t.Fatalf("la file a suivi le changement de salle: %v", got)
+		}
+		h.attach()
+		h.conn.take()
+		h.server(protocol.TypeWelcome, protocol.Welcome{
+			SelfID: "u1", Room: "cave", State: h.paused(0),
+			Users: []protocol.User{{ID: "u1", Name: "thib"}},
+		})
+		if got := chatTexts(h.conn.take()); len(got) != 0 {
+			t.Fatalf("message de « soirée » livré dans « cave »: %v", got)
+		}
+	})
+
+	t.Run("déconnexion volontaire : la file est jetée", func(t *testing.T) {
+		h := newHarness(t)
+		h.connect(h.paused(0))
+		h.sessionEnd()
+		h.e.Chat("tapé pendant la coupure")
+		h.e.Disconnect() // l'utilisateur quitte de lui-même
+		if got := h.e.Snapshot().PendingChats; len(got) != 0 {
+			t.Fatalf("la file survit à un départ volontaire: %v", got)
+		}
+		h.attach()
+		h.conn.take()
+		h.welcome(h.paused(0))
+		if got := chatTexts(h.conn.take()); len(got) != 0 {
+			t.Fatalf("message livré après un départ volontaire: %v", got)
+		}
+	})
+}
+
 func TestFileDeChatBornee(t *testing.T) {
 	h := newHarness(t)
 	h.connect(h.paused(0))
@@ -195,18 +240,32 @@ func virginState() protocol.RoomState {
 	return protocol.RoomState{Paused: true, PositionSec: 0, Rate: 1, RefServerMs: 1}
 }
 
+// seanceEnCours amène le moteur à connaître la séance d'une salle : c'est la
+// condition sans laquelle aucune reprise n'est possible.
+func seanceEnCours(t *testing.T, h *harness, positionSec float64) {
+	t.Helper()
+	h.openFile("ep1.mkv", 7200)
+	h.connect(h.paused(positionSec))
+	h.fake.SeekTo(positionSec)
+	h.ticks(4)
+	h.conn.take()
+}
+
 func TestRepriseSalleVierge(t *testing.T) {
 	h := newHarness(t)
-	h.openFile("ep1.mkv", 7200)
-	h.attach()
-	h.fake.SeekTo(3725) // 01:02:05
-	h.fake.Play()
-	h.ticks(2)
+	// Séance connue à 01:02:05 dans « soirée », puis le serveur disparaît.
+	seanceEnCours(t, h, 3725)
+	h.sessionEnd()
+	h.clock.Advance(3 * time.Second)
+	h.ticks(5)
 	h.conn.take()
+
 	events, unsub := h.e.Subscribe()
 	defer unsub()
 	drainToasts(events)
 
+	// Le serveur revient tout neuf.
+	h.attach()
 	h.welcome(virginState())
 
 	got := controls(h.conn.take())
@@ -238,16 +297,38 @@ func TestRepriseSalleVierge(t *testing.T) {
 	}
 }
 
+// La reprise vise la dernière position de SALLE connue, pas la position brute
+// de VLC : l'utilisateur a pu avancer à la main, ou ouvrir autre chose.
+func TestRepriseViseLaPositionDeSalleConnue(t *testing.T) {
+	h := newHarness(t)
+	seanceEnCours(t, h, 1200)
+	h.sessionEnd()
+
+	// Hors ligne, l'utilisateur part se balader dans son fichier.
+	h.fake.SeekTo(4000)
+	h.fake.Play()
+	h.ticks(5)
+	h.conn.take()
+
+	h.attach()
+	h.welcome(virginState())
+	got := controls(h.conn.take())
+	if len(got) != 1 {
+		t.Fatalf("UNE reprise attendue, obtenu %+v", got)
+	}
+	if math.Abs(got[0].PositionSec-1200) > 1 {
+		t.Fatalf("reprise à %v : c'est la position de VLC, pas celle de la séance",
+			got[0].PositionSec)
+	}
+}
+
 // Une seule reprise par connexion : le roomState suivant (même vierge en
 // apparence) ne la relance pas.
 func TestRepriseSalleViergeUneSeuleFoisParConnexion(t *testing.T) {
 	h := newHarness(t)
-	h.openFile("ep1.mkv", 3600)
+	seanceEnCours(t, h, 900)
+	h.sessionEnd()
 	h.attach()
-	h.fake.SeekTo(900)
-	h.fake.Play()
-	h.ticks(2)
-	h.conn.take()
 
 	h.welcome(virginState())
 	if n := len(controls(h.conn.take())); n != 1 {
@@ -261,25 +342,59 @@ func TestRepriseSalleViergeUneSeuleFoisParConnexion(t *testing.T) {
 }
 
 func TestPasDeRepriseSalleVierge(t *testing.T) {
+	// Chaque cas part d'un moteur qui a connu une séance à 900 s dans « soirée »,
+	// sauf mention contraire.
 	cases := []struct {
-		nom      string
-		position float64
-		state    protocol.RoomState
+		nom     string
+		prepare func(t *testing.T, h *harness)
+		state   protocol.RoomState
 	}{
-		{"lecteur au tout début", 2, virginState()},
-		{"salle déjà pilotée par un autre", 900, protocol.RoomState{
-			Paused: true, PositionSec: 0, Rate: 1, RefServerMs: 1, SetBy: "u2"}},
-		{"salle avec une position", 900, protocol.RoomState{
-			Paused: true, PositionSec: 800, Rate: 1, RefServerMs: 1}},
+		{
+			// Le cas qui compte : rien ne justifie de piloter une salle neuve
+			// juste parce que VLC est loin dans un fichier.
+			nom: "premier join, VLC à 40 minutes",
+			prepare: func(t *testing.T, h *harness) {
+				h.openFile("ep1.mkv", 7200)
+				h.fake.SeekTo(2400)
+				h.fake.Play()
+				h.ticks(4)
+				h.attach()
+			},
+			state: virginState(),
+		},
+		{
+			nom:     "séance connue trop courte",
+			prepare: func(t *testing.T, h *harness) { seanceEnCours(t, h, 3); h.sessionEnd(); h.attach() },
+			state:   virginState(),
+		},
+		{
+			nom:     "salle déjà pilotée par un autre",
+			prepare: func(t *testing.T, h *harness) { seanceEnCours(t, h, 900); h.sessionEnd(); h.attach() },
+			state: protocol.RoomState{
+				Paused: true, PositionSec: 0, Rate: 1, RefServerMs: 1, SetBy: "u2"},
+		},
+		{
+			nom:     "salle avec une position",
+			prepare: func(t *testing.T, h *harness) { seanceEnCours(t, h, 900); h.sessionEnd(); h.attach() },
+			state: protocol.RoomState{
+				Paused: true, PositionSec: 800, Rate: 1, RefServerMs: 1},
+		},
+		{
+			// Séance suivie ailleurs : elle n'a rien à faire dans cette salle-ci.
+			nom: "séance connue dans une autre salle",
+			prepare: func(t *testing.T, h *harness) {
+				seanceEnCours(t, h, 900)
+				h.sessionEnd()
+				h.e.Connect(ConnectRequest{URL: "ws://test/ws", Name: "thib", Room: "cave"})
+				h.attach()
+			},
+			state: virginState(),
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.nom, func(t *testing.T) {
 			h := newHarness(t)
-			h.openFile("ep1.mkv", 3600)
-			h.attach()
-			h.fake.SeekTo(tc.position)
-			h.fake.Play()
-			h.ticks(2)
+			tc.prepare(t, h)
 			h.conn.take()
 
 			h.welcome(tc.state)
@@ -287,15 +402,5 @@ func TestPasDeRepriseSalleVierge(t *testing.T) {
 				t.Fatalf("reprise émise à tort: %+v", got)
 			}
 		})
-	}
-}
-
-// Sans média chargé, il n'y a rien à reprendre.
-func TestPasDeRepriseSansMedia(t *testing.T) {
-	h := newHarness(t)
-	h.attach()
-	h.welcome(virginState())
-	if got := controls(h.conn.take()); len(got) != 0 {
-		t.Fatalf("reprise émise sans média: %+v", got)
 	}
 }

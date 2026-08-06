@@ -90,8 +90,11 @@ type recordingDialer struct {
 }
 
 func (d *recordingDialer) Dial(ctx context.Context, url string) (client.Conn, error) {
-	if d.resolve != nil {
-		url = d.resolve()
+	d.mu.Lock()
+	resolve := d.resolve
+	d.mu.Unlock()
+	if resolve != nil {
+		url = resolve()
 	}
 	c, err := d.inner.Dial(ctx, url)
 	if err != nil {
@@ -102,6 +105,13 @@ func (d *recordingDialer) Dial(ctx context.Context, url string) (client.Conn, er
 	d.dials++
 	d.mu.Unlock()
 	return c, nil
+}
+
+// setResolve change l'adresse que ce dialer composera désormais.
+func (d *recordingDialer) setResolve(fn func() string) {
+	d.mu.Lock()
+	d.resolve = fn
+	d.mu.Unlock()
 }
 
 // cutLast coupe la connexion courante sous les pieds du moteur.
@@ -231,6 +241,20 @@ func (p *peer) dials() int {
 // jeton : le moteur le conserve pour toute la vie du processus).
 func (p *peer) reconnect() {
 	p.eng.Connect(client.ConnectRequest{URL: p.fx.currentURL(), Name: p.name, Room: p.fx.room})
+}
+
+// couperReseau simule la perte de connectivité de ce pair seul : sa connexion
+// est coupée et ses tentatives de reconnexion tombent dans le vide jusqu'à
+// retablirReseau. Le serveur, lui, reste debout pour les autres — c'est ce qui
+// distingue une coupure réseau d'un départ volontaire (que le moteur traite
+// tout autrement : la file de chat y est jetée).
+func (p *peer) couperReseau() {
+	p.dialer.setResolve(func() string { return "ws://127.0.0.1:1/ws" })
+	_ = p.dialer.cutLast()
+}
+
+func (p *peer) retablirReseau() {
+	p.dialer.setResolve(p.fx.currentURL)
 }
 
 func (p *peer) ready() bool {
@@ -878,9 +902,12 @@ func TestE2E(t *testing.T) {
 			return a.snap().Phase == client.PhaseConnected && b.snap().Phase == client.PhaseConnected &&
 				len(a.snap().Users) == 2 && len(b.snap().Users) == 2
 		})
+		// La reprise vise la dernière position de salle connue de chacun : elles
+		// sont quasi identiques, et surtout ce n'est pas un retour à zéro.
 		f.waitFor("la séance est reprise là où elle en était", func() bool {
-			return a.snap().RoomPosition > avant && b.snap().RoomPosition > avant &&
-				math.Abs(a.snap().RoomPosition-b.snap().RoomPosition) < 1
+			ra, rb := a.snap().RoomPosition, b.snap().RoomPosition
+			return ra > client.VirginResumeSec && math.Abs(ra-avant) < 2 &&
+				math.Abs(ra-rb) < 1
 		})
 		if !a.hasToastPrefix("Reprise à ") && !b.hasToastPrefix("Reprise à ") {
 			t.Fatalf("aucun client n'a annoncé la reprise de la séance\n%s", f.dump())
@@ -900,13 +927,17 @@ func TestE2E(t *testing.T) {
 		})
 	})
 
-	// VS-024 (b) : ce qu'on écrit pendant une coupure part au retour, dans l'ordre.
+	// VS-024 (b) : ce qu'on écrit pendant une coupure RÉSEAU part au retour, dans
+	// l'ordre. C'est bien une reconnexion automatique : un départ volontaire
+	// jetterait la file (elle appartient à la salle qu'on quitte).
 	t.Run("12-chat-compose-hors-ligne", func(t *testing.T) {
 		f := newFixture(t)
 		a, b := joinBoth(f, filmDuration, filmDuration)
 
-		b.eng.Disconnect()
-		f.waitFor("B est hors ligne", func() bool { return b.snap().Phase == client.PhaseIdle })
+		b.couperReseau()
+		f.waitFor("B est hors ligne", func() bool {
+			return b.snap().Phase != client.PhaseConnected
+		})
 
 		envoyes := []string{"je perds la connexion", "vous m'entendez ?", "je reviens"}
 		for _, msg := range envoyes {
@@ -919,7 +950,7 @@ func TestE2E(t *testing.T) {
 			return len(a.chatTexts()) == 0
 		})
 
-		b.reconnect()
+		b.retablirReseau()
 		f.waitFor("A a reçu les trois messages", func() bool { return len(a.chatTexts()) >= 3 })
 		if got := a.chatTexts(); !slices.Equal(got, envoyes) {
 			t.Fatalf("messages reçus %v, attendus %v (dans l'ordre)\n%s", got, envoyes, f.dump())

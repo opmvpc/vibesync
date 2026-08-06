@@ -1,5 +1,9 @@
 // Commande vibesync : le client desktop. Il câble la GUI locale (internal/webui),
 // le moteur de synchronisation (internal/client) et le driver VLC (internal/vlc).
+//
+// La version applicative vient du fichier VERSION du repo, injectée au build :
+//
+//	go build -ldflags "-X main.appVersion=$(cat VERSION)" ./cmd/vibesync
 package main
 
 import (
@@ -17,22 +21,37 @@ import (
 	"github.com/thibsix/vibesync/internal/webui"
 )
 
+// appVersion est renseignée au build (`-X main.appVersion=…`) depuis le fichier
+// VERSION du repo ; « dev » pour un binaire construit à la main — et « dev »
+// n'est pas une version comparable, donc aucune invitation à mettre à jour.
+var appVersion = client.DevVersion
+
 func main() {
 	var (
 		addr     = flag.String("ui-addr", "127.0.0.1:0", "adresse d'écoute de l'UI locale")
 		headless = flag.Bool("headless", false, "ne pas ouvrir le navigateur (une UI native se connectera à /ui)")
 		keepVLC  = flag.Bool("keep-vlc", false, "laisser VLC ouvert à la fermeture du client")
 		debug    = flag.Bool("debug", false, "journal détaillé")
+		version  = flag.Bool("version", false, "afficher la version et quitter")
 	)
 	flag.Parse()
+	if *version {
+		fmt.Println(appVersion)
+		return
+	}
 
 	level := slog.LevelInfo
 	if *debug {
 		level = slog.LevelDebug
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	logger.Info("vibesync", "version", appVersion)
 
-	engine := client.New(client.Config{Logger: logger, KeepVLCOpen: *keepVLC})
+	engine := client.New(client.Config{
+		Logger:      logger,
+		KeepVLCOpen: *keepVLC,
+		Version:     appVersion,
+	})
 	server, err := webui.New(engine, webui.Options{})
 	if err != nil {
 		logger.Error("démarrage de l'UI impossible", "err", err)
