@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/thibsix/vibesync/internal/protocol"
+	"github.com/opmvpc/vibesync/internal/protocol"
 )
 
 const (

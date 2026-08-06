@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thibsix/vibesync/internal/vlc"
+	"github.com/opmvpc/vibesync/internal/vlc"
 )
 
 func TestBufferingDetector(t *testing.T) {

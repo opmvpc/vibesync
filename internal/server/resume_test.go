@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/thibsix/vibesync/internal/protocol"
+	"github.com/opmvpc/vibesync/internal/protocol"
 )
 
 // Reprise de session : docs/protocol.md §Comportements serveur, point 6.

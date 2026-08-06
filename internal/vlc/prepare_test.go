@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thibsix/vibesync/internal/vlc"
-	"github.com/thibsix/vibesync/internal/vlc/vlctest"
+	"github.com/opmvpc/vibesync/internal/vlc"
+	"github.com/opmvpc/vibesync/internal/vlc/vlctest"
 )
 
 // Le faux VLC démarre en lecture à l'ouverture, comme le vrai : Prepare doit

@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thibsix/vibesync/internal/vlc"
-	"github.com/thibsix/vibesync/internal/vlc/vlctest"
+	"github.com/opmvpc/vibesync/internal/vlc"
+	"github.com/opmvpc/vibesync/internal/vlc/vlctest"
 )
 
 func newFake(t *testing.T) (*vlctest.Fake, *vlctest.Clock, *vlc.HTTPClient) {

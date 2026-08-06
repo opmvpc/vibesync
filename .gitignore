@@ -4,3 +4,4 @@ dist/
 /vibesync-server
 coverage.out
 .DS_Store
+ui/macos/.build/

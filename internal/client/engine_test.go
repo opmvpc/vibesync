@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thibsix/vibesync/internal/protocol"
-	"github.com/thibsix/vibesync/internal/vlc"
-	"github.com/thibsix/vibesync/internal/vlc/vlctest"
+	"github.com/opmvpc/vibesync/internal/protocol"
+	"github.com/opmvpc/vibesync/internal/vlc"
+	"github.com/opmvpc/vibesync/internal/vlc/vlctest"
 )
 
 // --- Conn factice en mémoire ---

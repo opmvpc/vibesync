@@ -4,8 +4,8 @@ import (
 	"math"
 	"testing"
 
-	"github.com/thibsix/vibesync/internal/protocol"
-	"github.com/thibsix/vibesync/internal/vlc"
+	"github.com/opmvpc/vibesync/internal/protocol"
+	"github.com/opmvpc/vibesync/internal/vlc"
 )
 
 // docs/protocol.md §Départ et reprise de lecture : au passage pause → lecture,

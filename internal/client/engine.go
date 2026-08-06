@@ -20,8 +20,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/thibsix/vibesync/internal/protocol"
-	"github.com/thibsix/vibesync/internal/vlc"
+	"github.com/opmvpc/vibesync/internal/protocol"
+	"github.com/opmvpc/vibesync/internal/vlc"
 )
 
 // Clock est l'horloge du moteur (injectable pour les tests).

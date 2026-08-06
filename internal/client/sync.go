@@ -5,8 +5,8 @@ import (
 	"math"
 	"time"
 
-	"github.com/thibsix/vibesync/internal/protocol"
-	"github.com/thibsix/vibesync/internal/vlc"
+	"github.com/opmvpc/vibesync/internal/protocol"
+	"github.com/opmvpc/vibesync/internal/vlc"
 )
 
 // tick est une itération complète du moteur : lecture de l'état de VLC,

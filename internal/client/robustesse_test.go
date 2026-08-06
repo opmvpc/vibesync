@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thibsix/vibesync/internal/protocol"
+	"github.com/opmvpc/vibesync/internal/protocol"
 )
 
 // Robustesse des déconnexions (VS-024) : docs/protocol.md §Erreurs et

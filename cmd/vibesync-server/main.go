@@ -27,8 +27,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/thibsix/vibesync/internal/protocol"
-	"github.com/thibsix/vibesync/internal/server"
+	"github.com/opmvpc/vibesync/internal/protocol"
+	"github.com/opmvpc/vibesync/internal/server"
 )
 
 // appVersion est renseignée au build (`-X main.appVersion=…`) depuis le fichier

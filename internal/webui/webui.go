@@ -18,7 +18,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/thibsix/vibesync/internal/client"
+	"github.com/opmvpc/vibesync/internal/client"
 )
 
 //go:embed web

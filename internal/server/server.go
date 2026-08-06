@@ -13,7 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/thibsix/vibesync/internal/ws"
+	"github.com/opmvpc/vibesync/internal/ws"
 )
 
 // Plafonds anti-abus par défaut (§Comportements serveur, point 6).

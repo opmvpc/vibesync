@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thibsix/vibesync/internal/protocol"
-	"github.com/thibsix/vibesync/internal/vlc"
-	"github.com/thibsix/vibesync/internal/ws"
+	"github.com/opmvpc/vibesync/internal/protocol"
+	"github.com/opmvpc/vibesync/internal/vlc"
+	"github.com/opmvpc/vibesync/internal/ws"
 )
 
 // fakeServer est un serveur WebSocket factice minimal (le vrai serveur est

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thibsix/vibesync/internal/protocol"
+	"github.com/opmvpc/vibesync/internal/protocol"
 )
 
 // Tests issus de la review croisée (sol) : règles gelées dans

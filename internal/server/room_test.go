@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thibsix/vibesync/internal/protocol"
+	"github.com/opmvpc/vibesync/internal/protocol"
 )
 
 func TestJoinEnvoieWelcomeEtUsers(t *testing.T) {

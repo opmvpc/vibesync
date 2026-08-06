@@ -17,8 +17,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/thibsix/vibesync/internal/client"
-	"github.com/thibsix/vibesync/internal/webui"
+	"github.com/opmvpc/vibesync/internal/client"
+	"github.com/opmvpc/vibesync/internal/webui"
 )
 
 // appVersion est renseignée au build (`-X main.appVersion=…`) depuis le fichier

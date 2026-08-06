@@ -28,9 +28,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thibsix/vibesync/internal/client"
-	"github.com/thibsix/vibesync/internal/server"
-	"github.com/thibsix/vibesync/internal/vlc"
+	"github.com/opmvpc/vibesync/internal/client"
+	"github.com/opmvpc/vibesync/internal/server"
+	"github.com/opmvpc/vibesync/internal/vlc"
 )
 
 const (

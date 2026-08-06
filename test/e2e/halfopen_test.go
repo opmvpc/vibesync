@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thibsix/vibesync/internal/client"
-	"github.com/thibsix/vibesync/internal/protocol"
-	"github.com/thibsix/vibesync/internal/vlc"
-	"github.com/thibsix/vibesync/internal/vlc/vlctest"
+	"github.com/opmvpc/vibesync/internal/client"
+	"github.com/opmvpc/vibesync/internal/protocol"
+	"github.com/opmvpc/vibesync/internal/vlc"
+	"github.com/opmvpc/vibesync/internal/vlc/vlctest"
 )
 
 // halfOpenConn simule une coupure réseau *silencieuse* (câble arraché, Wi-Fi

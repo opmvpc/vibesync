@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thibsix/vibesync/internal/protocol"
+	"github.com/opmvpc/vibesync/internal/protocol"
 )
 
 // Par défaut les hubs de test n'ont pas de fenêtre de reprise : la destruction

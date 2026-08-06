@@ -3,7 +3,7 @@ package client
 import (
 	"time"
 
-	"github.com/thibsix/vibesync/internal/protocol"
+	"github.com/opmvpc/vibesync/internal/protocol"
 )
 
 // Constantes de synchronisation (docs/protocol.md §Comportements client).

@@ -12,9 +12,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thibsix/vibesync/internal/client"
-	"github.com/thibsix/vibesync/internal/protocol"
-	"github.com/thibsix/vibesync/internal/ws"
+	"github.com/opmvpc/vibesync/internal/client"
+	"github.com/opmvpc/vibesync/internal/protocol"
+	"github.com/opmvpc/vibesync/internal/ws"
 )
 
 // stubEngine enregistre les appels de l'UI.

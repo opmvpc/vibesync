@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/thibsix/vibesync/internal/protocol"
+	"github.com/opmvpc/vibesync/internal/protocol"
 )
 
 // connLoop maintient la connexion au serveur : dial, hello, lecture, puis

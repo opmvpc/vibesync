@@ -7,7 +7,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/thibsix/vibesync/internal/ws"
+	"github.com/opmvpc/vibesync/internal/ws"
 )
 
 // Conn est une connexion message-orientée vers le serveur vibesync.

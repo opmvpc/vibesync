@@ -13,7 +13,7 @@ certificats soi-même. Le client doit être un binaire simple pour Windows et ma
 
 ## Décision
 
-- **Go** pour serveur et client, mono-repo `github.com/thibsix/vibesync`, package
+- **Go** pour serveur et client, mono-repo `github.com/opmvpc/vibesync`, package
   partagé `internal/protocol` généré depuis la spec `docs/protocol.md`.
 - **Transport WebSocket** (`/ws`), messages JSON `{type, data}`, versionnés.
 - **TLS terminé par Traefik/Coolify** : le serveur écoute en HTTP simple dans le
