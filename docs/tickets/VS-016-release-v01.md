@@ -1,7 +1,7 @@
 ---
 id: VS-016
 titre: Releases GitHub avec l'exe attaché, à partir de v0.1.0
-statut: en-cours
+statut: terminé
 priorité: haute
 dépend-de: [VS-007]
 créé: 2026-08-06
@@ -15,11 +15,13 @@ n'uploadait qu'un artifact de workflow, aucun job de release ni tag n'existait.
 
 ## Critères d'acceptation
 
-- [ ] Job `release` (on tag v*) : crée la GitHub Release (notes auto) et y attache
+- [x] Job `release` (on tag v*) : crée la GitHub Release (notes auto) et y attache
       `vibesync.exe` (via `gh` préinstallé sur le runner, pas d'action tierce)
-- [ ] Tag `v0.1.0` poussé, release visible avec l'exe téléchargeable
-- [ ] Guides amis : URL de release réelle à la place du placeholder
+- [x] Tag `v0.1.0` poussé, release visible avec l'exe (176 640 o) téléchargeable
+- [x] Guides amis : URL réelle — et le repo est passé PUBLIC (06-08), les amis
+      téléchargent sans compte
 
 ## Journal du ticket
 
 - 2026-08-06 : créé (orchestrateur).
+- 2026-08-06 : release v0.1.0 en ligne, repo public. Terminé.
