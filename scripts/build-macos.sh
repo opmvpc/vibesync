@@ -22,13 +22,23 @@ if [ "${1:-}" = "--arm64" ]; then
     ARCH_ARGS="--arch arm64"
 fi
 
+# Version applicative (VS-023) : source unique = fichier VERSION à la racine,
+# injecté dans l'Info.plist du bundle (l'équivalent mac des ldflags Go et du -D
+# du client C). Absente, le client reste « dev » : illisible en semver, donc
+# jamais de bannière de mise à jour.
+VERSION=dev
+if [ -f "$REPO_ROOT/VERSION" ]; then
+    VERSION=$(tr -d ' \t\r\n' < "$REPO_ROOT/VERSION")
+    [ -n "$VERSION" ] || VERSION=dev
+fi
+
 if ! command -v swift >/dev/null 2>&1; then
     echo "swift introuvable : installez les Xcode Command Line Tools" >&2
     echo "  xcode-select --install" >&2
     exit 2
 fi
 
-echo "== compilation (release)"
+echo "== compilation (release, version $VERSION)"
 # shellcheck disable=SC2086
 swift build -c release --package-path "$PACKAGE_DIR" $ARCH_ARGS
 
@@ -47,7 +57,7 @@ mkdir -p "$APP/Contents/Resources"
 cp "$BINARY" "$APP/Contents/MacOS/VibeSync"
 chmod +x "$APP/Contents/MacOS/VibeSync"
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -67,9 +77,11 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>$VERSION</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>$VERSION</string>
+    <key>VibeSyncVersion</key>
+    <string>$VERSION</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>

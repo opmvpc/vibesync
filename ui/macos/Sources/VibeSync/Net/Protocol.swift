@@ -28,8 +28,28 @@ public struct ServerUser {
     public init() {}
 }
 
+/// Contenu du `welcome` (docs/protocol.md §Messages serveur → client). Un
+/// struct plutôt qu'un n-uplet : le message a grossi avec VS-023 et chaque
+/// champ mérite son nom.
+public struct Welcome {
+    public var selfId: String = ""
+    public var room: String = ""
+    public var state: RoomState? = nil
+    public var users: [ServerUser] = []
+    /// Ready que le serveur nous attribue. Le moteur ne l'adopte PAS au welcome
+    /// (c'est notre état local qui fait foi au re-join, cf. Engine.onWelcome) :
+    /// ce champ n'est là que pour l'affichage et le diagnostic.
+    public var selfReady: Bool? = nil
+    /// VS-023 : version applicative du serveur et lien de téléchargement.
+    /// Champs additifs, absents des serveurs plus anciens.
+    public var serverVersion: String = ""
+    public var downloadUrl: String = ""
+
+    public init() {}
+}
+
 public enum ServerMessage {
-    case welcome(selfId: String, room: String, state: RoomState?, users: [ServerUser], selfReady: Bool?)
+    case welcome(Welcome)
     case pong(Pong)
     case roomState(RoomState)
     case users([ServerUser])
@@ -121,21 +141,22 @@ public enum Proto {
     public static func fill(type: String, data: [String: Any]?) -> ServerMessage {
         switch type {
         case "welcome":
-            let selfId = JSON.string(data, "selfId")
-            let room = JSON.string(data, "room")
-            var state: RoomState? = nil
+            var w = Welcome()
+            w.selfId = JSON.string(data, "selfId")
+            w.room = JSON.string(data, "room")
             if let st = JSON.child(data, "state") {
-                state = readRoomState(st)
+                w.state = readRoomState(st)
             }
-            let users = readUsers(JSON.array(data, "users"))
-            var selfReady: Bool? = nil
-            if !selfId.isEmpty {
-                for u in users where u.id == selfId {
-                    selfReady = u.ready
+            w.users = readUsers(JSON.array(data, "users"))
+            if !w.selfId.isEmpty {
+                for u in w.users where u.id == w.selfId {
+                    w.selfReady = u.ready
                     break
                 }
             }
-            return .welcome(selfId: selfId, room: room, state: state, users: users, selfReady: selfReady)
+            w.serverVersion = JSON.string(data, "serverVersion")
+            w.downloadUrl = JSON.string(data, "downloadUrl")
+            return .welcome(w)
 
         case "pong":
             return .pong(Pong(t: JSON.int(data, "t"), serverMs: JSON.int(data, "serverMs")))

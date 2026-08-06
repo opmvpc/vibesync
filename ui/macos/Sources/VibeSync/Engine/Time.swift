@@ -73,6 +73,16 @@ public enum Sync {
     /// Détecteur de buffering (l'interface HTTP de VLC n'expose pas d'état).
     public static let bufferWindow: Nanos = 700 * 1_000_000
     public static let bufferMinRatio: Double = 0.25
+    /// Suspension de la détection après un seek ou une transition play/pause :
+    /// la position se fige mécaniquement, ce n'est pas un buffering (VS-017).
+    public static let bufferingSuspend: Nanos = 2000 * 1_000_000
+    /// Anti-masquage : fenêtre de vision minimale garantie entre deux
+    /// suspensions, sans quoi un moteur qui corrige en boucle resterait aveugle
+    /// (docs/protocol.md §Buffering).
+    public static let minSuspendGap: Nanos = 1000 * 1_000_000
+    /// Salle vierge : un lecteur local au-delà de ce seuil déclenche UNE reprise
+    /// `control seek` à sa position (docs/protocol.md §Erreurs et robustesse).
+    public static let virginResumeSec: Double = 5.0
 
     /// Doublement borné 1 s → 10 s.
     public static func nextBackoff(_ current: Nanos) -> Nanos {

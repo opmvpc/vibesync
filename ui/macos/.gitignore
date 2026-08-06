@@ -1,0 +1,4 @@
+# Sorties de build locales : .build est celui de SwiftPM, build/ le bundle
+# assemblé par scripts/build-macos.sh.
+.build/
+build/

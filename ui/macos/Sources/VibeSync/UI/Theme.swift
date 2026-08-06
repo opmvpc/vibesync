@@ -75,6 +75,47 @@ struct Badge: View {
     }
 }
 
+/// Bandeau cliquable et fermable, non bloquant. Sert aux invitations de la
+/// salle (mise à jour, « X regarde… », fichier introuvable) — même rôle que
+/// notice_bar du client Windows.
+struct NoticeBar: View {
+    var text: String
+    var color: Color
+    var busy: Bool = false
+    var onTap: () -> Void
+    var onClose: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if busy {
+                ProgressView()
+                    .controlSize(.small)
+            }
+            Text(text)
+                .font(.system(size: 12))
+                .lineLimit(2)
+            Spacer(minLength: 8)
+            Button {
+                onClose()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .bold))
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(color)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(color.opacity(0.14))
+        .foregroundColor(color)
+        .contentShape(Rectangle())
+        .onTapGesture {
+            onTap()
+        }
+    }
+}
+
 /// Barre de position cliquable.
 struct PositionBar: View {
     var position: Double

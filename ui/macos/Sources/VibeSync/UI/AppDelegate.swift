@@ -9,7 +9,10 @@ import SwiftUI
 
 public final class AppDelegate: NSObject, NSApplicationDelegate {
 
-    let model = AppModel()
+    // Magasin de réglages (suite alternative si VIBESYNC_SUITE est posée) et
+    // pilote du harnais de test réel (nil hors mode auto) : les deux se lisent
+    // dans l'environnement, avant toute construction de l'interface.
+    let model = AppModel(store: Preferences.store(), auto: AutoPilot.fromEnvironment())
     private var window: NSWindow?
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
@@ -27,7 +30,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         win.center()
         win.makeKeyAndOrderFront(nil)
         window = win
-        NSApp.activate(ignoringOtherApps: true)
+        // Une instance pilotée ne vole pas le premier plan : le harnais en
+        // lance deux, elles se battraient pour l'activation.
+        if !model.isAutoPiloted {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        model.startAutoPilot()
     }
 
     public func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

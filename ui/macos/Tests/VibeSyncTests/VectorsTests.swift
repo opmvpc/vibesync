@@ -62,8 +62,8 @@ final class VectorsTests: XCTestCase {
             .contentsOfDirectory(atPath: dir.path)
             .filter { $0.hasSuffix(".json") }
             .sorted()
-        XCTAssertGreaterThanOrEqual(names.count, 12,
-                                    "\(names.count) vecteur(s) dans \(dir.path), attendu au moins 12")
+        XCTAssertGreaterThanOrEqual(names.count, 13,
+                                    "\(names.count) vecteur(s) dans \(dir.path), attendu au moins 13")
         for name in names {
             replay(dir.appendingPathComponent(name))
         }
@@ -100,9 +100,18 @@ final class VectorsTests: XCTestCase {
 
         var engine = Engine()
         // Les sorties de l'ouverture sont drainées par le générateur.
-        engine.openFile(name: fileName, sizeBytes: vectorFileSize)
+        engine.openFile(now: now, name: fileName, sizeBytes: vectorFileSize)
 
         var eventIndex = 0
+        // keepOutput : par défaut, ce que le moteur émet en réaction immédiate à
+        // un événement ne fait pas partie de la trace (le générateur Go le
+        // draine). Un événement marqué « keepOutput » garde cette réaction, qui
+        // est alors attendue en tête du `toServer` du premier pas qui suit —
+        // c'est le cas quand la réaction EST la règle testée (reprise « salle
+        // vierge »).
+        var pending: [Decision] = []
+        var keepPending = false
+
         for rawStep in trace {
             guard let step = rawStep as? [String: Any] else {
                 continue
@@ -135,8 +144,11 @@ final class VectorsTests: XCTestCase {
                     fake.seek(JSON.number(data, "positionSec", 0), now)
                 default:
                     switch Proto.fill(type: type, data: data) {
-                    case .welcome(let selfId, _, let state, _, let selfReady):
-                        engine.onWelcome(now: now, selfId: selfId, state: state, selfReady: selfReady)
+                    case .welcome(let w):
+                        pending += engine.onWelcome(now: now,
+                                                    selfId: w.selfId,
+                                                    room: w.room,
+                                                    state: w.state)
                     case .pong(let p):
                         engine.onPong(now: now, p)
                     case .roomState(let rs):
@@ -144,6 +156,11 @@ final class VectorsTests: XCTestCase {
                     default:
                         break
                     }
+                }
+                if JSON.bool(event, "keepOutput") {
+                    keepPending = true
+                } else if !keepPending {
+                    pending.removeAll()
                 }
                 eventIndex += 1
             }
@@ -158,7 +175,13 @@ final class VectorsTests: XCTestCase {
                 XCTFail("\(vectorName) : status.json simulé illisible")
                 return
             }
-            var out = engine.onVLCStatus(now: now, status)
+            if !keepPending {
+                pending.removeAll()
+            }
+            keepPending = false
+            var out = pending
+            pending.removeAll()
+            out += engine.onVLCStatus(now: now, status)
             out += engine.onTick(now: now)
 
             let at = "\(vectorName) @\(stepMs)ms"

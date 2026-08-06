@@ -59,7 +59,6 @@ public enum VLCLauncher {
                 return path
             }
         }
-        _ = fm
         return nil
     }
 
@@ -83,13 +82,18 @@ public enum VLCLauncher {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: binary)
+        // Mêmes drapeaux que le driver Go, MOINS `--no-one-instance` : le VLC
+        // macOS ne connaît pas cette option et refuse purement et simplement de
+        // démarrer (« unknown option or missing mandatory argument »). Elle n'y
+        // sert de toute façon à rien — lancer deux fois le binaire du bundle
+        // donne bien deux processus indépendants, chacun avec son interface
+        // HTTP (vérifié : le harnais de test réel en fait tourner deux).
         process.arguments = [
             "--extraintf=http",
             "--http-host=127.0.0.1",
             "--http-port=\(port)",
             "--http-password=" + password,
             "--no-video-title-show",
-            "--no-one-instance",
             filePath,
         ]
         process.standardOutput = FileHandle.nullDevice
@@ -104,20 +108,25 @@ public enum VLCLauncher {
         let client = VLCClient(port: port, password: password)
         let handle = VLCProcess(process: process, client: client)
         client.waitReady(timeoutSec: timeoutSec) { result in
-            switch result {
-            case .success:
-                // §Chargement de fichier : VLC démarre la lecture tout seul à
-                // l'ouverture. On force pause + position 0 avant de rendre la
-                // main ; le moteur ne déclarera le fichier (`setFile`) qu'une
-                // fois cette pause effectivement observée.
-                client.apply(VLCCommand(.pause)) { _ in
-                    client.apply(VLCCommand(.seek, 0)) { _ in
-                        completion(.success(handle))
-                    }
-                }
-            case .failure(let err):
+            if case .failure(let err) = result {
                 handle.terminate()
                 completion(.failure(err))
+                return
+            }
+            // §Chargement de fichier : VLC démarre la lecture tout seul à
+            // l'ouverture. On ne rend la main qu'une fois la pause à la
+            // position 0 OBSERVÉE (vlc.Prepare côté Go) — et l'appelant ne
+            // déclare le fichier au serveur qu'après ce succès. Un échec (VLC
+            // qui refuse pause/seek, média jamais chargé) est propagé : rien
+            // n'est déclaré.
+            client.prepare { prepared in
+                switch prepared {
+                case .success:
+                    completion(.success(handle))
+                case .failure(let err):
+                    handle.terminate()
+                    completion(.failure(err))
+                }
             }
         }
     }

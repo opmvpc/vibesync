@@ -27,6 +27,14 @@ struct ConnectView: View {
                             .foregroundColor(Palette.secondary)
                         SecureField("", text: $model.password)
                             .textFieldStyle(.roundedBorder)
+                        // VS-025 : le clair ne touche jamais le disque, c'est le
+                        // trousseau du système qui le chiffre.
+                        Toggle("Se souvenir du mot de passe (trousseau macOS)",
+                               isOn: $model.rememberPassword)
+                            .font(.system(size: 11))
+                            .onChange(of: model.rememberPassword) { _ in
+                                model.rememberPasswordChanged()
+                            }
                     }
                 }
 
@@ -37,7 +45,13 @@ struct ConnectView: View {
                 }
 
                 HStack {
+                    Text("version \(model.clientVersion)")
+                        .font(.system(size: 11))
+                        .foregroundColor(Palette.tertiary)
                     Spacer()
+                    Button("Réglages…") {
+                        model.showSettings = true
+                    }
                     Button("Rejoindre la salle") {
                         model.connect()
                     }

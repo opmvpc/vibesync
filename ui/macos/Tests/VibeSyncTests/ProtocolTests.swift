@@ -83,25 +83,29 @@ final class ProtocolTests: XCTestCase {
         {"type":"welcome","data":{"selfId":"u1","room":"salon",\
         "state":{"paused":false,"positionSec":100,"rate":1,"refServerMs":1785960000000,"setBy":"u2"},\
         "users":[{"id":"u1","name":"thib","ready":true,\
-        "file":{"name":"ep1.mkv","durationSec":1200,"sizeBytes":15}},{"id":"u2","name":"ami"}]}}
+        "file":{"name":"ep1.mkv","durationSec":1200,"sizeBytes":15}},{"id":"u2","name":"ami"}],\
+        "serverVersion":"0.3.0","downloadUrl":"https://exemple.fr/releases"}}
         """
         guard let message = Proto.decode(raw) else {
             XCTFail("welcome non décodé")
             return
         }
-        guard case .welcome(let selfId, let room, let state, let users, let selfReady) = message else {
+        guard case .welcome(let w) = message else {
             XCTFail("welcome non reconnu")
             return
         }
-        XCTAssertEqual(selfId, "u1")
-        XCTAssertEqual(room, "salon")
-        XCTAssertEqual(state?.positionSec, 100)
-        XCTAssertEqual(state?.refServerMs, 1785960000000)
-        XCTAssertEqual(state?.setBy, "u2")
-        XCTAssertEqual(users.count, 2)
-        XCTAssertEqual(selfReady, true)
-        XCTAssertTrue(users[0].hasFile)
-        XCTAssertEqual(users[0].fileDurationSec, 1200)
+        XCTAssertEqual(w.selfId, "u1")
+        XCTAssertEqual(w.room, "salon")
+        XCTAssertEqual(w.state?.positionSec, 100)
+        XCTAssertEqual(w.state?.refServerMs, 1785960000000)
+        XCTAssertEqual(w.state?.setBy, "u2")
+        XCTAssertEqual(w.users.count, 2)
+        XCTAssertEqual(w.selfReady, true)
+        XCTAssertTrue(w.users[0].hasFile)
+        XCTAssertEqual(w.users[0].fileDurationSec, 1200)
+        // VS-023 : champs additifs de version.
+        XCTAssertEqual(w.serverVersion, "0.3.0")
+        XCTAssertEqual(w.downloadUrl, "https://exemple.fr/releases")
     }
 
     func testDecodeOtherMessages() {
@@ -158,12 +162,13 @@ final class ProtocolTests: XCTestCase {
         XCTAssertNil(Proto.decode(""))
 
         // data absent : ne doit pas planter.
-        guard case .welcome(_, _, let state, let users, _)? = Proto.decode("{\"type\":\"welcome\"}") else {
+        guard case .welcome(let w)? = Proto.decode("{\"type\":\"welcome\"}") else {
             XCTFail("welcome sans data")
             return
         }
-        XCTAssertNil(state)
-        XCTAssertTrue(users.isEmpty)
+        XCTAssertNil(w.state)
+        XCTAssertTrue(w.users.isEmpty)
+        XCTAssertTrue(w.serverVersion.isEmpty)
     }
 
     // MARK: Assainissement du moteur
@@ -226,8 +231,8 @@ final class ProtocolTests: XCTestCase {
         var engine = Engine()
         engine.onWelcome(now: VSTime.now(),
                          selfId: "u1",
-                         state: RoomState(paused: true, positionSec: 10, rate: 1, refServerMs: 1, setBy: "u2"),
-                         selfReady: false)
+                         room: "salon",
+                         state: RoomState(paused: true, positionSec: 10, rate: 1, refServerMs: 1, setBy: "u2"))
         XCTAssertTrue(engine.haveState)
         engine.sessionLost()
         XCTAssertFalse(engine.haveState, "référence non invalidée à la coupure")

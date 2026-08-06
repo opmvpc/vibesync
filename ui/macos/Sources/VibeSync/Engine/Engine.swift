@@ -52,21 +52,62 @@ public struct Engine {
 
     /// Détecteur de buffering : la position n'avance plus alors que VLC se
     /// déclare en lecture (l'interface HTTP de VLC n'expose pas d'état de
-    /// buffering).
+    /// buffering). Port fidèle de internal/vlc (BufferingDetector), suspension
+    /// et anti-masquage compris.
     private struct BufferDetect {
         var have: Bool = false
         var buffering: Bool = false
         var stallFrom: Nanos? = nil
         var lastPos: Double = 0
         var lastAt: Nanos = 0
+        /// Instant jusqu'auquel la détection est neutralisée : un seek ou une
+        /// transition play/pause fige mécaniquement la position le temps que
+        /// VLC obéisse, ce n'est pas un buffering (VS-017).
+        var suspendUntil: Nanos? = nil
 
         mutating func reset() {
             have = false
             buffering = false
+            // Sans cet oubli, un stall entamé avant le reset ferait basculer en
+            // buffering dès la deuxième observation qui suit.
             stallFrom = nil
         }
 
+        /// Oublie le stall en cours et neutralise la détection jusqu'à now+d.
+        ///
+        /// Anti-masquage : la demande est ignorée tant qu'on n'est pas à
+        /// minSuspendGap de la fin de la suspension précédente — il reste donc
+        /// toujours une fenêtre de vision entre deux, sans quoi un moteur qui
+        /// corrige en boucle un lecteur figé resterait aveugle indéfiniment.
+        /// Le verdict courant est conservé : envoyer un seek ne prouve pas que
+        /// la lecture est repartie.
+        mutating func suspend(_ now: Nanos, _ d: Nanos) {
+            if let until = suspendUntil, now < until + Sync.minSuspendGap {
+                return
+            }
+            have = false
+            stallFrom = nil
+            suspendUntil = now + d
+        }
+
+        func suspended(_ now: Nanos) -> Bool {
+            guard let until = suspendUntil else {
+                return false
+            }
+            return now < until
+        }
+
         mutating func observe(_ st: VLCStatus, _ now: Nanos) -> Bool {
+            if suspended(now) {
+                // On continue d'ancrer la position pour que la reprise de la
+                // détection ne voie pas d'un coup tout le saut accumulé pendant
+                // la suspension. Aucun diagnostic posé ni levé.
+                have = true
+                lastPos = st.positionSec
+                lastAt = now
+                stallFrom = nil
+                return buffering
+            }
             if st.state != .playing {
                 have = true
                 lastPos = st.positionSec
@@ -109,6 +150,16 @@ public struct Engine {
     public private(set) var phase: Phase = .idle
     public private(set) var selfId: String = ""
     public private(set) var ready: Bool = false
+    /// Salle courante (celle de la demande de connexion, corrigée par le welcome).
+    public private(set) var room: String = ""
+
+    // Mémoire de séance (§Salle vierge) : dernière position de salle connue, et
+    // pour quelle salle. Elle survit aux coupures — c'est tout son intérêt —
+    // mais pas à un changement de salle. Sans elle, aucune reprise n'est
+    // possible : un premier join ne propose jamais rien.
+    private var resumeRoom: String = ""
+    private var resumePos: Double = 0
+    private var resumeKnown: Bool = false
 
     // horloge serveur
     private var offsets: [Int64] = []
@@ -143,10 +194,11 @@ public struct Engine {
     public private(set) var fileDurationSec: Double = 0
     public private(set) var fileSizeBytes: Int64 = 0
     public private(set) var haveFile: Bool = false
-    /// §Chargement de fichier : `setFile` n'est envoyé qu'une fois l'état
-    /// « en pause » effectivement observé (VLC démarre la lecture tout seul à
-    /// l'ouverture ; le driver force pause + position 0, cette course est réelle).
-    public private(set) var fileDeclared: Bool = false
+    /// Vrai dès que la durée du média a été observée et déclarée au serveur —
+    /// l'UI s'en sert pour distinguer « chargement » de « prêt ».
+    public var fileDeclared: Bool {
+        return haveFile && fileDurationSec > 0
+    }
 
     // tâches périodiques
     private var lastPing: Nanos? = nil
@@ -221,7 +273,16 @@ public struct Engine {
         drift = 0
     }
 
-    public mutating func connecting() {
+    /// Démarrage (ou redémarrage) d'une boucle de connexion vers `room`.
+    public mutating func connecting(room newRoom: String) {
+        let trimmed = newRoom.trimmingCharacters(in: .whitespaces)
+        if trimmed != resumeRoom.trimmingCharacters(in: .whitespaces) {
+            // Une séance suivie ailleurs ne se propose pas ici.
+            resumeRoom = ""
+            resumePos = 0
+            resumeKnown = false
+        }
+        room = newRoom
         phase = .connecting
         invalidateReference()
     }
@@ -300,14 +361,44 @@ public struct Engine {
         ready = value
     }
 
+    /// Dit si ce welcome déclenche une reprise « salle vierge »
+    /// (docs/protocol.md §Erreurs et robustesse), et à quelle position.
+    ///
+    /// Conditions cumulatives : la salle n'a jamais reçu de control (`setBy`
+    /// vide, position 0) ET nous étions déjà connectés à CETTE salle dans ce
+    /// processus, avec une position de séance connue au-delà du seuil. La
+    /// position proposée est la dernière position de SALLE connue, jamais la
+    /// position brute de VLC. À appeler AVANT d'adopter l'état du welcome.
+    private func virginResumeCandidate(_ rs: RoomState, _ welcomeRoom: String) -> Double? {
+        if !rs.setBy.isEmpty || rs.positionSec != 0 {
+            return nil
+        }
+        if !resumeKnown || resumeRoom.isEmpty || resumeRoom != welcomeRoom {
+            return nil
+        }
+        if resumePos <= Sync.virginResumeSec {
+            return nil
+        }
+        return Engine.clampPosition(resumePos, duration())
+    }
+
     @discardableResult
     public mutating func onWelcome(now: Nanos,
                                    selfId newSelfId: String,
-                                   state: RoomState?,
-                                   selfReady: Bool?) -> [Decision] {
+                                   room welcomeRoom: String,
+                                   state: RoomState?) -> [Decision] {
         var out: [Decision] = []
         selfId = newSelfId
         phase = .connected
+        if !welcomeRoom.isEmpty {
+            room = welcomeRoom
+        }
+        // Décidé AVANT d'adopter l'état : l'adoption écrase la référence sur
+        // laquelle repose la reprise.
+        var resume: Double? = nil
+        if let st = state, let sane = Engine.sanitize(st) {
+            resume = virginResumeCandidate(sane, room)
+        }
         // Le welcome est la référence d'une session neuve : aucun hold ni
         // roomState en attente ne lui survit.
         userHoldUntil = nil
@@ -317,12 +408,11 @@ public struct Engine {
         if let st = state {
             onRoomState(now: now, st)
         }
-        if let r = selfReady {
-            ready = r
-        }
-        // Re-déclarer notre état après un (re)join — seulement si le fichier a
-        // déjà été reconnu comme chargé (§Chargement de fichier).
-        if haveFile && fileDeclared {
+        // Volontairement pas d'adoption du ready serveur ici : le serveur vient
+        // de nous créer un membre neuf, donc « pas prêt ». C'est notre état
+        // local qui fait foi au (re)join. Re-déclarer systématiquement notre
+        // état : l'état courant fait foi (§File d'attente hors ligne).
+        if haveFile {
             out.append(.server(.setFile(name: fileName,
                                         durationSec: fileDurationSec,
                                         sizeBytes: fileSizeBytes)))
@@ -330,39 +420,46 @@ public struct Engine {
         out.append(.server(.setReady(ready: ready)))
         out.append(.server(.ping(t: VSTime.toUnixMs(now))))
         lastPing = now
+        // Salle vierge : proposer la séance perdue avant tout alignement. C'est
+        // un control comme un autre : il arme le hold post-action, ce qui
+        // suspend l'alignement sur l'état vierge jusqu'à l'écho du serveur.
+        if let pos = resume {
+            userAction(.seek, pos, now, &out, armGrace: false)
+        }
         return out
     }
 
     // MARK: - Lecteur
 
-    /// Un fichier vient d'être ouvert dans VLC. Aucun `setFile` n'est émis ici :
-    /// c'est le driver qui force pause + position 0, et le fichier n'est déclaré
-    /// qu'une fois cette pause observée (§Chargement de fichier).
+    /// Un fichier vient d'être ouvert dans VLC (le driver force pause +
+    /// position 0 avant de rendre la main). Comme la référence Go : le fichier
+    /// est déclaré immédiatement (nom + taille, durée encore inconnue), puis
+    /// re-déclaré par declareFile dès que la durée observée diverge.
     @discardableResult
-    public mutating func openFile(name: String, sizeBytes: Int64) -> [Decision] {
+    public mutating func openFile(now: Nanos, name: String, sizeBytes: Int64) -> [Decision] {
         fileName = name
         fileDurationSec = 0
         fileSizeBytes = sizeBytes
         haveFile = true
-        fileDeclared = false
         status = VLCStatus()
         haveStatus = false
         expect = Expectation()
+        // Média neuf : le diagnostic du précédent ne vaut plus rien. Ouvrir un
+        // fichier enchaîne pause + seek 0 + démarrage, autant de raisons
+        // mécaniques de voir la position figée : on suspend aussi la détection.
         buf.reset()
         buffering = false
+        buf.suspend(now, Sync.bufferingSuspend)
         vlcError = false
         appliedRate = 1
-        return []
+        return [.server(.setFile(name: name, durationSec: 0, sizeBytes: sizeBytes))]
     }
 
-    /// Envoie setFile dès que le fichier est chargé, en pause, et sa durée connue.
+    /// Envoie setFile dès qu'un fichier (et sa durée) est connu — et le
+    /// re-déclare si le nom ou la durée observés divergent de ce qui a été
+    /// annoncé (même règle que la référence Go).
     private mutating func declareFile(_ st: VLCStatus, _ out: inout [Decision]) {
         if !st.loaded || st.lengthSec <= 0 {
-            return
-        }
-        // Tant que la pause forcée du chargement n'a pas été observée, on ne
-        // déclare rien : la durée et le nom rapportés ne sont pas fiables.
-        if !fileDeclared && st.state != .paused {
             return
         }
         var name = st.fileName
@@ -375,22 +472,30 @@ public struct Engine {
         fileName = name
         fileDurationSec = st.lengthSec
         haveFile = true
-        fileDeclared = true
         out.append(.server(.setFile(name: name,
                                     durationSec: st.lengthSec,
                                     sizeBytes: fileSizeBytes)))
     }
 
-    /// Remonte une action utilisateur et arme le hold de 2 s.
+    /// Remonte une action utilisateur (control) et arme le hold de 2 s.
+    /// `armGrace` n'est vrai que pour une action détectée DANS VLC : la fenêtre
+    /// de grâce protège alors la ré-observation (la référence Go ne l'arme pas
+    /// pour un control venu de l'UI ni pour la reprise « salle vierge »).
     private mutating func userAction(_ act: ControlAction,
                                      _ pos: Double,
                                      _ now: Nanos,
-                                     _ out: inout [Decision]) {
+                                     _ out: inout [Decision],
+                                     armGrace: Bool = true) {
         out.append(.server(.control(action: act,
                                     positionSec: Engine.clampPosition(pos, duration()))))
-        graceUntil = now + Sync.graceWindow
+        if armGrace {
+            graceUntil = now + Sync.graceWindow
+        }
         userHoldUntil = now + Sync.userHold
         pendingRoomState = nil
+        // Le seek (ou la transition) qui va suivre fige la position, ce n'est
+        // pas un buffering.
+        buf.suspend(now, Sync.bufferingSuspend)
     }
 
     /// Compare l'observation à ce que le moteur attendait ; tout écart non
@@ -461,16 +566,18 @@ public struct Engine {
                 expect.pos = expect.predict(now)
                 expect.paused = true
                 expect.at = now
+                buf.suspend(now, Sync.bufferingSuspend)
                 hold = true
             case .resume:
                 expect.pos = expect.predict(now)
                 expect.paused = false
                 expect.at = now
+                buf.suspend(now, Sync.bufferingSuspend)
                 hold = true
             case .seek:
                 expect.pos = c.value.rounded()  // VLC arrondit à la seconde
                 expect.at = now
-                buf.reset()
+                buf.suspend(now, Sync.bufferingSuspend)
                 hold = true
             case .rate:
                 expect.pos = expect.predict(now)
@@ -621,11 +728,26 @@ public struct Engine {
         }
     }
 
+    /// Mémorise où en est la séance de la salle courante. Cette mémoire est la
+    /// seule chose qui autorise une reprise si le serveur revient amnésique
+    /// (§Salle vierge) : alimentée seulement connecté avec un état de salle
+    /// valide, elle se fige à la dernière position connue quand la connexion
+    /// tombe.
+    private mutating func rememberSession(_ now: Nanos) {
+        if phase != .connected || !haveState || room.isEmpty {
+            return
+        }
+        resumeRoom = room
+        resumePos = expectedPosition(now)
+        resumeKnown = true
+    }
+
     /// Tic d'horloge : lève le hold, décide des corrections, tâches périodiques.
     @discardableResult
     public mutating func onTick(now: Nanos) -> [Decision] {
         var out: [Decision] = []
         expireUserHold(now)
+        rememberSession(now)
         plan(now, &out)
         periodic(now, &out)
         return out
@@ -648,9 +770,9 @@ public struct Engine {
         }
         pos = Engine.clampPosition(pos, duration())
         // Hold post-action : corrections suspendues jusqu'à l'écho ou l'expiration.
-        userHoldUntil = now + Sync.userHold
-        pendingRoomState = nil
-        return [.server(.control(action: action, positionSec: pos))]
+        var out: [Decision] = []
+        userAction(action, pos, now, &out, armGrace: false)
+        return out
     }
 
     @discardableResult

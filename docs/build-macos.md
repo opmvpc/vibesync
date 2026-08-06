@@ -151,10 +151,74 @@ Points connus à surveiller, dans l'ordre de probabilité :
    `Color(nsColor:)`, `Label`, `overlay(alignment:)`). Des avertissements de
    dépréciation sur macOS 14+ sont normaux et sans effet.
 
-## 7. Test réel à faire sur le Mac
+## 7. Test réel automatisé (`scripts/run-real-macos.sh`)
 
-- serveur local (`go run ./cmd/vibesync-server`) ou Coolify, deux clients
-  (le Mac + le PC Windows), le même film ;
-- vérifier : ready des deux côtés, démarrage synchrone, pause distante,
-  seek distant, chat, coupure réseau (couper le Wi-Fi 15 s) et reprise
-  automatique sans perdre le pseudo (jeton de session).
+Équivalent macOS de `scripts/run-real-sandbox.ps1` : une séance réelle à **deux
+clients et deux vrais VLC sur une seule machine**, avec verdict PASS/FAIL.
+
+```sh
+VIBESYNC_PASSWORD=… ./scripts/run-real-macos.sh [fichier-video] [url-serveur]
+```
+
+- **fichier-video** (facultatif) : sans lui, un WAV silencieux de 10 minutes est
+  généré (perl, fourni par macOS — ni ffmpeg ni rien d'autre).
+- **url-serveur** (facultatif) : défaut `ws://127.0.0.1:8080/ws`, et dans ce cas
+  un serveur doit **déjà tourner** (`go run ./cmd/vibesync-server`). Avec une
+  URL `wss://…`, le test vise le serveur déployé.
+- `VIBESYNC_PASSWORD` : mot de passe du serveur. Jamais en argument — `argv` est
+  lisible par tous les processus de la machine.
+- `VIBESYNC_ROOM` : salle imposée (défaut `vibesync-test-$RANDOM`, pour ne pas
+  tomber dans une vraie séance en cours).
+- `VIBESYNC_KEEP=1` : conserver le dossier de travail (journaux + états).
+
+Points de contrôle : (a) les deux clients connectés et qui se voient, (b) les
+deux VLC attachés et le fichier déclaré, (c) `play` depuis le client 1 → la
+position avance des deux côtés et tient 5 s, (d) `pause` depuis le client 2 →
+les deux en pause, (e) `seek` depuis le client 1 → positions alignées, (f) écart
+final entre les deux VLC < 0,5 s, (g) fermeture propre (close 1000, aucun VLC
+orphelin). Code retour non nul dès qu'un point échoue.
+
+### Comment le script pilote l'application
+
+Le client macOS n'a pas de ligne de commande. Il lit donc, **et seulement si
+`VIBESYNC_AUTO_URL` est présente**, un mode « pilote »
+(`Sources/VibeSync/UI/AutoPilot.swift`) :
+
+| Variable | Rôle |
+| --- | --- |
+| `VIBESYNC_AUTO_URL` | serveur — sa présence active le mode auto |
+| `VIBESYNC_AUTO_NAME` / `_ROOM` / `_PASSWORD` | identité et salle |
+| `VIBESYNC_AUTO_FILE` | média ouvert dans VLC au démarrage |
+| `VIBESYNC_AUTO_STATUS` | fichier où l'app réécrit son état (une ligne JSON, chaque seconde) |
+| `VIBESYNC_AUTO_CMDS` | fichier de commandes lu au fil de l'eau |
+| `VIBESYNC_AUTO_SCENARIO` | étiquette libre, recopiée dans l'état |
+| `VIBESYNC_SUITE` | suite `UserDefaults` alternative (isolation des instances) |
+
+Commandes acceptées, une par ligne : `play`, `pause`, `seek <secondes>`,
+`ready [0|1]`, `unready`, `chat <texte>`, `open <chemin>`, `quit`. Le script en
+ajoute une puis attend d'avoir vérifié son point de contrôle : rien n'est minuté
+en dur, un VLC lent ne fait pas échouer le test.
+
+Sans ces variables, **aucun changement de comportement** : l'application
+démarre normalement sur l'écran de connexion.
+
+Deux pièges rencontrés, corrigés dans le script — les reproduire si l'on écrit
+un autre harnais :
+
+1. **Lancer l'app par `open -n -a … --env`**, pas en exécutant le binaire du
+   bundle. Une app lancée directement depuis un shell hérite du contexte de ce
+   shell ; sous un shell restreint (agent, CI, session sans Aqua) `URLSession`
+   reste muette — la connexion ne part jamais et aucune erreur ne remonte.
+   `open` ne rend pas le pid : c'est l'app qui l'écrit dans son état.
+2. **`VIBESYNC_SUITE` est indispensable.** Un `HOME` distinct ne suffit pas :
+   les préférences passent par `cfprefsd`, qui résout le dossier de
+   l'utilisateur lui-même. Sans suite distincte, les deux instances présentent
+   le **même jeton de session** au serveur (VS-028) et se chassent l'une
+   l'autre.
+
+### Ce qui reste à faire à la main
+
+Le harnais ne couvre pas tout ; à vérifier à deux machines (le Mac + le PC) :
+chat, coupure réseau (couper le Wi-Fi 15 s) et reprise automatique sans perdre
+le pseudo, mot de passe mémorisé au trousseau, ouverture automatique du fichier
+d'un participant (dossiers médias), bannière de mise à jour.

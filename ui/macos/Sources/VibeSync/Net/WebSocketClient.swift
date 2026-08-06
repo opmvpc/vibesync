@@ -20,10 +20,22 @@ public final class WebSocketClient: NSObject, URLSessionWebSocketDelegate {
     public var onEvent: ((Event) -> Void)?
 
     private var session: URLSession?
-    private var task: URLSessionWebSocketTask?
+    /// Tâche courante. Interne (et non privée) pour que les tests puissent
+    /// distinguer un rappel délégué légitime d'un rappel tardif.
+    private(set) var task: URLSessionWebSocketTask?
     /// Génération : les rappels tardifs d'une connexion abandonnée sont ignorés.
     private var generation: Int = 0
     private var live: Bool = false
+    /// Tâche en cours de fermeture volontaire : on n'en attend plus que
+    /// l'accusé de réception du serveur (VS-028).
+    private var closingTask: URLSessionWebSocketTask?
+    private var closeAcked: Bool = true
+
+    /// Vrai quand la dernière fermeture volontaire a été confirmée (ou qu'il
+    /// n'y avait rien à confirmer).
+    public var closeAcknowledged: Bool {
+        return closeAcked
+    }
 
     public override init() {
         super.init()
@@ -32,6 +44,18 @@ public final class WebSocketClient: NSObject, URLSessionWebSocketDelegate {
     /// Vrai entre l'ouverture du handshake et la fermeture.
     public var isOpen: Bool {
         return live
+    }
+
+    /// Vrai tant qu'une tâche vit : handshake en cours OU session ouverte.
+    ///
+    /// C'est ce qu'il faut regarder avant de relancer une connexion. Se fier à
+    /// `isOpen` seul relance le dial à chaque tour de boucle (200 ms) : le
+    /// handshake est alors annulé avant d'aboutir et la connexion n'a lieu
+    /// JAMAIS dès que le serveur est à plus de 200 ms (TLS + aller-retour vers
+    /// un serveur distant). Une tâche qui n'aboutit pas est bornée par le
+    /// délai de la requête, qui la fait tomber en `.closed`.
+    public var isActive: Bool {
+        return task != nil
     }
 
     public static func parseURL(_ text: String) -> URL? {
@@ -80,12 +104,33 @@ public final class WebSocketClient: NSObject, URLSessionWebSocketDelegate {
         }
     }
 
-    public func close() {
+    /// Ferme la connexion. `normal` = départ volontaire (bouton « Quitter la
+    /// salle », fermeture de l'app) : on envoie une close 1000 pour que le
+    /// serveur retire le membre immédiatement et libère le pseudo, au lieu de
+    /// laisser une connexion zombie expirer (VS-028, docs/protocol.md §Départ
+    /// volontaire). Autrement 1001 « going away », qui décrit une coupure
+    /// technique ou un simple redémarrage de la boucle de connexion.
+    public func close(normal: Bool = false) {
+        let wasLive = live
         live = false
         generation += 1
-        task?.cancel(with: .goingAway, reason: nil)
+        let code: URLSessionWebSocketTask.CloseCode = normal ? .normalClosure : .goingAway
+        let closing = task
+        closing?.cancel(with: code, reason: nil)
         task = nil
-        session?.invalidateAndCancel()
+        if normal && wasLive && closing != nil {
+            // On garde la tâche sous la main : son didClose est le seul accusé
+            // de réception du départ (l'appelant peut l'attendre brièvement).
+            closingTask = closing
+            closeAcked = false
+        } else {
+            closingTask = nil
+            closeAcked = true
+        }
+        // invalidateAndCancel() couperait la socket avant que la trame de
+        // fermeture ne parte : on laisse la session se terminer d'elle-même
+        // après avoir vidé ce qui est en vol.
+        session?.finishTasksAndInvalidate()
         session = nil
     }
 
@@ -134,9 +179,17 @@ public final class WebSocketClient: NSObject, URLSessionWebSocketDelegate {
 
     // MARK: - URLSessionWebSocketDelegate
 
+    // Les rappels délégués arrivent aussi pour des tâches abandonnées (une
+    // connexion remplacée met un instant à se dénouer). Sans ce filtrage, le
+    // didOpen d'une ancienne tâche renverrait un hello en double et son
+    // didClose couperait la connexion active à sa place.
+
     public func urlSession(_ session: URLSession,
                            webSocketTask: URLSessionWebSocketTask,
                            didOpenWithProtocol protocolName: String?) {
+        guard webSocketTask === task else {
+            return
+        }
         live = true
         onEvent?(.connected)
     }
@@ -145,6 +198,15 @@ public final class WebSocketClient: NSObject, URLSessionWebSocketDelegate {
                            webSocketTask: URLSessionWebSocketTask,
                            didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
                            reason: Data?) {
+        if webSocketTask === closingTask {
+            // Accusé de réception de notre propre départ : rien à signaler.
+            closingTask = nil
+            closeAcked = true
+            return
+        }
+        guard webSocketTask === task else {
+            return
+        }
         fail("connexion fermée par le serveur (code \(closeCode.rawValue))")
     }
 }

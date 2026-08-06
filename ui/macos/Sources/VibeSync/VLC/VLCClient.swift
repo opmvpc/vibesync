@@ -14,6 +14,8 @@ public enum VLCError: Error {
     case http(Int)
     case badJSON
     case timeout
+    /// Le média n'a pas pu être mis en pause au début (cf. `prepare`).
+    case notReady(String)
 
     public var text: String {
         switch self {
@@ -31,6 +33,8 @@ public enum VLCError: Error {
             return "status.json illisible"
         case .timeout:
             return "interface HTTP de VLC muette"
+        case .notReady(let m):
+            return "média non arrêté au début : \(m)"
         }
     }
 }
@@ -125,6 +129,101 @@ public final class VLCClient {
                 rate = 1
             }
             call(command: "rate", value: JSONVal.number(rate), completion: completion)
+        }
+    }
+
+    // MARK: - Préparation du média
+
+    /// Position en deçà de laquelle le média est « au début » (le seek HTTP est
+    /// arrondi à la seconde : viser mieux n'aurait pas de sens).
+    public static let startTolerance: Double = 0.5
+    /// Pas de scrutation pendant la préparation, comme internal/vlc/prepare.go.
+    static let preparePoll: Double = 0.02
+    public static let prepareTimeoutSec: Double = 15
+
+    /// Met un média fraîchement ouvert en pause à la position 0, et ne rend la
+    /// main qu'une fois cet état **observé** (port de internal/vlc/prepare.go,
+    /// docs/protocol.md §Chargement de fichier).
+    ///
+    /// Indispensable : VLC démarre la lecture tout seul à l'ouverture. Sans
+    /// cette étape, deux clients qui ouvrent leur média à quelques centaines de
+    /// millisecondes d'écart démarrent déjà désynchronisés, et le rattrapage au
+    /// rate (5 %/s) mettrait une dizaine de secondes.
+    ///
+    /// La boucle est volontairement idempotente : on redemande pause et seek 0
+    /// tant que l'état visé n'est pas constaté, ce qui absorbe aussi bien le
+    /// délai d'ouverture du média que les commandes perdues. L'échec d'une
+    /// commande n'interrompt rien mais devient l'erreur retenue : si l'état
+    /// visé n'est jamais atteint, c'est elle que voit l'appelant.
+    public func prepare(timeoutSec: Double = VLCClient.prepareTimeoutSec,
+                        completion: @escaping (Result<Void, VLCError>) -> Void) {
+        prepareStep(deadline: Date().addingTimeInterval(timeoutSec), completion: completion)
+    }
+
+    private func prepareStep(deadline: Date, completion: @escaping (Result<Void, VLCError>) -> Void) {
+        status { [weak self] result in
+            guard let self = self else {
+                return
+            }
+            guard case .success(let st) = result else {
+                if case .failure(let err) = result {
+                    self.prepareRetry(deadline, err, completion)
+                }
+                return
+            }
+            if !st.loaded {
+                // Le média n'est pas encore ouvert : rien à commander.
+                self.prepareRetry(deadline, .notReady("aucun média chargé (état \(st.state.rawValue))"),
+                                  completion)
+                return
+            }
+            let atStart = st.positionSec < VLCClient.startTolerance
+            if st.state == .paused && atStart {
+                completion(.success(()))
+                return
+            }
+            let observed = VLCError.notReady(String(format: "média %@ à %.2f s",
+                                                    st.state.rawValue, st.positionSec))
+            // pause puis seek 0, en séquence comme Prepare.
+            let afterPause: (VLCError) -> Void = { pending in
+                if !atStart {
+                    self.apply(VLCCommand(.seek, 0)) { seeked in
+                        if case .failure(let err) = seeked {
+                            self.prepareRetry(deadline, err, completion)
+                        } else {
+                            self.prepareRetry(deadline, pending, completion)
+                        }
+                    }
+                } else {
+                    self.prepareRetry(deadline, pending, completion)
+                }
+            }
+            if st.state == .playing {
+                self.apply(VLCCommand(.pause)) { paused in
+                    if case .failure(let err) = paused {
+                        afterPause(err)
+                    } else {
+                        afterPause(observed)
+                    }
+                }
+            } else {
+                afterPause(observed)
+            }
+        }
+    }
+
+    private func prepareRetry(_ deadline: Date,
+                              _ last: VLCError,
+                              _ completion: @escaping (Result<Void, VLCError>) -> Void) {
+        if Date() >= deadline {
+            completion(.failure(last))
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + VLCClient.preparePoll) { [weak self] in
+            guard let self = self else {
+                return
+            }
+            self.prepareStep(deadline: deadline, completion: completion)
         }
     }
 

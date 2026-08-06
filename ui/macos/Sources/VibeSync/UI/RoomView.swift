@@ -9,6 +9,7 @@ struct RoomView: View {
         VStack(spacing: 0) {
             header
             Divider()
+            notices
             HStack(alignment: .top, spacing: 14) {
                 VStack(spacing: 14) {
                     playbackCard
@@ -44,12 +45,47 @@ struct RoomView: View {
             if model.latencyMs > 0 {
                 Badge(text: "\(model.latencyMs) ms", color: Palette.secondary)
             }
+            Button("Réglages…") {
+                model.showSettings = true
+            }
             Button("Quitter") {
                 model.leave()
             }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
+    }
+
+    // MARK: Bandeaux
+
+    /// Invitations empilées, non bloquantes : mise à jour (VS-023), fichier
+    /// d'un participant (VS-026), fichier introuvable.
+    private var notices: some View {
+        VStack(spacing: 0) {
+            if model.showUpdateBanner {
+                NoticeBar(text: model.updateBannerText, color: Palette.accent) {
+                    model.openDownloadPage()
+                } onClose: {
+                    model.showUpdateBanner = false
+                }
+            }
+            if model.showWatchBanner {
+                NoticeBar(text: "\(model.watchWho) regarde \(model.watchFile) — cliquer pour l'ouvrir chez vous",
+                          color: Palette.good,
+                          busy: model.mediaSearching) {
+                    model.openWatchedFile()
+                } onClose: {
+                    model.dismissWatchBanner()
+                }
+            }
+            if model.showMediaNotice {
+                NoticeBar(text: model.mediaNotice, color: Palette.warn) {
+                    model.openSettingsFromNotice()
+                } onClose: {
+                    model.dismissMediaNotice()
+                }
+            }
+        }
     }
 
     // MARK: Lecture

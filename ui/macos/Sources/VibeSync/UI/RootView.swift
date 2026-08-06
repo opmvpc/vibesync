@@ -14,5 +14,11 @@ struct RootView: View {
             }
         }
         .frame(minWidth: 760, minHeight: 560)
+        // La feuille est ici : les Réglages s'ouvrent depuis les deux écrans
+        // (bouton de l'écran de connexion, bandeau « introuvable » en salle).
+        .sheet(isPresented: $model.showSettings) {
+            SettingsView()
+                .environmentObject(model)
+        }
     }
 }
