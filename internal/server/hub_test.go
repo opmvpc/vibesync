@@ -222,6 +222,25 @@ func TestHubSalleVideConserveeAvecSaSeanceGelee(t *testing.T) {
 	}
 }
 
+// Le gel doit dater du départ du dernier membre, pas du moment où le hub s'en
+// aperçoit : entre les deux, l'horloge peut avoir avancé (le hub reprend le
+// verrou, la machine souffle) et la séance retomberait n'importe où.
+func TestHubGelDateDuDepartPasDeLaPriseEnCompte(t *testing.T) {
+	hub, clk := newTestHubLinger(30*time.Minute, defaultMaxRooms)
+	room, alice := playAlone(t, hub, "salon", "alice", 100)
+
+	clk.Advance(30 * time.Second)
+	if !room.leave(alice) {
+		t.Fatal("la salle devrait être vide")
+	}
+	clk.Advance(2 * time.Minute) // le hub met du temps à s'en occuper
+	hub.retireIfEmpty(room)
+
+	if st := room.State(); math.Abs(st.PositionSec-130) > 0.01 {
+		t.Fatalf("séance gelée à %v, attendu 130 s (instant du départ)", st.PositionSec)
+	}
+}
+
 func TestHubSalleEnLingerDetruiteApresExpiration(t *testing.T) {
 	hub, clk := newTestHubLinger(30*time.Minute, defaultMaxRooms)
 	var destroyed []string

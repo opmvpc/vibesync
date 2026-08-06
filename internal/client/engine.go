@@ -191,6 +191,10 @@ type Engine struct {
 	lastReport time.Time
 	// sorties
 	outbox [][]byte
+	// chatQueue retient les messages de chat composés hors ligne : eux seuls
+	// sont rejoués (docs/protocol.md §File d'attente hors ligne). Il survit à
+	// invalidateReferenceLocked, contrairement à outbox.
+	chatQueue []string
 
 	subMu sync.Mutex
 	subs  map[chan Event]struct{}
@@ -337,6 +341,8 @@ func (e *Engine) Snapshot() Snapshot {
 func (e *Engine) snapshotLocked() Snapshot {
 	users := make([]protocol.User, len(e.users))
 	copy(users, e.users)
+	pending := make([]string, len(e.chatQueue))
+	copy(pending, e.chatQueue)
 	s := Snapshot{
 		Phase:         e.phase,
 		Version:       e.cfg.Version,
@@ -357,6 +363,7 @@ func (e *Engine) snapshotLocked() Snapshot {
 		ClockOffsetMs: e.offsetMs,
 		Retrying:      e.retrying,
 		LastError:     e.lastError,
+		PendingChats:  pending,
 		VLC: VLCSnapshot{
 			Running:     e.player != nil,
 			Available:   e.vlcOK,
@@ -508,15 +515,51 @@ func (e *Engine) SetReady(ready bool) {
 	e.publishState()
 }
 
-// Chat envoie un message de salle.
+// Chat envoie un message de salle. Composé hors ligne, il est mis en file et
+// livré dans l'ordre après le welcome de reconnexion — c'est le seul type de
+// message rejoué (docs/protocol.md §Erreurs et robustesse).
 func (e *Engine) Chat(text string) {
 	if text == "" {
 		return
 	}
 	e.mu.Lock()
-	e.queueLocked(protocol.TypeChat, protocol.Chat{Text: text})
+	offline := e.conn == nil || e.phase != PhaseConnected
+	if offline {
+		e.enqueueChatLocked(text)
+	} else {
+		e.queueLocked(protocol.TypeChat, protocol.Chat{Text: text})
+	}
 	e.mu.Unlock()
-	e.flush()
+	if !offline {
+		e.flush()
+	}
+	e.publishState()
+}
+
+// enqueueChatLocked ajoute un message à la file hors ligne. Au-delà de
+// ChatQueueMax, les plus anciens sont abandonnés : mieux vaut perdre le début
+// d'une longue tirade que de garder indéfiniment ce qui ne partira jamais.
+func (e *Engine) enqueueChatLocked(text string) {
+	e.chatQueue = append(e.chatQueue, text)
+	if excess := len(e.chatQueue) - ChatQueueMax; excess > 0 {
+		e.log.Warn("file de chat hors ligne pleine, plus anciens messages abandonnés",
+			"abandonnes", excess, "max", ChatQueueMax)
+		e.chatQueue = append(e.chatQueue[:0], e.chatQueue[excess:]...)
+	}
+}
+
+// flushChatQueueLocked met en file d'envoi les chats composés hors ligne, dans
+// leur ordre de composition. Appelé au welcome : la salle existe, le hello est
+// passé.
+func (e *Engine) flushChatQueueLocked() {
+	if len(e.chatQueue) == 0 {
+		return
+	}
+	e.log.Info("livraison des messages composés hors ligne", "n", len(e.chatQueue))
+	for _, text := range e.chatQueue {
+		e.queueLocked(protocol.TypeChat, protocol.Chat{Text: text})
+	}
+	e.chatQueue = nil
 }
 
 // Play demande la lecture (action volontaire de l'utilisateur via l'UI).
@@ -542,17 +585,22 @@ func (e *Engine) userControl(act string, pos float64, usePos bool) {
 		e.log.Warn("position de control non finie, ignorée", "action", act)
 		return
 	}
-	pos = clampPosition(pos, e.durationLocked())
+	e.userControlLocked(act, clampPosition(pos, e.durationLocked()), now)
+	e.mu.Unlock()
+	e.flush()
+}
+
+// userControlLocked met un control en file et arme le hold post-action : les
+// corrections sont suspendues jusqu'à l'écho du serveur (roomState setBy = soi)
+// ou l'expiration. Toute émission volontaire de control passe par ici, y
+// compris la reprise « salle vierge ».
+func (e *Engine) userControlLocked(act string, pos float64, now time.Time) {
 	e.queueLocked(protocol.TypeControl, protocol.Control{Action: act, PositionSec: pos})
-	// Hold post-action : on suspend les corrections jusqu'à l'écho du serveur
-	// (roomState setBy = soi) ou l'expiration.
 	e.userHoldUntil = now.Add(UserHold)
 	e.pendingRS = nil
 	// Même raison que pour une action faite dans VLC : le seek (ou la
 	// transition) qui va suivre fige la position, ce n'est pas un buffering.
 	e.suspendBufferingLocked(now)
-	e.mu.Unlock()
-	e.flush()
 }
 
 // durationLocked est la durée du média courant, 0 si inconnue.
@@ -567,6 +615,15 @@ func (e *Engine) durationLocked() float64 {
 }
 
 func isFinite(v float64) bool { return !math.IsNaN(v) && !math.IsInf(v, 0) }
+
+// formatTimecode rend une position en HH:MM:SS (toasts de reprise).
+func formatTimecode(sec float64) string {
+	if !isFinite(sec) || sec < 0 {
+		sec = 0
+	}
+	total := int64(math.Round(sec))
+	return fmt.Sprintf("%02d:%02d:%02d", total/3600, total/60%60, total%60)
+}
 
 // clampPosition borne une position à [0, durée] (durée connue seulement).
 func clampPosition(pos, duration float64) float64 {

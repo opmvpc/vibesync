@@ -48,6 +48,14 @@ const (
 	// MinRate / MaxRate bornent le rate accepté dans un roomState (§Assainissement).
 	MinRate = 0.25
 	MaxRate = 4.0
+	// ChatQueueMax borne la file des messages de chat composés hors ligne : au
+	// delà, les plus anciens sont abandonnés (docs/protocol.md §Erreurs et
+	// robustesse, File d'attente hors ligne).
+	ChatQueueMax = 20
+	// VirginResumeSec : sur une salle vierge (jamais pilotée), un lecteur local
+	// au-delà de ce seuil déclenche UNE reprise `control seek` à sa position.
+	// En deçà, on considère que la séance n'avait pas commencé.
+	VirginResumeSec = 5.0
 
 	pingEvery   = 2 * time.Second
 	reportEvery = time.Second
@@ -114,7 +122,10 @@ type Snapshot struct {
 	ClockOffsetMs int64           `json:"clockOffsetMs"`
 	Retrying      bool            `json:"retrying"`
 	LastError     string          `json:"lastError"`
-	VLC           VLCSnapshot     `json:"vlc"`
+	// PendingChats est la file des messages composés hors ligne, dans l'ordre
+	// d'envoi : l'UI les affiche « en attente » jusqu'à la reconnexion.
+	PendingChats []string    `json:"pendingChats"`
+	VLC          VLCSnapshot `json:"vlc"`
 }
 
 // Types de messages moteur → UI (canal local /ui, cf.

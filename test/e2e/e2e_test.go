@@ -15,9 +15,11 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"net"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -76,6 +78,11 @@ func (c *skewClock) Advance(d time.Duration) {
 
 type recordingDialer struct {
 	inner client.Dialer
+	// resolve donne l'adresse du serveur au moment de composer. Le moteur, lui,
+	// garde l'URL reçue au Connect : cette indirection permet de redémarrer le
+	// httptest (forcément sur un autre port) sans que le client « sache » que
+	// l'adresse a changé — l'équivalent d'un serveur qui revient chez lui.
+	resolve func() string
 
 	mu    sync.Mutex
 	last  client.Conn
@@ -83,6 +90,9 @@ type recordingDialer struct {
 }
 
 func (d *recordingDialer) Dial(ctx context.Context, url string) (client.Conn, error) {
+	if d.resolve != nil {
+		url = d.resolve()
+	}
 	c, err := d.inner.Dial(ctx, url)
 	if err != nil {
 		return nil, err
@@ -164,6 +174,31 @@ func (p *peer) collect(events <-chan client.Event) {
 	}
 }
 
+// hasToastPrefix dit si un toast commence exactement par ce préfixe : sert à
+// distinguer la reprise décidée par le client (« Reprise à … ») de celle
+// annoncée par le serveur (« Séance reprise à … »).
+func (p *peer) hasToastPrefix(prefix string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, t := range p.toasts {
+		if strings.HasPrefix(t.text, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// chatTexts rend, dans l'ordre de réception, les messages de chat vus par ce pair.
+func (p *peer) chatTexts() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]string, 0, len(p.chats))
+	for _, c := range p.chats {
+		out = append(out, c.Text)
+	}
+	return out
+}
+
 // hasToast dit si un toast du niveau donné contenant substr a été reçu.
 func (p *peer) hasToast(level, substr string) bool {
 	p.mu.Lock()
@@ -195,7 +230,7 @@ func (p *peer) dials() int {
 // reconnect rouvre une session pour ce pair (même pseudo, même salle, même
 // jeton : le moteur le conserve pour toute la vie du processus).
 func (p *peer) reconnect() {
-	p.eng.Connect(client.ConnectRequest{URL: p.fx.url, Name: p.name, Room: p.fx.room})
+	p.eng.Connect(client.ConnectRequest{URL: p.fx.currentURL(), Name: p.name, Room: p.fx.room})
 }
 
 func (p *peer) ready() bool {
@@ -209,13 +244,49 @@ func (p *peer) ready() bool {
 
 // --- Fixture : serveur + pairs ---
 
+// trackingListener retient les connexions acceptées pour pouvoir les couper.
+// httptest.Server.Close() « oublie » les connexions hijackées — c'est le cas de
+// toutes les WebSocket — qui survivraient donc à l'arrêt du serveur : sans ça,
+// un redémarrage simulé passerait totalement inaperçu des clients.
+type trackingListener struct {
+	net.Listener
+	mu    sync.Mutex
+	conns []net.Conn
+}
+
+func (l *trackingListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	l.mu.Lock()
+	l.conns = append(l.conns, c)
+	l.mu.Unlock()
+	return c, nil
+}
+
+func (l *trackingListener) closeAll() {
+	l.mu.Lock()
+	conns := l.conns
+	l.conns = nil
+	l.mu.Unlock()
+	for _, c := range conns {
+		_ = c.Close()
+	}
+}
+
 type fixture struct {
 	t     *testing.T
-	url   string
 	room  string
 	start time.Time
 	// clock est l'horloge du serveur : sert à simuler une longue absence.
 	clock *skewClock
+	cfg   server.Config
+
+	srvMu sync.Mutex
+	ts    *httptest.Server
+	lis   *trackingListener
+	url   string
 
 	mu    sync.Mutex
 	peers []*peer
@@ -225,18 +296,58 @@ func newFixture(t *testing.T) *fixture { return newFixtureWith(t, server.Config{
 
 func newFixtureWith(t *testing.T, cfg server.Config) *fixture {
 	t.Helper()
-	clock := &skewClock{}
-	srv := server.New(cfg, server.WithLogger(quietLogger()), server.WithClock(clock))
-	ts := httptest.NewServer(srv.Handler())
-	t.Cleanup(ts.Close)
-	room := strings.NewReplacer("/", "-", " ", "-").Replace(t.Name())
-	return &fixture{
+	f := &fixture{
 		t:     t,
-		url:   "ws://" + strings.TrimPrefix(ts.URL, "http://") + "/ws",
-		room:  room,
+		room:  strings.NewReplacer("/", "-", " ", "-").Replace(t.Name()),
 		start: time.Now(),
-		clock: clock,
+		clock: &skewClock{},
+		cfg:   cfg,
 	}
+	f.startServer()
+	t.Cleanup(f.stopServer)
+	return f
+}
+
+// startServer démarre une instance neuve et publie son adresse.
+func (f *fixture) startServer() {
+	f.t.Helper()
+	srv := server.New(f.cfg, server.WithLogger(quietLogger()), server.WithClock(f.clock))
+	ts := httptest.NewUnstartedServer(srv.Handler())
+	lis := &trackingListener{Listener: ts.Listener}
+	ts.Listener = lis
+	ts.Start()
+
+	f.srvMu.Lock()
+	f.ts, f.lis = ts, lis
+	f.url = "ws://" + strings.TrimPrefix(ts.URL, "http://") + "/ws"
+	f.srvMu.Unlock()
+}
+
+func (f *fixture) stopServer() {
+	f.srvMu.Lock()
+	ts, lis := f.ts, f.lis
+	f.ts, f.lis = nil, nil
+	f.srvMu.Unlock()
+	if ts == nil {
+		return
+	}
+	ts.Close()
+	lis.closeAll()
+}
+
+// restartServer coupe le serveur et en démarre un neuf : salles perdues, état
+// oublié — exactement ce que fait un redéploiement Coolify.
+func (f *fixture) restartServer() {
+	f.t.Helper()
+	f.stopServer()
+	f.startServer()
+}
+
+// currentURL est l'adresse du serveur en cours (résolue à chaque dial).
+func (f *fixture) currentURL() string {
+	f.srvMu.Lock()
+	defer f.srvMu.Unlock()
+	return f.url
 }
 
 // newPeer branche un moteur complet sur son faux VLC et le connecte à la salle.
@@ -248,7 +359,7 @@ func (f *fixture) newPeer(name string, durationSec float64) *peer {
 	t.Cleanup(fake.Close)
 	fake.LoadFile("film.mkv", durationSec)
 
-	dialer := &recordingDialer{inner: client.WSDialer{}}
+	dialer := &recordingDialer{inner: client.WSDialer{}, resolve: f.currentURL}
 	eng := client.New(client.Config{
 		Dialer:  dialer,
 		Logger:  quietLogger(),
@@ -282,7 +393,7 @@ func (f *fixture) newPeer(name string, durationSec float64) *peer {
 	f.peers = append(f.peers, p)
 	f.mu.Unlock()
 
-	eng.Connect(client.ConnectRequest{URL: f.url, Name: name, Room: f.room})
+	eng.Connect(client.ConnectRequest{URL: f.currentURL(), Name: name, Room: f.room})
 	f.waitFor(name+" connecté", func() bool { return p.snap().Phase == client.PhaseConnected })
 
 	path := filepath.Join(t.TempDir(), "film.mkv")
@@ -735,6 +846,124 @@ func TestE2E(t *testing.T) {
 		f.waitUpTo(convergeTimeout, "les deux VLC sont recalés sur la séance retrouvée", func() bool {
 			return math.Abs(a.pos()-want) < 1 && math.Abs(b.pos()-want) < 1
 		})
+	})
+
+	// VS-024 (a) : le serveur disparaît en pleine séance (redéploiement Coolify)
+	// et revient tout neuf, sans mémoire des salles. Les lecteurs ne doivent ni
+	// s'arrêter ni repartir de zéro : le premier revenant propose sa position.
+	t.Run("11-redemarrage-du-serveur", func(t *testing.T) {
+		f := newFixture(t)
+		a, b := joinBoth(f, filmDuration, filmDuration)
+		markReady(f, a, b)
+		startPlayback(f, a, a, b)
+		// Au-delà du seuil de reprise : en deçà, la séance est considérée comme
+		// n'ayant pas commencé et le client se range derrière la salle vierge.
+		f.waitFor("la séance a dépassé le seuil de reprise", func() bool {
+			return a.pos() > client.VirginResumeSec+1 && b.pos() > client.VirginResumeSec+1
+		})
+		avant := a.pos()
+
+		f.restartServer()
+
+		// Tant que la connexion n'est pas revenue, VLC continue tout seul.
+		f.holds(300*time.Millisecond, "la lecture continue localement pendant la coupure",
+			func() bool {
+				if a.snap().Phase == client.PhaseConnected {
+					return true // déjà revenu : l'assertion ne s'applique plus
+				}
+				return a.vlcState() == "playing" && b.vlcState() == "playing"
+			})
+
+		f.waitFor("les deux clients sont revenus", func() bool {
+			return a.snap().Phase == client.PhaseConnected && b.snap().Phase == client.PhaseConnected &&
+				len(a.snap().Users) == 2 && len(b.snap().Users) == 2
+		})
+		f.waitFor("la séance est reprise là où elle en était", func() bool {
+			return a.snap().RoomPosition > avant && b.snap().RoomPosition > avant &&
+				math.Abs(a.snap().RoomPosition-b.snap().RoomPosition) < 1
+		})
+		if !a.hasToastPrefix("Reprise à ") && !b.hasToastPrefix("Reprise à ") {
+			t.Fatalf("aucun client n'a annoncé la reprise de la séance\n%s", f.dump())
+		}
+		f.waitUpTo(convergeTimeout, "les deux lecteurs sont recalés sur la séance reprise",
+			func() bool {
+				return math.Abs(a.pos()-a.snap().RoomPosition) < 1 &&
+					math.Abs(b.pos()-b.snap().RoomPosition) < 1
+			})
+		// Le ready survit au redémarrage : la salle neuve doit pouvoir repartir
+		// sans que personne ne reclique.
+		f.waitFor("les deux membres sont de nouveau prêts côté serveur", func() bool {
+			return a.ready() && b.ready()
+		})
+		f.holds(time.Second, "aucun lecteur n'est revenu au début", func() bool {
+			return a.pos() > avant-driftMax && b.pos() > avant-driftMax
+		})
+	})
+
+	// VS-024 (b) : ce qu'on écrit pendant une coupure part au retour, dans l'ordre.
+	t.Run("12-chat-compose-hors-ligne", func(t *testing.T) {
+		f := newFixture(t)
+		a, b := joinBoth(f, filmDuration, filmDuration)
+
+		b.eng.Disconnect()
+		f.waitFor("B est hors ligne", func() bool { return b.snap().Phase == client.PhaseIdle })
+
+		envoyes := []string{"je perds la connexion", "vous m'entendez ?", "je reviens"}
+		for _, msg := range envoyes {
+			b.eng.Chat(msg)
+		}
+		if got := b.snap().PendingChats; len(got) != len(envoyes) {
+			t.Fatalf("file « en attente » = %v, attendu %v\n%s", got, envoyes, f.dump())
+		}
+		f.holds(400*time.Millisecond, "rien n'arrive à A tant que B est hors ligne", func() bool {
+			return len(a.chatTexts()) == 0
+		})
+
+		b.reconnect()
+		f.waitFor("A a reçu les trois messages", func() bool { return len(a.chatTexts()) >= 3 })
+		if got := a.chatTexts(); !slices.Equal(got, envoyes) {
+			t.Fatalf("messages reçus %v, attendus %v (dans l'ordre)\n%s", got, envoyes, f.dump())
+		}
+		if got := b.snap().PendingChats; len(got) != 0 {
+			t.Fatalf("file non vidée après la reconnexion: %v", got)
+		}
+	})
+
+	// VS-024 (c) : le serveur est vivant, c'est la connexion du client qui
+	// flanche. À son retour il se cale sur la salle — et surtout il ne lui
+	// impose pas son propre timecode.
+	t.Run("13-coupure-client-sans-ecrasement", func(t *testing.T) {
+		f := newFixture(t)
+		a := f.newPeer("alice", filmDuration)
+		markReady(f, a)
+		startPlayback(f, a, a)
+		f.waitFor("lecture engagée", func() bool { return a.pos() > 2 })
+
+		a.eng.Disconnect()
+		f.waitFor("A est hors ligne", func() bool { return a.snap().Phase == client.PhaseIdle })
+		// La salle a figé la séance à ce moment-là ; VLC, lui, continue.
+		fige := a.pos()
+		f.holds(1500*time.Millisecond, "VLC continue de jouer hors ligne", func() bool {
+			return a.vlcState() == "playing"
+		})
+		if a.pos() <= fige {
+			t.Fatalf("le lecteur n'avance plus hors ligne (%v)\n%s", a.pos(), f.dump())
+		}
+		// Trente secondes d'absence côté serveur.
+		f.clock.Advance(30 * time.Second)
+
+		a.reconnect()
+		f.waitFor("A est revenu", func() bool { return a.snap().Phase == client.PhaseConnected })
+		f.waitUpTo(convergeTimeout, "A s'est recalé sur la séance conservée", func() bool {
+			return math.Abs(a.pos()-fige) < 1.5 && a.vlcState() == "paused"
+		})
+		if got := a.snap().RoomPosition; math.Abs(got-fige) > 1 {
+			t.Fatalf("la salle a été écrasée : position %.2f, séance figée à %.2f\n%s",
+				got, fige, f.dump())
+		}
+		if a.hasToastPrefix("Reprise à ") {
+			t.Fatalf("reprise « salle vierge » émise alors que la salle avait sa séance\n%s", f.dump())
+		}
 	})
 
 	t.Run("07-fichiers-de-durees-differentes", func(t *testing.T) {

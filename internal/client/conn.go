@@ -175,8 +175,14 @@ func (e *Engine) handleRaw(raw []byte) (string, bool) {
 			e.holdUntil = time.Time{}
 			e.nudging = false
 			e.applyRoomStateLocked(w.State, now)
-			e.readyFromUsersLocked()
-			// Re-déclarer notre état après un (re)join.
+			// Volontairement pas de readyFromUsersLocked ici : le serveur vient
+			// de nous créer un membre neuf, donc « pas prêt ». C'est notre état
+			// local qui fait foi au (re)join — sinon toute reconnexion (et tout
+			// redémarrage du serveur) effacerait le ready de l'utilisateur.
+			// Le broadcast `users` qui suit notre setReady nous resynchronisera.
+			// Re-déclarer systématiquement notre état après un (re)join : ni
+			// setFile ni setReady ne sont mis en file, c'est l'état courant qui
+			// fait foi (docs/protocol.md §File d'attente hors ligne).
 			if e.fileInfo != nil {
 				e.queueLocked(protocol.TypeSetFile, protocol.SetFile{
 					Name:        e.fileInfo.Name,
@@ -187,6 +193,12 @@ func (e *Engine) handleRaw(raw []byte) (string, bool) {
 			e.queueLocked(protocol.TypeSetReady, protocol.SetReady{Ready: e.ready})
 			e.queueLocked(protocol.TypePing, protocol.Ping{T: now.UnixMilli()})
 			e.lastPing = now
+			// Salle vierge : proposer notre position avant tout alignement.
+			if t := e.virginResumeLocked(w.State, now); t != nil {
+				events = append(events, Event{Kind: EventToast, Toast: t})
+			}
+			// Les chats composés hors ligne partent maintenant, dans l'ordre.
+			e.flushChatQueueLocked()
 		} else {
 			e.log.Debug("welcome illisible", "err", err)
 		}
@@ -307,6 +319,31 @@ func sanitizeRoomState(rs protocol.RoomState) (protocol.RoomState, bool) {
 		return rs, false
 	}
 	return rs, true
+}
+
+// virginResumeLocked traite le cas « salle vierge » (docs/protocol.md §Erreurs
+// et robustesse) : un welcome montrant une salle qui n'a jamais reçu de control
+// (`setBy` vide, position 0) alors que notre lecteur est au-delà de
+// VirginResumeSec signifie que le serveur a perdu la séance — typiquement un
+// redémarrage (auto-deploy). Plutôt que de se laisser ramener à 0, le client
+// propose sa propre position par UN control seek.
+//
+// C'est un control comme un autre : il arme le hold post-action, ce qui suspend
+// l'alignement sur l'état vierge jusqu'à l'écho du serveur. Une seule reprise
+// par connexion, puisqu'il n'y a qu'un welcome par session. Si un autre client
+// a été plus rapide, `setBy` n'est plus vide et on se range simplement derrière
+// lui : le dernier revenant gagne, et leurs positions sont quasi identiques.
+func (e *Engine) virginResumeLocked(rs protocol.RoomState, now time.Time) *protocol.Toast {
+	if rs.SetBy != "" || rs.PositionSec != 0 {
+		return nil
+	}
+	if !e.haveStatus || !e.status.Loaded() || e.status.PositionSec <= VirginResumeSec {
+		return nil
+	}
+	pos := clampPosition(e.status.PositionSec, e.durationLocked())
+	e.userControlLocked(protocol.ActionSeek, pos, now)
+	e.log.Info("salle vierge : reprise proposée au serveur", "positionSec", pos)
+	return &protocol.Toast{Level: protocol.LevelInfo, Text: "Reprise à " + formatTimecode(pos)}
 }
 
 // versionToastLocked enregistre ce que le serveur dit de lui-même et, s'il

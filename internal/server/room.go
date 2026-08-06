@@ -279,14 +279,18 @@ func (r *Room) leave(m *member) bool {
 			break
 		}
 	}
+	now := r.clock.Now()
 	if idx < 0 {
 		// Membre déjà retiré : reprise de session (le zombie ne provoque ni
 		// toast de départ ni pause automatique) ou double leave.
-		return len(r.members) == 0
+		if len(r.members) == 0 {
+			r.freezeLocked(now)
+			return true
+		}
+		return false
 	}
 	r.members = append(r.members[:idx:idx], r.members[idx+1:]...)
 
-	now := r.clock.Now()
 	r.broadcastLocked(protocol.TypeToast, protocol.Toast{
 		Level: protocol.LevelInfo,
 		Text:  fmt.Sprintf("%s a quitté la salle", m.name),
@@ -296,19 +300,22 @@ func (r *Room) leave(m *member) bool {
 	}
 	r.broadcastUsersLocked(now)
 	r.log.Info("membre parti", "room", r.name, "user", m.id, "restants", len(r.members))
-	return len(r.members) == 0
-}
-
-// markEmpty fait entrer une salle qui vient de se vider en « linger » : la
-// séance est gelée à sa position courante, en pause, et l'instant est noté pour
-// le ramasse-miettes du hub (§Modèle, VS-021). Renvoie false si un membre est
-// arrivé entre-temps — la salle reste vivante et rien n'est touché.
-func (r *Room) markEmpty(now time.Time) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	if len(r.members) > 0 {
 		return false
 	}
+	// Dernier parti : la séance est gelée ici même, à l'instant du départ.
+	r.freezeLocked(now)
+	return true
+}
+
+// freezeLocked fait entrer en « linger » une salle qui vient de se vider : la
+// séance est gelée à sa position courante, en pause, et l'instant du départ est
+// noté pour le ramasse-miettes du hub (§Modèle, VS-021).
+//
+// Appelé depuis leave, sous le verrou de la salle et dans le même geste que le
+// retrait du dernier membre : le gel doit dater de l'instant exact du départ,
+// pas de celui où le hub s'en aperçoit.
+func (r *Room) freezeLocked(now time.Time) {
 	if !r.state.Paused {
 		// Personne ne regarde plus : sans ce gel, la position de référence
 		// continuerait de courir et la reprise retomberait n'importe où.
@@ -321,6 +328,21 @@ func (r *Room) markEmpty(now time.Time) bool {
 	if r.emptySince.IsZero() {
 		// Idempotent : la fin d'agonie d'une connexion zombie ne doit pas
 		// repousser la fin de la fenêtre de reprise.
+		r.emptySince = now
+	}
+}
+
+// markEmpty confirme, sous le verrou du hub, que la salle est toujours vide et
+// bien en attente de reprise. Renvoie false si quelqu'un est arrivé entre-temps.
+func (r *Room) markEmpty(now time.Time) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.members) > 0 {
+		return false
+	}
+	// Filet : une salle qui n'a jamais eu de membre n'est jamais passée par
+	// leave et n'a donc pas d'instant de départ.
+	if r.emptySince.IsZero() {
 		r.emptySince = now
 	}
 	return true

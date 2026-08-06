@@ -216,6 +216,30 @@ func (b *vecBuilder) event(msgType string, data any) {
 	b.rec.drain()
 }
 
+// eventKeep consigne un message serveur SANS vider la file d'envoi : ce que le
+// moteur émet en réaction immédiate apparaît alors dans le premier pas de trace
+// qui suit. Réservé aux scénarios dont la réaction au message EST la règle
+// testée (reprise « salle vierge »).
+func (b *vecBuilder) eventKeep(msgType string, data any) {
+	raw, err := json.Marshal(data)
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	b.vec.Events = append(b.vec.Events, vectorEvent{AtMs: b.atMs(), Type: msgType, Data: raw})
+	b.h.server(msgType, data)
+}
+
+// welcomeKeep injecte un welcome (et son pong) en gardant les messages émis en
+// réaction, cf. eventKeep.
+func (b *vecBuilder) welcomeKeep(state protocol.RoomState) {
+	b.eventKeep(protocol.TypeWelcome, protocol.Welcome{
+		SelfID: "u1", Room: "salon", State: state,
+		Users: []protocol.User{{ID: "u1", Name: "thib"}},
+	})
+	now := b.h.clock.Now().UnixMilli()
+	b.eventKeep(protocol.TypePong, protocol.Pong{T: now, ServerMs: now})
+}
+
 // welcome injecte un welcome puis le pong qui débloque les corrections.
 func (b *vecBuilder) welcome(state protocol.RoomState) {
 	b.event(protocol.TypeWelcome, protocol.Welcome{
@@ -478,6 +502,43 @@ func TestVectors(t *testing.T) {
 	b.welcome(b.h.playing(1500))
 	b.run(5)
 	b.check()
+
+	// 13. Salle vierge : le serveur est revenu tout neuf (redémarrage) et ne
+	// connaît plus la séance. Le client propose sa propre position par UNE
+	// reprise `control seek` ; le hold post-action empêche l'alignement sur la
+	// position 0 de la salle vierge, puis l'écho du serveur adopte la reprise.
+	b = newVecBuilder(t, vecSetup{
+		name: "13-reprise-salle-vierge", file: "ep1.mkv", durationSec: 7200,
+		positionSec: 1800, playing: true,
+		description: "Le serveur redémarre : welcome d'une salle vierge (setBy vide, " +
+			"position 0) alors que VLC est loin dans le film. Le client émet UNE " +
+			"reprise control seek à sa position au lieu de se laisser ramener à 0, " +
+			"puis adopte l'écho du serveur.",
+	})
+	b.welcome(b.h.playing(1800))
+	b.run(4)
+	b.sessionLost()
+	b.wait(5 * time.Second)
+	b.run(3)
+	// Le serveur revient : salle jamais pilotée. La trace garde ici les messages
+	// émis en réaction au welcome — la reprise en fait partie.
+	b.welcomeKeep(protocol.RoomState{Paused: true, PositionSec: 0, Rate: 1, RefServerMs: 1})
+	b.run(6)
+	// Le serveur applique la reprise et la renvoie en écho (setBy = nous).
+	reprise := b.h.paused(b.vlcPosition())
+	reprise.SetBy = "u1"
+	b.event(protocol.TypeRoomState, reprise)
+	b.run(4)
+	b.check()
+}
+
+// vlcPosition est la dernière position de VLC observée par le moteur : sert à
+// fabriquer un écho serveur cohérent avec la reprise que le client vient
+// d'émettre.
+func (b *vecBuilder) vlcPosition() float64 {
+	b.h.e.mu.Lock()
+	defer b.h.e.mu.Unlock()
+	return round3(b.h.e.status.PositionSec)
 }
 
 // TestVectorsGoldenComplets vérifie la forme des fichiers committés.
@@ -486,8 +547,8 @@ func TestVectorsGoldenComplets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(files) < 12 {
-		t.Fatalf("%d vecteurs golden, attendu au moins 12", len(files))
+	if len(files) < 13 {
+		t.Fatalf("%d vecteurs golden, attendu au moins 13", len(files))
 	}
 	for _, f := range files {
 		raw, err := os.ReadFile(f)

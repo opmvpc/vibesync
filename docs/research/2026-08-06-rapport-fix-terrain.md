@@ -44,3 +44,40 @@ jamais de bannière) → toast info. Injection vérifiée (`version=0.2.0`).
 
 **QA** : build, vet, gofmt, staticcheck, `-count=2 -shuffle=on` trois fois verts.
 Aucun vecteur impacté.
+
+## VS-024 — robustesse des déconnexions
+
+**File hors ligne.** `Engine.chatQueue` (20 max, plus anciens abandonnés)
+alimentée quand `conn == nil || phase != connected`, vidée dans l'ordre au
+welcome. Elle survit à `invalidateReferenceLocked`, contrairement à `outbox` —
+c'est ce qui garantit que control, ready, report et ping ne sont jamais rejoués.
+`Snapshot.PendingChats` expose la file à l'UI.
+
+**Bug trouvé en chemin :** le welcome appelait `readyFromUsersLocked`, or le
+serveur vient d'y créer un membre neuf donc « pas prêt » — toute reconnexion
+(et donc tout redéploiement) effaçait le ready. Supprimé : au (re)join c'est
+l'état local qui est re-déclaré, le broadcast `users` resynchronise ensuite.
+
+**Alignement sans control.** Déjà garanti par la grâce + la mise à jour de
+`expect` à chaque poll ; c'était une supposition, c'est désormais un test
+(welcome à +1200 s → seek local, zéro control) et c'était déjà visible dans le
+golden 12.
+
+**Salle vierge.** `virginResumeLocked` (setBy vide, position 0, VLC > 5 s) émet
+UNE reprise `control seek` via `userControlLocked` — donc avec le hold, qui est
+exactement ce qui empêche l'alignement sur la position 0. Un client plus lent
+voit `setBy` renseigné et se range : testé. Nouveau vecteur
+`13-reprise-salle-vierge` (aucun des 12 autres n'a bougé) ; il a fallu un
+`eventKeep` pour que la réaction immédiate au welcome entre dans la trace.
+
+**Bug trouvé en chemin (2) :** le gel d'une salle qui se vide se faisait en deux
+temps (retrait du membre, puis `markEmpty` sous le verrou du hub). Un saut
+d'horloge entre les deux figeait la séance 2 min trop loin — flake reproduit en
+`-shuffle=on`. Le gel est maintenant dans `Room.leave`, atomique avec le
+retrait ; test de non-régression dédié.
+
+**E2e** : `11-redemarrage-du-serveur` (vérifié rouge sans la reprise vierge),
+`12-chat-compose-hors-ligne` (rouge sans la file), `13-coupure-client-sans-
+ecrasement`. Le harnais sait désormais redémarrer le serveur : `trackingListener`
+coupe les connexions hijackées, que `httptest.Close` oublie, et le dialer résout
+l'adresse à chaque tentative.
