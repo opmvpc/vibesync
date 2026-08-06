@@ -1,7 +1,7 @@
 ---
 id: VS-024
 titre: Robustesse déconnexions — file de chat hors ligne, reconnexion sans écrasement, salle vierge
-statut: ouvert
+statut: terminé
 priorité: haute
 dépend-de: [VS-017, VS-021]
 créé: 2026-08-06
@@ -29,8 +29,8 @@ le cas « salle vierge » est fréquent en pratique.
 - [x] Vecteurs : nouveaux scénarios si le moteur pur est concerné (alignement
       sans control, reprise vierge) — vecteurs 12 et 13 ; le 13 en cours de
       régénération (champ `keepOutput`, état initial complet, écho exact)
-- [ ] Port C (engine.c + ui) **livré** (1d5a4ad) — reste la validation contre le
-      vecteur 13 régénéré + règles resserrées terra ; Swift au polissage Mac
+- [x] Port C (engine.c + ui) livré (1d5a4ad) puis validé contre le vecteur 13
+      régénéré + règles resserrées terra (3a70fa0, 13/13) ; Swift au polissage Mac
 - [x] UI : indicateur clair « hors ligne, reconnexion... » + chat marqué
       « en attente » pour les messages en file (C : file rendue en gris sous
       l'historique, jamais dedans — évite les doublons à l'écho serveur)
@@ -44,3 +44,6 @@ le cas « salle vierge » est fréquent en pratique.
   via emit_user_control, + fix d'un bug miroir du Go (ready effacé à chaque
   reconnexion). Bloquant vecteur 13 identifié : le format golden n'encodait pas
   la convention event/eventKeep → champ `keepOutput` demandé au générateur.
+- 2026-08-06 : resserrages Go livrés (c811207), vecteur 13 régénéré (keepOutput,
+  scenario, écho exact 1800.8), port C aligné (3a70fa0) — 13/13 des deux côtés,
+  CI verte. Dans v0.2.0. Terminé (reliquat Swift → VS-015).

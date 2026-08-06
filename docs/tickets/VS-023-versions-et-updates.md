@@ -1,7 +1,7 @@
 ---
 id: VS-023
 titre: Versions visibles + notification de nouvelle release (simple)
-statut: ouvert
+statut: terminé
 priorité: haute
 dépend-de: []
 créé: 2026-08-06
@@ -19,16 +19,19 @@ fichier `VERSION` à la racine, injecté au build (ldflags Go, -D en C, plist Sw
 
 ## Critères d'acceptation
 
-- [ ] `VERSION` racine + injection : Dockerfile (ldflags), build.bat (-D), à venir mac
-- [ ] Spec + protocol.go : `Welcome.serverVersion`, `Welcome.downloadUrl`
+- [x] `VERSION` racine + injection : Dockerfile (ldflags), build.bat (-D), à venir mac
+- [x] Spec + protocol.go : `Welcome.serverVersion`, `Welcome.downloadUrl`
       (env `VIBESYNC_DOWNLOAD_URL`, défaut releases GitHub) — champs additifs
-- [ ] Serveur : version dans le log de démarrage et dans le welcome
-- [ ] Client C : version affichée (connexion + salle), comparaison semver simple,
+- [x] Serveur : version dans le log de démarrage et dans le welcome
+- [x] Client C : version affichée (connexion + salle), comparaison semver simple,
       bannière cliquable (ShellExecute) si serveur plus récent, non bloquante
-- [ ] Client Go de référence : même logique (toast), pour les tests
-- [ ] Question ouverte à trancher par Thibault : repo public vs distribution de
-      l'exe par le serveur (`/download`) — le lien des guides dépend de la réponse
+- [x] Client Go de référence : même logique (toast), pour les tests — fix review
+      terra : version injectée par ldflags dans cmd/vibesync (+ --version),
+      NewerVersion ordonne les pré-releases (1.2.3-rc1 < 1.2.3)
+- [x] Question tranchée : repo public → lien des guides = releases GitHub
 
 ## Journal du ticket
 
 - 2026-08-06 : créé.
+- 2026-08-06 : livré, puis fix terra n°5 (c811207) : le client livré ne recevait
+  jamais sa version. Dans v0.2.0. Terminé (injection mac au polissage Swift).

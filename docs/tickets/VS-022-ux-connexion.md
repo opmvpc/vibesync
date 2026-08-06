@@ -1,7 +1,7 @@
 ---
 id: VS-022
 titre: UX de connexion — adresses intelligentes, erreurs actionnables, pas de retry sur mdp
-statut: ouvert
+statut: terminé
 priorité: haute
 dépend-de: [VS-018]
 créé: 2026-08-06
@@ -37,3 +37,6 @@ corriger les champs sans relancer l'exe.
 ## Journal du ticket
 
 - 2026-08-06 : créé (retour terrain avec capture ws:// en boucle).
+- 2026-08-06 : livré côté C (machine à états conn IDLE/TRYING/WAITING/OPEN/REFUSED,
+  testeur healthz, erreurs fatales sans retry avec retour au formulaire, messages
+  actionnables). Tous les critères cochés au rendu de l'agent. Dans v0.2.0. Terminé.

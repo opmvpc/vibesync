@@ -1,7 +1,7 @@
 ---
 id: VS-025
 titre: Mémoriser le mot de passe serveur, chiffré par l'OS (DPAPI / Keychain)
-statut: ouvert
+statut: terminé
 priorité: haute
 dépend-de: [VS-022]
 créé: 2026-08-06
@@ -16,16 +16,18 @@ maison.
 
 ## Critères d'acceptation
 
-- [ ] Windows : DPAPI (`CryptProtectData`/`CryptUnprotectData`, crypt32, entropie
+- [x] Windows : DPAPI (`CryptProtectData`/`CryptUnprotectData`, crypt32, entropie
       applicative fixe) → blob hex dans vibesync.ini (`password_enc=`) ; jamais de
       clair écrit ; case « Se souvenir du mot de passe » (cochée par défaut) sur
       l'écran de connexion ; déchiffrement au chargement, champ prérempli masqué ;
       blob invalide/autre machine → champ vide sans erreur bruyante
-- [ ] La valeur en mémoire est effacée (SecureZeroMemory) quand elle n'est plus utile
-- [ ] Tests : round-trip DPAPI, blob corrompu, ini sans entrée, migration d'un ini
+- [x] La valeur en mémoire est effacée (SecureZeroMemory) quand elle n'est plus utile
+- [x] Tests : round-trip DPAPI, blob corrompu, ini sans entrée, migration d'un ini
       existant
-- [ ] macOS (au polissage Swift) : Keychain Services, même UX
+- [ ] macOS (au polissage Swift) : Keychain Services, même UX → suivi via VS-015
 
 ## Journal du ticket
 
 - 2026-08-06 : créé.
+- 2026-08-06 : livré côté Windows (secret.c, DPAPI). Dans v0.2.0. Terminé
+  (Keychain mac au polissage Swift, VS-015).
