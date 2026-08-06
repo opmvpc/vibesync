@@ -133,6 +133,11 @@ type Welcome struct {
 	Room   string    `json:"room"`
 	State  RoomState `json:"state"`
 	Users  []User    `json:"users"`
+	// ServerVersion est la version applicative du serveur (semver, fichier
+	// VERSION du repo). Si elle est plus récente que celle du client, celui-ci
+	// affiche une invitation non bloquante à télécharger DownloadURL.
+	ServerVersion string `json:"serverVersion,omitempty"`
+	DownloadURL   string `json:"downloadUrl,omitempty"`
 }
 
 type Pong struct {

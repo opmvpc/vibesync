@@ -44,7 +44,7 @@ Source de vérité du protocole client↔serveur. Les types Go correspondants vi
 
 | type | data | notes |
 |---|---|---|
-| `welcome` | `{selfId, room, state, users[]}` | réponse au `hello` |
+| `welcome` | `{selfId, room, state, users[], serverVersion, downloadUrl?}` | réponse au `hello` ; `serverVersion` = version applicative du serveur (semver, fichier `VERSION` du repo), `downloadUrl` = où télécharger les clients (env `VIBESYNC_DOWNLOAD_URL`). Client : si `serverVersion` > sa propre version (comparaison semver numérique), afficher une invitation non bloquante à télécharger — le garde-fou dur reste la version de protocole du `hello` |
 | `pong` | `{t, serverMs}` | echo du `t` client ; sert à l'offset d'horloge |
 | `roomState` | `{paused, positionSec, rate, refServerMs, setBy}` | broadcast à chaque changement |
 | `users` | `{users: [{id, name, ready, file?, positionSec, latencyMs}]}` | broadcast à chaque changement |
