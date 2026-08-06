@@ -9,6 +9,22 @@
 // initial optionnel, un suffixe de pré-release (`-rc1`) et des métadonnées de
 // build (`+sha`). Les composants absents valent 0. Tout le reste (« dev », vide,
 // texte) est illisible : dans le doute, on ne dit rien.
+//
+// VS-033 (phase 4 d'ADR-010) — POURQUOI CE FICHIER N'A PAS BASCULÉ SUR LE C.
+// La couche commune a bien une comparaison de versions, `proto_semver_cmp`
+// (core/src/protocol.c), et c'est elle que le client Windows appelle sans autre
+// précaution (main.c, on_server_message). Elle est plus SIMPLE que ce port de
+// internal/client/version.go : elle ne rogne pas les espaces, n'a pas de notion
+// d'illisibilité (« dev », vide, texte → 0.0.0) et ignore les suffixes de
+// pré-version. Sur les 35 cas de testNewerVersion, 9 divergent — dans les deux
+// sens : bannière indue quand notre propre version est illisible (« dev » →
+// 0.0.0, donc TOUT serveur numéroté paraît plus récent), bannière manquante
+// quand la version du serveur porte un espace de tête. Basculer aurait exigé de
+// réécrire 9 attentes de test pour un comportement moins bon ; le point est
+// remonté tel quel (rapport VS-033) parce que l'écart est CELUI DE WINDOWS, pas
+// celui de macOS : c'est le C commun qu'il faut corriger, pour les deux clients
+// à la fois. `AppVersion.current` (lecture de l'Info.plist) resterait de toute
+// façon ici : c'est de la plateforme.
 
 import Foundation
 

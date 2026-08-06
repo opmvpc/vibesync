@@ -157,7 +157,11 @@ final class VectorsTests: XCTestCase {
                 case "userSeek":
                     fake.seek(JSON.number(data, "positionSec", 0), now)
                 default:
-                    switch Proto.fill(type: type, data: data) {
+                    // Depuis VS-033 le décodage EST celui du C : l'événement du
+                    // vecteur est ré-enveloppé en {type, data} et repasse par
+                    // proto_decode, c'est-à-dire le chemin exact que suit un
+                    // message venu du serveur.
+                    switch decodeEvent(type: type, data: data) {
                     case .welcome(let w):
                         pending += engine.onWelcome(now: now,
                                                     selfId: w.selfId,
@@ -214,6 +218,22 @@ final class VectorsTests: XCTestCase {
                 fake.apply(cmd, now)
             }
         }
+    }
+
+    // MARK: - Événements du vecteur
+
+    /// Ré-enveloppe un événement de vecteur ({type, data} sans enveloppe) et le
+    /// fait analyser par le protocole commun. Un événement que le C refuserait
+    /// (champ obligatoire manquant) doit faire échouer le rejeu, pas passer
+    /// inaperçu : c'est exactement ce que verrait le client Windows.
+    private func decodeEvent(type: String, data: [String: Any]?) -> ServerMessage {
+        let envelope: [String: Any] = ["type": type, "data": data ?? [:]]
+        guard let raw = try? JSONSerialization.data(withJSONObject: envelope, options: []),
+              let message = Proto.decode(String(decoding: raw, as: UTF8.self)) else {
+            XCTFail("événement « \(type) » refusé par proto_decode")
+            return .unknown(type: type)
+        }
+        return message
     }
 
     // MARK: - Comparaisons

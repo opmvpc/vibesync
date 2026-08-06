@@ -1,21 +1,32 @@
-// MediaLibrary.swift — retrouver chez soi le fichier qu'un participant regarde
-// (VS-026). Port de core/src/media_core.c.
+// MediaLibrary.swift — frontière Swift ↔ recherche de médias commune
+// (VS-026 pour la fonction, ADR-010 phase 4 pour la bascule).
 //
-// Aucun changement de protocole : les noms de fichiers circulent déjà par
-// `setFile`/`users`. On cherche le nom EXACT (comparaison insensible à la
-// casse) dans les dossiers configurés, récursivement, avec des bornes dures :
-// une arborescence pathologique ne doit ni bloquer l'interface ni tourner
-// indéfiniment. À nom égal, le plus gros fichier gagne (heuristique : c'est la
-// version, pas l'extrait) — et on la trace pour pouvoir la contester.
+// L'algorithme borné — descente récursive limitée en profondeur ET en nombre
+// d'entrées, liens jamais suivis, homonyme le plus gros retenu — n'existe plus
+// qu'une fois : `media_find_with` (core/src/media_core.c), au-dessus de la
+// primitive de parcours de la plateforme (`vs_dir_ops`, core/posix/
+// media_posix.c : opendir/readdir, lstat, comparaison de noms NFC insensible à
+// la casse). Il ne reste ici que le passage sur un thread de travail et la
+// conversion du résultat.
+//
+// Deux choses que le C apporte et que le parcours Foundation retiré n'avait pas
+// (les deux valaient déjà pour le client Windows) :
+//   - les dossiers CACHÉS sont explorés (`FileManager` les sautait) : un média
+//     rangé sous un dossier commençant par un point se retrouve maintenant ;
+//   - le nombre d'entrées visitées est celui de `readdir` brut, « . » et « .. »
+//     compris, donc comparable à celui de `FindFirstFileW` sous Windows.
 
 import Foundation
+import VSCore
 
 public enum MediaLibrary {
 
     /// Profondeur maximale explorée sous un dossier configuré.
-    public static let maxDepth = 6
+    public static let maxDepth = Int(MEDIA_MAX_DEPTH)
     /// Nombre maximal d'entrées visitées, toutes racines confondues.
-    public static let maxEntries = 50_000
+    public static let maxEntries = Int(MEDIA_MAX_ENTRIES)
+    /// Nombre de dossiers racines pris en compte (borne du C commun).
+    public static let maxDirs = Int(MEDIA_MAX_DIRS)
 
     public struct Result {
         public var found: Bool = false
@@ -38,53 +49,38 @@ public enum MediaLibrary {
         if needle.isEmpty || dirs.isEmpty {
             return out
         }
-        let fm = FileManager.default
-        let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey, .fileSizeKey, .nameKey]
 
-        for dir in dirs {
-            if out.truncated {
-                break
+        var roots = [StrBuf](repeating: StrBuf(), count: maxDirs)
+        var count = 0
+        for dir in dirs where count < maxDirs {
+            if dir.isEmpty {
+                continue
             }
-            let root = URL(fileURLWithPath: dir, isDirectory: true)
-            guard let walker = fm.enumerator(at: root,
-                                             includingPropertiesForKeys: keys,
-                                             options: [.skipsHiddenFiles],
-                                             errorHandler: { _, _ in true }) else {
-                continue  // dossier illisible : on passe, ce n'est pas une erreur
+            var buf = StrBuf()
+            withStr8(dir) { strbuf_set(&buf, $0) }
+            roots[count] = buf
+            count += 1
+        }
+        if count == 0 {
+            return out
+        }
+
+        // Arène DÉDIÉE : la recherche peut durer des secondes sur un volume
+        // réseau, elle ne doit pas retenir l'arène partagée des appels courts
+        // (protocole, statut VLC) que la file principale utilise pendant ce
+        // temps. 4 Mo, comme le thread de recherche du client Windows.
+        let scratch = Scratch(reserveBytes: 4 * 1024 * 1024)
+        scratch.use { arena in
+            var find = MediaFind()
+            withStr8(needle) { target in
+                _ = media_find_with(arena, vs_dir_ops(), &roots, count, target, &find)
             }
-            while let url = walker.nextObject() as? URL {
-                if out.visited >= maxEntries {
-                    out.truncated = true
-                    break
-                }
-                out.visited += 1
-                let values = try? url.resourceValues(forKeys: Set(keys))
-                // Liens symboliques ignorés : sans cela une boucle de
-                // répertoires ferait tourner la recherche jusqu'à la borne.
-                if values?.isSymbolicLink == true {
-                    walker.skipDescendants()
-                    continue
-                }
-                if values?.isDirectory == true {
-                    // `level` vaut 1 pour le contenu direct de la racine.
-                    if walker.level >= maxDepth {
-                        walker.skipDescendants()
-                    }
-                    continue
-                }
-                let entry = values?.name ?? url.lastPathComponent
-                if entry.compare(needle, options: .caseInsensitive) != .orderedSame {
-                    continue
-                }
-                out.matches += 1
-                let size = Int64(values?.fileSize ?? 0)
-                if out.found && size <= out.sizeBytes {
-                    continue
-                }
-                out.found = true
-                out.path = url.path
-                out.sizeBytes = size
-            }
+            out.found = find.found != 0
+            out.path = coreString(find.path)
+            out.sizeBytes = find.size_bytes
+            out.matches = Int(find.matches)
+            out.visited = Int(find.visited)
+            out.truncated = find.truncated != 0
         }
         return out
     }

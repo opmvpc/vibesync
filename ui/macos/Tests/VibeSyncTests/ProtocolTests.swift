@@ -1,6 +1,11 @@
 // ProtocolTests.swift — encodage/décodage du protocole et jeton de session.
 // Les charges utiles sont reprises de la référence Go et du harnais C
 // (core/tests/test_core.c §protocol).
+//
+// Depuis VS-033 (phase 4 d'ADR-010) tout ce qui est vérifié ici passe par
+// `core/src/protocol.c` : ce fichier ne teste plus une deuxième implémentation
+// du protocole, il teste la FRONTIÈRE (les conversions Swift ↔ C) et fige le
+// comportement du C commun tel que l'application le voit.
 
 import XCTest
 @testable import VibeSync
@@ -160,15 +165,44 @@ final class ProtocolTests: XCTestCase {
         XCTAssertNil(Proto.decode("{\"data\":{}}"))
         XCTAssertNil(Proto.decode("[]"))
         XCTAssertNil(Proto.decode(""))
+    }
 
-        // data absent : ne doit pas planter.
-        guard case .welcome(let w)? = Proto.decode("{\"type\":\"welcome\"}") else {
-            XCTFail("welcome sans data")
+    /// Lecture STRICTE (VS-033) : un type connu dont un champ obligatoire
+    /// manque ou est mal typé est invalidé et ignoré, au lieu de se remplir de
+    /// zéros silencieux. C'est la règle du C commun — donc déjà celle du client
+    /// Windows (on_server_message jette `m->invalid`), et ce que le décodage
+    /// Swift retiré ne faisait PAS : un `pong` vide devenait {t:0, serverMs:0}
+    /// et empoisonnait l'offset d'horloge.
+    func testDecodeRejectsIncompleteMessages() {
+        // welcome sans data / sans selfId / sans état de salle recevable.
+        XCTAssertNil(Proto.decode("{\"type\":\"welcome\"}"))
+        XCTAssertNil(Proto.decode("{\"type\":\"welcome\",\"data\":{\"room\":\"salon\"}}"))
+        XCTAssertNil(Proto.decode("{\"type\":\"welcome\",\"data\":{\"selfId\":\"u1\"}}"))
+
+        XCTAssertNil(Proto.decode("{\"type\":\"pong\",\"data\":{}}"))
+        XCTAssertNil(Proto.decode("{\"type\":\"pong\",\"data\":{\"t\":\"10\",\"serverMs\":20}}"))
+        XCTAssertNil(Proto.decode("{\"type\":\"pong\",\"data\":{\"t\":-1,\"serverMs\":20}}"))
+
+        // roomState en LECTURE sans référence : irrecevable (en pause, elle est
+        // facultative — c'est la règle de docs/protocol.md).
+        XCTAssertNil(Proto.decode("{\"type\":\"roomState\",\"data\":" +
+                                  "{\"paused\":false,\"positionSec\":1,\"rate\":1}}"))
+        XCTAssertNotNil(Proto.decode("{\"type\":\"roomState\",\"data\":" +
+                                     "{\"paused\":true,\"positionSec\":1,\"rate\":1}}"))
+
+        XCTAssertNil(Proto.decode("{\"type\":\"error\",\"data\":{\"text\":\"sans code\"}}"))
+        XCTAssertNil(Proto.decode("{\"type\":\"toast\",\"data\":{\"level\":\"warn\"}}"))
+        XCTAssertNil(Proto.decode("{\"type\":\"chatEvent\",\"data\":{\"from\":\"ami\"}}"))
+
+        // `users` reste tolérant : c'est un rafraîchissement d'affichage. Les
+        // entrées sans identifiant utilisable sont simplement écartées.
+        guard case .users(let list)? = Proto.decode(
+            "{\"type\":\"users\",\"data\":{\"users\":[{\"name\":\"sans id\"},{\"id\":\"u2\"}]}}") else {
+            XCTFail("users")
             return
         }
-        XCTAssertNil(w.state)
-        XCTAssertTrue(w.users.isEmpty)
-        XCTAssertTrue(w.serverVersion.isEmpty)
+        XCTAssertEqual(list.count, 1)
+        XCTAssertEqual(list[0].id, "u2")
     }
 
     // MARK: Assainissement du moteur
@@ -361,21 +395,23 @@ final class ProtocolTests: XCTestCase {
 
     // MARK: Écriture JSON
 
-    func testJSONWriterEscapes() {
-        let value = JSONVal.obj([
-            ("a", .str("guillemet \" antislash \\ saut\nligne\ttab")),
-            ("b", .num(0.95)),
-            ("c", .num(1200)),
-            ("d", .bool(false)),
-            ("e", .null),
-        ])
-        guard let back = JSON.object(JSON.parse(value.encoded)) else {
-            XCTFail("relecture impossible : \(value.encoded)")
+    /// Échappements de l'écrivain C (json.c) vus depuis l'application : ce qui
+    /// part sur le fil doit se relire à l'identique, y compris les caractères
+    /// que JSON interdit en clair.
+    func testEncoderEscapes() {
+        let hostile = "guillemet \" antislash \\ saut\nligne\ttab \u{0001} 😀"
+        let raw = Proto.encode(.chat(text: hostile))
+        guard let back = JSON.child(JSON.object(JSON.parse(raw)), "data") else {
+            XCTFail("relecture impossible : \(raw)")
             return
         }
-        XCTAssertEqual(JSON.string(back, "a"), "guillemet \" antislash \\ saut\nligne\ttab")
-        XCTAssertEqual(JSON.number(back, "b"), 0.95)
-        XCTAssertEqual(JSON.number(back, "c"), 1200)
-        XCTAssertFalse(JSON.bool(back, "d", true))
+        XCTAssertEqual(JSON.string(back, "text"), hostile)
+
+        // Nombres : la représentation la plus courte qui relit la même valeur,
+        // et un entier reste un entier (1200, pas 1200.0).
+        let file = Proto.encode(.setFile(name: "x", durationSec: 1200, sizeBytes: 15))
+        XCTAssertTrue(file.contains("\"durationSec\":1200,"), file)
+        let report = Proto.encode(.report(positionSec: 0.95, paused: false, buffering: false))
+        XCTAssertTrue(report.contains("\"positionSec\":0.95,"), report)
     }
 }

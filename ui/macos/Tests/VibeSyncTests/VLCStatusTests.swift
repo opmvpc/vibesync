@@ -1,5 +1,9 @@
 // VLCStatusTests.swift — parsing et assainissement de /requests/status.json.
 // Mêmes cas que internal/vlc/http_test.go et que le harnais C §vlc.
+//
+// Depuis VS-033 (phase 4 d'ADR-010) le parsing EST celui du C commun
+// (vlc_parse_status + json.c) : ces cas n'ont pas bougé d'une virgule à la
+// bascule — le port Swift retiré en était la copie exacte.
 
 import XCTest
 @testable import VibeSync

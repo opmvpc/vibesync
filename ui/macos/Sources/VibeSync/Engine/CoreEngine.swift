@@ -11,7 +11,7 @@
 //
 //   1. Aucun pointeur C ne survit à l'appel. Une chaîne Swift n'est vue comme
 //      `Str8` que le temps d'un appel (`withStr8`), et les `StrBuf` d'état du
-//      moteur sont recopiés en `String` à la lecture (`string(_:)`). Le C ne
+//      moteur sont recopiés en `String` à la lecture (`coreString(_:)`). Le C ne
 //      conserve jamais une adresse qui nous appartient : `strbuf_set` copie.
 //   2. Tout l'état tient dans le `VsEngine` détenu par cette classe — tampons
 //      bornés, aucune allocation, aucune durée de vie à gérer.
@@ -58,36 +58,9 @@ public enum VSTime {
     }
 }
 
-// MARK: - Ponts de chaînes
-
-/// Voit une chaîne Swift comme un `Str8` le temps d'un appel — et pas une
-/// instruction de plus. Le tampon est vivant pour toute la durée du corps ;
-/// une chaîne vide reçoit quand même une adresse valide (le C ne déréférence
-/// jamais un `Str8` de longueur 0, mais un tampon Swift vide n'a pas d'adresse
-/// stable).
-@inline(__always)
-private func withStr8<R>(_ s: String, _ body: (Str8) -> R) -> R {
-    var bytes = Array(s.utf8)
-    let length = bytes.count
-    if bytes.isEmpty {
-        bytes = [0]
-    }
-    return bytes.withUnsafeMutableBufferPointer { buffer in
-        body(Str8(data: buffer.baseAddress, len: length))
-    }
-}
-
-/// Recopie un `StrBuf` (tampon borné, inclus par valeur dans l'état C) en
-/// `String`. La copie est délibérée : rien de ce que l'interface garde ne doit
-/// pointer dans le moteur.
-private func string(_ buf: StrBuf) -> String {
-    var copy = buf
-    let capacity = MemoryLayout.size(ofValue: copy.data)
-    let length = max(0, min(Int(copy.len), capacity))
-    return withUnsafeBytes(of: &copy.data) { raw in
-        String(decoding: raw.prefix(length), as: UTF8.self)
-    }
-}
+// Les ponts de chaînes (`withStr8`, `coreString`) vivent dans CoreBridge.swift
+// depuis VS-033 : le protocole, le statut VLC et la recherche de médias
+// traversent la même frontière et se servent des mêmes trois gestes.
 
 // MARK: - Le moteur
 
@@ -152,12 +125,12 @@ public final class CoreEngine {
     }
 
     public var selfId: String {
-        return string(engine.self_id)
+        return coreString(engine.self_id)
     }
 
     /// Salle de la session en cours (posée par `connecting(room:)`).
     public var room: String {
-        return string(engine.session_room)
+        return coreString(engine.session_room)
     }
 
     public var ready: Bool {
@@ -190,7 +163,7 @@ public final class CoreEngine {
         st.positionSec = engine.status.position_sec
         st.lengthSec = engine.status.length_sec
         st.rate = engine.status.rate
-        st.fileName = string(engine.status.file_name)
+        st.fileName = coreString(engine.status.file_name)
         return st
     }
 
@@ -225,7 +198,7 @@ public final class CoreEngine {
     }
 
     public var fileName: String {
-        return string(engine.file_name)
+        return coreString(engine.file_name)
     }
 
     public var fileDurationSec: Double {
@@ -451,13 +424,13 @@ public final class CoreEngine {
         case VS_MSG_SET_READY:
             return .setReady(ready: m.ready != 0)
         case VS_MSG_SET_FILE:
-            return .setFile(name: string(m.name), durationSec: m.duration_sec, sizeBytes: m.size_bytes)
+            return .setFile(name: coreString(m.name), durationSec: m.duration_sec, sizeBytes: m.size_bytes)
         case VS_MSG_CONTROL:
             return .control(action: action(m.action), positionSec: m.position_sec)
         case VS_MSG_REPORT:
             return .report(positionSec: m.position_sec, paused: m.paused != 0, buffering: m.buffering != 0)
         case VS_MSG_CHAT:
-            return .chat(text: string(m.text))
+            return .chat(text: coreString(m.text))
         default:
             return nil
         }
@@ -514,6 +487,6 @@ public final class CoreEngine {
                          positionSec: rs.position_sec,
                          rate: rs.rate,
                          refServerMs: rs.ref_server_ms,
-                         setBy: string(rs.set_by))
+                         setBy: coreString(rs.set_by))
     }
 }

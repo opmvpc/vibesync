@@ -8,6 +8,7 @@
 import AppKit
 import Combine
 import Foundation
+import VSCore
 
 public struct ChatLine: Identifiable {
     public let id = UUID()
@@ -97,8 +98,9 @@ public final class AppModel: ObservableObject {
     private var timer: Timer?
     private let store: PrefStore
     private var sessionToken: String = ""
-    private var backoff: Nanos = 0
-    private var nextAttempt: Nanos = 0
+    /// Quand ouvrir une socket, quand renoncer : la politique commune du C
+    /// (core/src/conn.c), la même que le client Windows depuis VS-033.
+    private var conn = ConnPolicy()
     private var wantConnection: Bool = false
     private var statusInFlight: Bool = false
     private var serverURLValue: URL?
@@ -167,8 +169,11 @@ public final class AppModel: ObservableObject {
     public func connect() {
         let trimmedName = pseudo.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedRoom = room.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let url = WebSocketClient.parseURL(serverURL) else {
-            formError = "Adresse invalide : attendu ws://hôte:port/ws ou wss://hôte/ws"
+        // Un hôte nu suffit (« vibesync.exemple.fr » → wss://…/ws) et le
+        // message d'erreur est celui du C commun, en français.
+        let address = ServerAddress.normalize(serverURL)
+        guard let url = address.url else {
+            formError = address.error
             return
         }
         if trimmedName.isEmpty || trimmedRoom.isEmpty {
@@ -186,8 +191,7 @@ public final class AppModel: ObservableObject {
         savePassword()
 
         wantConnection = true
-        backoff = 0
-        nextAttempt = VSTime.now()
+        conn.start(VSTime.now())
         screen = .room
         startConnection()
     }
@@ -196,6 +200,7 @@ public final class AppModel: ObservableObject {
     /// de suite et libère le pseudo (VS-028).
     public func leave() {
         wantConnection = false
+        conn.cancel()
         ws.close(normal: true)
         engine.disconnected()
         connected = false
@@ -210,6 +215,7 @@ public final class AppModel: ObservableObject {
     /// pour laisser partir la trame de fermeture avant que le processus meure.
     public func shutdown() {
         wantConnection = false
+        conn.cancel()
         timer?.invalidate()
         timer = nil
         ws.close(normal: true)
@@ -275,16 +281,11 @@ public final class AppModel: ObservableObject {
         guard let url = serverURLValue else {
             return
         }
+        conn.attemptStarted()
         engine.connecting(room: room)
         connected = false
         connectionLabel = "connexion…"
         ws.connect(url: url)
-    }
-
-    private func scheduleReconnect() {
-        backoff = CoreEngine.nextBackoff(backoff)
-        nextAttempt = VSTime.now() + backoff
-        connectionLabel = "reconnexion dans \(Int(VSTime.seconds(backoff))) s…"
     }
 
     private func dropSession(_ reason: String) {
@@ -292,7 +293,9 @@ public final class AppModel: ObservableObject {
         connected = false
         engine.sessionLost()
         if wantConnection {
-            scheduleReconnect()
+            let now = VSTime.now()
+            conn.socketDown(now)
+            connectionLabel = "reconnexion dans \(conn.secondsUntilRetry(now)) s…"
         } else {
             connectionLabel = "hors ligne"
         }
@@ -330,7 +333,7 @@ public final class AppModel: ObservableObject {
 
         switch msg {
         case .welcome(let w):
-            backoff = 0
+            conn.opened()
             connected = true
             connectionLabel = "connecté à « \(w.room) »"
             users = w.users
@@ -373,7 +376,11 @@ public final class AppModel: ObservableObject {
         case .error(let code, let text):
             pushToast(level: "error", text: text.isEmpty ? code : text)
             if Proto.isFatal(code) {
+                // Refus du serveur : ARRÊT NET, jamais de nouvelle tentative
+                // (c'est la boucle « Nouvelle tentative… » après un mauvais mot
+                // de passe que conn_on_refused interdit).
                 wantConnection = false
+                conn.refused()
                 ws.close()
                 engine.disconnected()
                 connected = false
@@ -618,37 +625,44 @@ public final class AppModel: ObservableObject {
             return
         }
         let st = engine.status
-        let root = JSONVal.obj([
-            ("ts", .int(VSTime.toUnixMs(now))),
+        // Écrit par l'écrivain JSON du C (json.c), comme tout ce que
+        // l'application produit depuis VS-033 : mêmes échappements, même
+        // représentation des flottants que sur le fil.
+        let line = Scratch.shared.use { arena -> String in
+            var w = JsonWriter()
+            jw_init(&w, arena)
+            jw_obj_begin(&w)
+            jw_kv_i64(&w, "ts", VSTime.toUnixMs(now))
             // Le harnais lance les instances par `open -n`, qui ne rend pas le
             // pid : c'est nous qui le disons.
-            ("pid", .int(Int64(ProcessInfo.processInfo.processIdentifier))),
-            ("scenario", .str(auto.scenario)),
-            ("name", .str(pseudo)),
-            ("room", .str(room)),
-            ("phase", .str(connected ? "connected" : (wantConnection ? "connecting" : "idle"))),
-            ("connected", .bool(connected)),
-            ("users", .int(Int64(users.count))),
-            ("ready", .bool(ready)),
-            ("file", .str(engine.fileName)),
-            ("fileDeclared", .bool(engine.fileDeclared)),
-            ("vlcRunning", .bool(vlcRunning)),
-            ("vlcState", .str(engine.haveStatus ? st.state.rawValue : "stopped")),
-            ("positionSec", .num(engine.haveStatus ? st.positionSec : 0)),
-            ("durationSec", .num(durationSec)),
-            ("roomPositionSec", .num(engine.expectedPosition(now))),
-            ("paused", .bool(roomPaused)),
-            ("driftSec", .num(driftSec)),
-            ("buffering", .bool(buffering)),
-            ("latencyMs", .int(latencyMs)),
-            ("error", .str(formError)),
+            jw_kv_i64(&w, "pid", Int64(ProcessInfo.processInfo.processIdentifier))
+            AppModel.jwText(&w, "scenario", auto.scenario)
+            AppModel.jwText(&w, "name", pseudo)
+            AppModel.jwText(&w, "room", room)
+            AppModel.jwText(&w, "phase", connected ? "connected" : (wantConnection ? "connecting" : "idle"))
+            jw_kv_bool(&w, "connected", connected ? 1 : 0)
+            jw_kv_i64(&w, "users", Int64(users.count))
+            jw_kv_bool(&w, "ready", ready ? 1 : 0)
+            AppModel.jwText(&w, "file", engine.fileName)
+            jw_kv_bool(&w, "fileDeclared", engine.fileDeclared ? 1 : 0)
+            jw_kv_bool(&w, "vlcRunning", vlcRunning ? 1 : 0)
+            AppModel.jwText(&w, "vlcState", engine.haveStatus ? st.state.rawValue : "stopped")
+            jw_kv_num(&w, "positionSec", engine.haveStatus ? st.positionSec : 0)
+            jw_kv_num(&w, "durationSec", durationSec)
+            jw_kv_num(&w, "roomPositionSec", engine.expectedPosition(now))
+            jw_kv_bool(&w, "paused", roomPaused ? 1 : 0)
+            jw_kv_num(&w, "driftSec", driftSec)
+            jw_kv_bool(&w, "buffering", buffering ? 1 : 0)
+            jw_kv_i64(&w, "latencyMs", latencyMs)
+            AppModel.jwText(&w, "error", formError)
             // Libellés de l'interface : c'est là que se lisent la cause d'un
             // échec de connexion et l'état du lancement de VLC.
-            ("connection", .str(connectionLabel)),
-            ("lastError", .str(lastError)),
-            ("media", .str(mediaLabel)),
-        ])
-        let line = root.encoded + "\n"
+            AppModel.jwText(&w, "connection", connectionLabel)
+            AppModel.jwText(&w, "lastError", lastError)
+            AppModel.jwText(&w, "media", mediaLabel)
+            jw_obj_end(&w)
+            return coreString(jw_result(&w)) + "\n"
+        }
         let tmp = auto.statusPath + ".tmp"
         do {
             try line.write(toFile: tmp, atomically: false, encoding: .utf8)
@@ -660,6 +674,12 @@ public final class AppModel: ObservableObject {
         }
     }
 
+    /// Paire clé/valeur textuelle de l'écrivain C : la chaîne Swift n'est vue
+    /// comme `Str8` que le temps de l'appel.
+    private static func jwText(_ w: inout JsonWriter, _ key: String, _ value: String) {
+        withStr8(value) { jw_kv_str(&w, key, $0) }
+    }
+
     // MARK: - Boucle
 
     private func tick() {
@@ -669,7 +689,7 @@ public final class AppModel: ObservableObject {
         // relancer. Relancer toutes les 200 ms tuait la tentative en cours
         // avant qu'elle aboutisse — aucune connexion possible vers un serveur
         // distant.
-        if wantConnection && !ws.isActive && now >= nextAttempt {
+        if wantConnection && !ws.isActive && conn.shouldAttempt(now) {
             startConnection()
             return
         }

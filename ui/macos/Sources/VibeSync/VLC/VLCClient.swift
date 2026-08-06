@@ -93,8 +93,8 @@ public final class VLCClient {
                 result = .failure(.auth)
             } else if let http = response as? HTTPURLResponse, http.statusCode != 200 {
                 result = .failure(.http(http.statusCode))
-            } else if let d = data, let root = JSON.object(JSON.parse(d)) {
-                result = .success(VLCStatusParser.parse(object: root))
+            } else if let d = data, let status = VLCStatusParser.parse(d) {
+                result = .success(status)
             } else {
                 result = .failure(.badJSON)
             }
@@ -128,7 +128,9 @@ public final class VLCClient {
             if !rate.isFinite || rate <= 0 {
                 rate = 1
             }
-            call(command: "rate", value: JSONVal.number(rate), completion: completion)
+            // Même écriture du flottant que sur le fil (f64_to_str) : la plus
+            // courte qui relit exactement la même valeur.
+            call(command: "rate", value: coreNumberText(rate), completion: completion)
         }
     }
 

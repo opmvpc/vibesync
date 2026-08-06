@@ -6,6 +6,7 @@
 // n'écrivent rien dans le profil de l'utilisateur.
 
 import Foundation
+import VSCore
 
 /// Le peu qu'on demande à un magasin de réglages. UserDefaults le remplit tel
 /// quel ; les tests fournissent une version en mémoire.
@@ -68,23 +69,12 @@ public enum Preferences {
 
     /// Borne haute du jeton relu (même valeur que le client Go) : le serveur
     /// refuse plus long, inutile de le conserver.
-    public static let maxSessionTokenLength = 128
+    public static let maxSessionTokenLength = Int(VS_SESSION_TOKEN_MAX)
 
-    /// Forme attendue par la spec : hexadécimal, au moins 16 octets.
+    /// Forme attendue par la spec : hexadécimal, au moins 16 octets. La règle
+    /// est celle du C commun (proto_session_token_valid), pas une copie.
     public static func validSessionToken(_ token: String) -> Bool {
-        if token.count < sessionTokenLength || token.count > maxSessionTokenLength {
-            return false
-        }
-        if token.count % 2 != 0 {
-            return false
-        }
-        for c in token.unicodeScalars {
-            let hex = ("0"..."9").contains(c) || ("a"..."f").contains(c) || ("A"..."F").contains(c)
-            if !hex {
-                return false
-            }
-        }
-        return true
+        return Proto.isValidSessionToken(token)
     }
 
     // MARK: - Mot de passe mémorisé (VS-025)

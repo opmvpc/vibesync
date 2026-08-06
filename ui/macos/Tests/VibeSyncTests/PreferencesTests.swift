@@ -7,6 +7,7 @@
 // faire dans une suite automatique — il est vérifié à la main (VS-025).
 
 import XCTest
+import VSCore
 @testable import VibeSync
 
 /// Magasin de réglages en mémoire.
@@ -126,6 +127,87 @@ final class PreferencesTests: XCTestCase {
         XCTAssertFalse(MediaLibrary.find(name: "", in: [root.path]).found)
         XCTAssertFalse(MediaLibrary.find(name: "ep1.mkv", in: []).found)
         XCTAssertFalse(MediaLibrary.find(name: "ep1.mkv", in: ["/ce/dossier/n/existe/pas"]).found)
+    }
+
+    // MARK: Formes canoniques des noms accentués (VS-033)
+    //
+    // APFS conserve la forme qu'on lui donne, HFS+ impose la forme décomposée,
+    // et un nom venu d'un participant Windows arrive composé : « Été.mkv »
+    // circule donc sous deux formes d'octets différentes pour un seul et même
+    // fichier. La comparaison de noms de core/posix/media_posix.c compose (NFC)
+    // les deux côtés avant de replier la casse ; sans cela, un film accentué
+    // envoyé par un ami restait introuvable chez soi.
+
+    /// Comparaison de noms de la plateforme, appelée directement (aucun disque).
+    private func nameEqualsCI(_ a: String, _ b: String) -> Bool {
+        guard let ops = vs_dir_ops(), let equal = ops.pointee.name_eq_ci else {
+            XCTFail("vs_dir_ops sans name_eq_ci")
+            return false
+        }
+        return Scratch(reserveBytes: 1 << 20).use { arena in
+            withStr8(a) { left in
+                withStr8(b) { right in
+                    equal(arena, left, right) != 0
+                }
+            }
+        }
+    }
+
+    func testNameComparisonNormalizesAccents() {
+        let composed = "Été 2024 — Amélie.mkv".precomposedStringWithCanonicalMapping
+        let decomposed = composed.decomposedStringWithCanonicalMapping
+        XCTAssertNotEqual(Array(composed.utf8), Array(decomposed.utf8),
+                          "le cas de test ne teste rien : les deux formes sont identiques")
+
+        XCTAssertTrue(nameEqualsCI(composed, decomposed), "NFC vs NFD refusés")
+        XCTAssertTrue(nameEqualsCI(decomposed, composed), "NFD vs NFC refusés")
+        // Composition ET repli de casse, dans les deux sens.
+        XCTAssertTrue(nameEqualsCI(decomposed.uppercased(), composed.lowercased()))
+        XCTAssertTrue(nameEqualsCI(composed.uppercased(), decomposed.lowercased()))
+        // Toute la plage couverte : les cinq accents, le tilde, le rond, la cédille.
+        for word in ["àâäçéèêëîïôöùûüÿñåÀÂÄÇÉÈÊËÎÏÔÖÙÛÜÑÅ.mkv", "Ma\u{0308}dchen.mkv"] {
+            XCTAssertTrue(nameEqualsCI(word.precomposedStringWithCanonicalMapping,
+                                       word.decomposedStringWithCanonicalMapping),
+                          "« \(word) » non normalisé")
+        }
+
+        // Ce qui ne doit PAS devenir égal : l'accent reste une différence, et
+        // une paire hors de la plage Latin-1 n'est pas composée (jamais de faux
+        // positif — c'est le sens d'écart qui coûte le moins cher).
+        XCTAssertFalse(nameEqualsCI("Ete.mkv", "Été.mkv"))
+        XCTAssertFalse(nameEqualsCI("e", "é"))
+        XCTAssertFalse(nameEqualsCI("z\u{0301}.mkv", "\u{017A}.mkv"))
+        XCTAssertFalse(nameEqualsCI("ep1.mkv", "ep1.mkv "))
+    }
+
+    /// Le même écart, mais sur le disque : le fichier est créé sous une forme,
+    /// cherché sous l'autre.
+    func testMediaSearchFindsBothCanonicalForms() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("vibesync-nfc-\(UUID().uuidString)")
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        let composed = "L'Été — Amélie.mkv".precomposedStringWithCanonicalMapping
+        let decomposed = composed.decomposedStringWithCanonicalMapping
+        try Data(repeating: 0, count: 12).write(to: root.appendingPathComponent(decomposed))
+
+        XCTAssertTrue(MediaLibrary.find(name: composed, in: [root.path]).found,
+                      "fichier écrit en NFD, cherché en NFC : introuvable")
+        XCTAssertTrue(MediaLibrary.find(name: decomposed, in: [root.path]).found,
+                      "fichier écrit en NFD, cherché en NFD : introuvable")
+        XCTAssertTrue(MediaLibrary.find(name: composed.uppercased(), in: [root.path]).found,
+                      "casse + forme canonique combinées : introuvable")
+
+        // Et dans l'autre sens : un fichier écrit sous la forme composée.
+        let other = fm.temporaryDirectory.appendingPathComponent("vibesync-nfd-\(UUID().uuidString)")
+        try fm.createDirectory(at: other, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: other) }
+        try Data(repeating: 0, count: 12).write(to: other.appendingPathComponent(composed))
+        XCTAssertTrue(MediaLibrary.find(name: decomposed, in: [other.path]).found,
+                      "fichier écrit en NFC, cherché en NFD : introuvable")
+        XCTAssertTrue(MediaLibrary.find(name: composed, in: [other.path]).found,
+                      "fichier écrit en NFC, cherché en NFC : introuvable")
     }
 
     func testMediaSearchDepthIsBounded() throws {

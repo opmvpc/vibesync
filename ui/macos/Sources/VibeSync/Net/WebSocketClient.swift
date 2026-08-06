@@ -58,21 +58,12 @@ public final class WebSocketClient: NSObject, URLSessionWebSocketDelegate {
         return task != nil
     }
 
+    /// Adresse du serveur telle qu'on la tape, normalisée par le C commun
+    /// (ServerAddress → conn_normalize_url) : un hôte nu suffit désormais,
+    /// comme sur le client Windows. `nil` s'accompagne toujours d'un message
+    /// prêt à afficher.
     public static func parseURL(_ text: String) -> URL? {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty {
-            return nil
-        }
-        guard let url = URL(string: trimmed), let scheme = url.scheme?.lowercased() else {
-            return nil
-        }
-        if scheme != "ws" && scheme != "wss" {
-            return nil
-        }
-        if url.host == nil || url.host?.isEmpty == true {
-            return nil
-        }
-        return url
+        return ServerAddress.normalize(text).url
     }
 
     public func connect(url: URL) {

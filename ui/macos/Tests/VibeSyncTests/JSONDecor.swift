@@ -1,11 +1,19 @@
-// JSON.swift — encodage écrit main, décodage via JSONSerialization.
+// JSONDecor.swift — JSON du DÉCOR DE TEST, plus du produit (VS-033).
 //
-// Les enveloppes du protocole sont hétérogènes ({type, data} où `data` change
-// de forme selon `type`) : Codable imposerait un type par message et des
-// conteneurs manuels de toute façon. On fait comme le port C — un écrivain
-// minimal côté sortie, des accesseurs type-sûrs côté entrée — ce qui donne un
-// contrôle exact sur le format des nombres (représentation la plus courte qui
-// relit la même valeur, indispensable pour `positionSec`).
+// Ce fichier était `Sources/VibeSync/Net/JSON.swift` : un écrivain JSON écrit
+// main et des accesseurs tolérants au-dessus de JSONSerialization. Depuis la
+// phase 4 d'ADR-010, plus une ligne de l'application n'en a besoin — le
+// protocole, le statut VLC et l'état publié par le pilote passent tous par
+// json.c, l'écrivain et le parseur du C commun. Il ne reste que deux usages,
+// tous deux dans les tests, et tous deux du DÉCOR (ce qui est jugé, lui, passe
+// par le C) :
+//
+//   - lire les vecteurs de conformité test/vectors/*.json et les cas de test,
+//     qu'il faut parcourir librement (VectorsTests, VSCoreVectorsTests) ;
+//   - fabriquer le status.json du faux VLC (FakeVLC).
+//
+// Il a donc migré dans la cible de tests plutôt que d'être supprimé : ce qui
+// compte est qu'il ne soit plus livré.
 
 import Foundation
 
