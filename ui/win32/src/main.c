@@ -65,6 +65,17 @@ typedef struct {
     char open_error[192];
     StrBuf open_name;
     i64 open_size;
+
+    // Recherche du fichier d'un participant (VS-026). Bloquante — c'est tout
+    // l'intérêt de la faire ici : la fenêtre ne gèle pas pendant qu'on
+    // parcourt une arborescence, éventuellement réseau.
+    b32 find_pending;
+    StrBuf find_name;
+    StrBuf find_dirs[MEDIA_MAX_DIRS];
+    isize find_dir_count;
+    b32 find_done;     // une recherche vient de se terminer
+    b32 find_found;
+    MediaFind find_result;
 } VlcWorker;
 
 static DWORD WINAPI vlc_thread(LPVOID param) {
@@ -75,9 +86,39 @@ static DWORD WINAPI vlc_thread(LPVOID param) {
         WaitForSingleObject(w->wake, 200);
         if (InterlockedCompareExchange(&w->stop, 0, 0)) break;
 
-        // 1. Ouverture d'un fichier (bloquant : jusqu'à 20 s).
+        // 0. Recherche du fichier d'un participant dans les dossiers médias.
+        //    Trouvé, elle enchaîne directement sur l'ouverture ci-dessous.
         StrBuf path;
         b32 want_open = 0;
+        AcquireSRWLockExclusive(&w->lock);
+        b32 want_find = w->find_pending;
+        StrBuf find_name = w->find_name;
+        StrBuf find_dirs[MEDIA_MAX_DIRS];
+        isize find_dir_count = w->find_dir_count;
+        if (want_find) {
+            memcpy(find_dirs, w->find_dirs, sizeof(find_dirs));
+            w->find_pending = 0;
+        }
+        ReleaseSRWLockExclusive(&w->lock);
+        if (want_find) {
+            MediaFind found;
+            TempArena t = temp_begin(scratch);
+            b32 ok = media_find(scratch, find_dirs, find_dir_count, strbuf_str(&find_name), &found);
+            temp_end(t);
+            AcquireSRWLockExclusive(&w->lock);
+            w->find_done = 1;
+            w->find_found = ok;
+            w->find_result = found;
+            ReleaseSRWLockExclusive(&w->lock);
+            if (ok) {
+                path = found.path;
+                want_open = 1;
+            } else {
+                PostMessageW(w->hwnd, WM_APP_VLC_OPEN, 0, 0);
+            }
+        }
+
+        // 1. Ouverture d'un fichier (bloquant : jusqu'à 20 s).
         AcquireSRWLockExclusive(&w->lock);
         if (w->open_pending) {
             path = w->open_path;
@@ -186,6 +227,18 @@ static void worker_open(VlcWorker *w, Str8 path) {
     AcquireSRWLockExclusive(&w->lock);
     strbuf_set(&w->open_path, path);
     w->open_pending = 1;
+    ReleaseSRWLockExclusive(&w->lock);
+    SetEvent(w->wake);
+}
+
+// worker_find demande la recherche d'un nom dans les dossiers médias, puis
+// l'ouverture si elle aboutit. Tout se passe sur le thread VLC.
+static void worker_find(VlcWorker *w, Str8 name, const StrBuf *dirs, isize dir_count) {
+    AcquireSRWLockExclusive(&w->lock);
+    strbuf_set(&w->find_name, name);
+    w->find_dir_count = VS_MIN(dir_count, (isize)MEDIA_MAX_DIRS);
+    for (isize i = 0; i < w->find_dir_count; i++) w->find_dirs[i] = dirs[i];
+    w->find_pending = 1;
     ReleaseSRWLockExclusive(&w->lock);
     SetEvent(w->wake);
 }
@@ -335,6 +388,9 @@ typedef struct {
     Str8 shot_path;
     Str8 auto_chat;  // message envoyé dès le welcome (diagnostic)
     StrBuf suggested_url;  // adresse proposée par le bouton « Utiliser »
+    StrBuf media_dirs[MEDIA_MAX_DIRS];
+    isize media_dir_count;
+    StrBuf pending_find;  // nom recherché, pour le message d'échec
 
     // Réglages : chemin VLC détecté au démarrage, AVANT que %VIBESYNC_VLC% ne
     // soit forcé par le réglage — sinon la « détection automatique » affichée
@@ -402,6 +458,17 @@ static void settings_load(App *app) {
         temp_end(t);
     }
 
+    // Dossiers médias : ceux de l'ini, sinon le dossier Téléchargements — le
+    // plus probable pour des fichiers reçus d'un ami.
+    v = ini_get(&app->ini, "dossiers_medias", str8_lit(""));
+    if (v.len > 0) app->media_dir_count = media_dirs_split(v, app->media_dirs, MEDIA_MAX_DIRS);
+    if (app->media_dir_count == 0) {
+        TempArena td = temp_begin(app->scratch);
+        Str8 dl;
+        if (media_default_dir(app->scratch, &dl)) strbuf_set(&app->media_dirs[app->media_dir_count++], dl);
+        temp_end(td);
+    }
+
     // Détection automatique de VLC, mesurée avant d'appliquer le réglage.
     app->vlc_auto = str8_lit("");
     TempArena t = temp_begin(app->scratch);
@@ -428,6 +495,8 @@ static b32 ini_flush(App *app) {
         // Décochée, ou aucun mot de passe : l'entrée DISPARAÎT du fichier.
         ini_remove(&app->ini, "password_enc");
     }
+    ini_set(app->perm, &app->ini, "dossiers_medias",
+            media_dirs_join(app->perm, app->media_dirs, app->media_dir_count));
     // Filet : un « password= » en clair hérité d'une version antérieure ou
     // ajouté à la main est retiré à la première écriture.
     ini_remove(&app->ini, "password");
@@ -633,6 +702,35 @@ static void refresh_view(App *app) {
         Str8 s = engine_pending_chat(&app->engine, i);
         snprintf(ui->pending[i], sizeof(ui->pending[i]), "%.*s", (int)s.len, s.data);
     }
+    // Dossiers médias : recopiés pour l'affichage du panneau Réglages.
+    ui->media_dir_count = app->media_dir_count;
+    for (isize i = 0; i < app->media_dir_count; i++) {
+        Str8 d = strbuf_str(&app->media_dirs[i]);
+        snprintf(ui->media_dirs[i], sizeof(ui->media_dirs[i]), "%.*s", (int)d.len, d.data);
+    }
+}
+
+// refresh_watch_banner propose d'ouvrir le média que les autres regardent déjà,
+// tant que nous n'en avons pas ouvert un. Fermable, et il ne réapparaît pas une
+// fois écarté pour ce fichier.
+static void refresh_watch_banner(App *app) {
+    UiApp *ui = &app->ui;
+    if (app->engine.have_file) {  // on a déjà notre copie ouverte
+        ui->watch_show = 0;
+        return;
+    }
+    for (isize i = 0; i < ui->user_count; i++) {
+        UiUser *u = &ui->users[i];
+        if (u->is_self || !u->has_file || u->file[0] == 0) continue;
+        // Même fichier que celui déjà proposé : ne pas ressusciter un bandeau
+        // que l'utilisateur vient de fermer.
+        if (ui->watch_show == 0 && strcmp(ui->watch_file, u->file) == 0) return;
+        snprintf(ui->watch_who, sizeof(ui->watch_who), "%s", u->name);
+        snprintf(ui->watch_file, sizeof(ui->watch_file), "%s", u->file);
+        ui->watch_show = 1;
+        return;
+    }
+    ui->watch_show = 0;
 }
 
 static void redraw(App *app) {
@@ -753,6 +851,7 @@ static void on_server_message(App *app, Str8 raw) {
                 ui_toast(&app->ui, resume, 0, now_ms());
             }
             fill_users(app, m);
+            refresh_watch_banner(app);
             app->ui.screen = UI_SCREEN_ROOM;
             app->ui.connecting = 0;
             if (m->room.len > 0) {
@@ -768,6 +867,7 @@ static void on_server_message(App *app, Str8 raw) {
         case VS_IN_ROOMSTATE: engine_on_roomstate(&app->engine, now, &m->state); break;
         case VS_IN_USERS:
             fill_users(app, m);
+            refresh_watch_banner(app);
             for (isize i = 0; i < m->user_count; i++) {
                 if (strbuf_eq(&app->engine.self_id, m->users[i].id)) {
                     engine_on_self_ready(&app->engine, m->users[i].ready);
@@ -920,6 +1020,8 @@ static void do_connect(App *app) {
 
     conn_start(&app->conn, vs_now_ns());
     conn_attempt_started(&app->conn);
+    // La salle visée pilote la mémoire de séance et la file de chat hors ligne.
+    engine_set_room(&app->engine, app->room);
     engine_connecting(&app->engine);
     ui_set_status(ui, "Connexion au serveur…", 0);
     if (!net_connect(app->net, app->url)) {
@@ -986,6 +1088,53 @@ static b32 open_file_dialog(App *app, Str8 *out) {
     return got;
 }
 
+// pick_folder ouvre le sélecteur natif en mode dossier (FOS_PICKFOLDERS).
+static b32 pick_folder(App *app, Str8 *out) {
+    b32 got = 0;
+    IFileOpenDialog *dlg = NULL;
+    HRESULT hr = CoCreateInstance(&CLSID_FileOpenDialog, NULL, CLSCTX_INPROC_SERVER, &IID_IFileOpenDialog,
+                                  (void **)&dlg);
+    if (FAILED(hr) || !dlg) return 0;
+    DWORD opts = 0;
+    if (SUCCEEDED(dlg->lpVtbl->GetOptions(dlg, &opts))) {
+        dlg->lpVtbl->SetOptions(dlg, opts | FOS_PICKFOLDERS | FOS_PATHMUSTEXIST);
+    }
+    dlg->lpVtbl->SetTitle(dlg, L"Choisir un dossier de médias");
+    if (SUCCEEDED(dlg->lpVtbl->Show(dlg, app->hwnd))) {
+        IShellItem *item = NULL;
+        if (SUCCEEDED(dlg->lpVtbl->GetResult(dlg, &item)) && item) {
+            PWSTR wpath = NULL;
+            if (SUCCEEDED(item->lpVtbl->GetDisplayName(item, SIGDN_FILESYSPATH, &wpath)) && wpath) {
+                *out = str8_copy(app->perm, utf16_to_utf8(app->scratch, (const u16 *)wpath));
+                CoTaskMemFree(wpath);
+                got = 1;
+            }
+            item->lpVtbl->Release(item);
+        }
+    }
+    dlg->lpVtbl->Release(dlg);
+    return got;
+}
+
+// request_media_open lance la recherche du fichier déclaré par un participant.
+static void request_media_open(App *app, Str8 name) {
+    UiApp *ui = &app->ui;
+    if (name.len == 0) return;
+    if (app->media_dir_count == 0) {
+        snprintf(ui->media_notice, sizeof(ui->media_notice),
+                 "Aucun dossier média configuré — cliquer pour ouvrir les Réglages");
+        ui->media_notice_show = 1;
+        return;
+    }
+    strbuf_set(&app->pending_find, name);
+    ui->media_notice_show = 0;
+    ui->media_searching = 1;
+    char msg[224];
+    snprintf(msg, sizeof(msg), "Recherche de « %.*s » dans vos dossiers…", (int)name.len, name.data);
+    ui_toast(ui, msg, 0, now_ms());
+    worker_find(&app->vlc, name, app->media_dirs, app->media_dir_count);
+}
+
 static void handle_actions(App *app) {
     UiApp *ui = &app->ui;
     VsOutput out;
@@ -1049,6 +1198,60 @@ static void handle_actions(App *app) {
             ui->server_hint[0] = 0;
             ui->health_tls_hint = 0;
             probe_health(app);  // vérifier tout de suite que la bascule marche
+        }
+        redraw(app);
+    }
+    if (ui->act_open_user_file) {
+        ui->act_open_user_file = 0;
+        isize i = ui->act_open_user_index;
+        if (i >= 0 && i < ui->user_count && ui->users[i].has_file) {
+            request_media_open(app, str8_from_cstr(ui->users[i].file));
+        }
+        redraw(app);
+    }
+    if (ui->act_open_watch_file) {
+        ui->act_open_watch_file = 0;
+        request_media_open(app, str8_from_cstr(ui->watch_file));
+        redraw(app);
+    }
+    if (ui->act_dismiss_watch) {
+        ui->act_dismiss_watch = 0;
+        ui->watch_show = 0;
+        redraw(app);
+    }
+    if (ui->act_dismiss_notice) {
+        ui->act_dismiss_notice = 0;
+        ui->media_notice_show = 0;
+        redraw(app);
+    }
+    if (ui->act_notice_settings) {
+        ui->act_notice_settings = 0;
+        ui->media_notice_show = 0;
+        settings_open(app);
+        redraw(app);
+    }
+    if (ui->act_media_add) {
+        ui->act_media_add = 0;
+        Str8 dir;
+        if (app->media_dir_count < MEDIA_MAX_DIRS && pick_folder(app, &dir)) {
+            b32 dup = 0;
+            for (isize i = 0; i < app->media_dir_count; i++) {
+                if (strbuf_eq(&app->media_dirs[i], dir)) dup = 1;
+            }
+            if (!dup) {
+                strbuf_set(&app->media_dirs[app->media_dir_count++], dir);
+                ini_flush(app);
+            }
+        }
+        redraw(app);
+    }
+    if (ui->act_media_remove) {
+        ui->act_media_remove = 0;
+        isize i = ui->act_media_remove_index;
+        if (i >= 0 && i < app->media_dir_count) {
+            for (isize j = i; j + 1 < app->media_dir_count; j++) app->media_dirs[j] = app->media_dirs[j + 1];
+            app->media_dir_count--;
+            ini_flush(app);
         }
         redraw(app);
     }
@@ -1266,19 +1469,46 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_APP_VLC_OPEN: {
-            b32 ok, failed;
+            b32 ok, failed, find_done, find_found;
             char err[192];
             StrBuf name;
             i64 size;
+            MediaFind found;
             AcquireSRWLockExclusive(&app->vlc.lock);
             ok = app->vlc.open_ok;
             failed = app->vlc.open_failed;
             memcpy(err, app->vlc.open_error, sizeof(err));
             name = app->vlc.open_name;
             size = app->vlc.open_size;
+            find_done = app->vlc.find_done;
+            find_found = app->vlc.find_found;
+            found = app->vlc.find_result;
             app->vlc.open_ok = 0;
             app->vlc.open_failed = 0;
+            app->vlc.find_done = 0;
             ReleaseSRWLockExclusive(&app->vlc.lock);
+
+            if (find_done) {
+                app->ui.media_searching = 0;
+                Str8 wanted = strbuf_str(&app->pending_find);
+                if (find_found) {
+                    // Homonymes : le plus gros gagne. On le trace, c'est une
+                    // heuristique et il faut pouvoir la contester.
+                    char dbg[320];
+                    snprintf(dbg, sizeof(dbg),
+                             "vibesync: « %.*s » trouvé (%lld correspondance(s), %lld entrées) : %s\n",
+                             (int)wanted.len, wanted.data, (long long)found.matches,
+                             (long long)found.visited, (const char *)found.path.data);
+                    OutputDebugStringA(dbg);
+                    vs_write_stderr(str8_from_cstr(dbg));
+                } else {
+                    snprintf(app->ui.media_notice, sizeof(app->ui.media_notice),
+                             "« %.*s » introuvable%s — cliquer pour ouvrir les Réglages", (int)wanted.len,
+                             wanted.data, found.truncated ? " (recherche écourtée)" : "");
+                    app->ui.media_notice_show = 1;
+                    app->ui.watch_show = 0;
+                }
+            }
             if (ok) {
                 VsOutput out;
                 vs_output_reset(&out);
@@ -1533,6 +1763,9 @@ static void capture_screens(App *app, Str8 dir) {
     ui_text_set(&ui->f_set_vlc, str8_lit("C:\\Program Files\\VideoLAN\\VLC\\vlc.exe"));
     snprintf(ui->settings_auto_vlc, sizeof(ui->settings_auto_vlc), "C:\\Program Files\\VideoLAN\\VLC\\vlc.exe");
     ui->settings_vlc_state = 1;
+    ui->media_dir_count = 2;
+    snprintf(ui->media_dirs[0], sizeof(ui->media_dirs[0]), "C:\\Users\\thibault\\Downloads");
+    snprintf(ui->media_dirs[1], sizeof(ui->media_dirs[1]), "D:\\Films");
     ui_frame(ui, app->mem_dc, w, h, now_ms());
     png_write(app->scratch, str8_cat(app->scratch, dir, str8_lit("\\ui-reglages.png")), (const u8 *)app->bits,
               w, h);

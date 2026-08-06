@@ -159,14 +159,23 @@ static b32 buf_suspended(const VsBufferDetect *b, i64 now) {
     return b->suspend_until != VS_TIME_ZERO && now < b->suspend_until;
 }
 
-// buf_suspend oublie le stall en cours et neutralise la détection jusqu'à
-// now+d. Une suspension déjà en cours et plus lointaine n'est jamais
-// raccourcie. Le verdict courant est délibérément conservé (cf. engine.h).
+// buf_suspend neutralise la détection jusqu'à now+d, si l'anti-masquage le
+// permet. Le verdict courant est délibérément conservé (cf. engine.h).
+//
+// Deux refus, tous deux nécessaires pour que le diagnostic finisse par sortir
+// malgré des corrections en boucle (docs/protocol.md §Buffering) :
+//   - suspension déjà en cours : on ne la prolonge pas, elle va à son terme ;
+//   - moins de VS_BUFFERING_COOLDOWN_NS après la fin de la précédente : la
+//     détection a droit à sa fenêtre d'observation.
+// Un refus ne touche à rien : effacer le stall en cours suffirait à masquer.
 static void buf_suspend(VsBufferDetect *b, i64 now, i64 d) {
+    if (b->suspend_until != VS_TIME_ZERO) {
+        if (now < b->suspend_until) return;
+        if (now - b->suspend_until < VS_BUFFERING_COOLDOWN_NS) return;
+    }
     b->have = 0;
     b->stall_from = VS_TIME_ZERO;
-    i64 until = now + d;
-    if (b->suspend_until == VS_TIME_ZERO || until > b->suspend_until) b->suspend_until = until;
+    b->suspend_until = now + d;
 }
 
 #define VS_BUF_WINDOW_NS (700 * 1000000LL)
@@ -248,6 +257,15 @@ static void invalidate_reference(VsEngine *e) {
     e->drift = 0;
 }
 
+void engine_set_room(VsEngine *e, Str8 room) {
+    if (strbuf_eq(&e->session_room, room)) return;  // même salle : rien ne change
+    strbuf_set(&e->session_room, room);
+    e->chat_queue_count = 0;  // la file appartenait à l'autre salle
+    e->had_session = 0;
+    e->have_last_room_pos = 0;
+    e->last_room_pos = 0;
+}
+
 void engine_connecting(VsEngine *e) {
     e->phase = VS_PHASE_CONNECTING;
     invalidate_reference(e);
@@ -261,6 +279,9 @@ void engine_session_lost(VsEngine *e) {
 void engine_disconnected(VsEngine *e) {
     e->phase = VS_PHASE_IDLE;
     invalidate_reference(e);
+    // Départ volontaire : les messages composés hors ligne ne partiront pas.
+    // Seule une reconnexion automatique vers la même salle les préserve.
+    e->chat_queue_count = 0;
 }
 
 // ------------------------------------------------------------ état de salle ---
@@ -283,6 +304,16 @@ static void adopt_room_state(VsEngine *e, i64 now, const VsRoomState *rs) {
     e->room_state = *rs;
     e->have_state = 1;
     e->grace_until = now + VS_GRACE_NS;
+}
+
+// sample_room_position mémorise où en est la séance. On ne retient QUE les
+// salles réellement pilotées : une salle vierge n'écrase pas ce qu'on savait,
+// c'est justement ce qu'on veut pouvoir reproposer.
+static void sample_room_position(VsEngine *e, i64 now) {
+    if (e->phase != VS_PHASE_CONNECTED || !e->have_state) return;
+    if (e->room_state.set_by.len == 0 && e->room_state.position_sec == 0) return;
+    e->last_room_pos = engine_expected_position(e, now);
+    e->have_last_room_pos = 1;
 }
 
 void engine_on_roomstate(VsEngine *e, i64 now, const VsRoomState *raw) {
@@ -349,25 +380,24 @@ static void flush_chat_queue(VsEngine *e, VsOutput *out) {
     e->chat_queue_count = 0;
 }
 
-// virgin_resume traite le cas « salle vierge » (docs/protocol.md §Erreurs et
-// robustesse) : un welcome montrant une salle qui n'a jamais reçu de control
-// (setBy vide, position 0) alors que notre lecteur est au-delà de
-// VS_VIRGIN_RESUME_SEC signifie que le serveur a perdu la séance — typiquement
-// un redémarrage. Plutôt que de se laisser ramener à 0, le client propose sa
-// propre position par UN control seek.
+// virgin_resume_pos décide de la reprise « salle vierge » (docs/protocol.md
+// §Erreurs et robustesse). Conditions CUMULATIVES :
+//   - le welcome montre une salle sans aucun control (setBy vide, position 0) ;
+//   - nous étions déjà connectés à CETTE salle dans CE processus ;
+//   - avec une position de salle connue au-delà de VS_VIRGIN_RESUME_SEC.
+// Un premier join dans une salle neuve ne déclenche donc JAMAIS de reprise,
+// quel que soit l'état de VLC — sinon un simple retard à l'ouverture ferait
+// sauter tout le monde.
 //
-// C'est un control comme un autre : il arme le hold post-action, ce qui suspend
-// l'alignement sur l'état vierge jusqu'à l'écho du serveur. Une seule reprise
-// par connexion, puisqu'il n'y a qu'un welcome par session. Si un autre client
-// a été plus rapide, setBy n'est plus vide et on se range derrière lui.
-static void virgin_resume(VsEngine *e, i64 now, const VsRoomState *rs, VsOutput *out) {
-    if (rs->set_by.len != 0 || rs->position_sec != 0) return;
-    if (!e->have_status || !vs_status_loaded(&e->status)) return;
-    if (e->status.position_sec <= VS_VIRGIN_RESUME_SEC) return;
-    f64 pos = engine_clamp_position(e->status.position_sec, engine_duration(e));
-    emit_user_control(e, now, VS_ACT_SEEK, pos, out);
-    out->have_resume_toast = 1;
-    out->resume_toast_sec = pos;
+// Renvoie 1 et la position à proposer. Doit être appelée AVANT d'adopter l'état
+// vierge, qui écraserait justement la position à proposer.
+static b32 virgin_resume_pos(const VsEngine *e, const VsRoomState *rs, f64 *out_pos) {
+    if (rs->set_by.len != 0 || rs->position_sec != 0) return 0;
+    if (!e->had_session || !e->have_last_room_pos) return 0;
+    f64 pos = engine_clamp_position(e->last_room_pos, engine_duration(e));
+    if (pos <= VS_VIRGIN_RESUME_SEC) return 0;
+    *out_pos = pos;
+    return 1;
 }
 
 void engine_on_welcome(VsEngine *e, i64 now, Str8 self_id, const VsRoomState *st,
@@ -380,6 +410,12 @@ void engine_on_welcome(VsEngine *e, i64 now, Str8 self_id, const VsRoomState *st
     e->have_pending_rs = 0;
     e->hold_until = VS_TIME_ZERO;
     e->nudging = 0;
+    // La reprise se décide AVANT d'adopter l'état de la salle : l'état vierge
+    // écraserait la dernière position connue, qui est justement ce qu'on veut
+    // proposer.
+    f64 resume_pos = 0;
+    b32 want_resume = virgin_resume_pos(e, st, &resume_pos);
+
     engine_on_roomstate(e, now, st);
     // Volontairement PAS de reprise du ready vu par le serveur : il vient de
     // nous créer un membre neuf, donc « pas prêt ». C'est notre état local qui
@@ -401,10 +437,16 @@ void engine_on_welcome(VsEngine *e, i64 now, Str8 self_id, const VsRoomState *st
     VsMsg *p = out_msg(out, VS_MSG_PING);
     p->t = vs_ns_to_unix_ms(now);
     e->last_ping = now;
-    // Salle vierge : proposer notre position avant tout alignement.
-    virgin_resume(e, now, st, out);
+    // Salle vierge : proposer la position de la séance avant tout alignement.
+    if (want_resume) {
+        emit_user_control(e, now, VS_ACT_SEEK, resume_pos, out);
+        out->have_resume_toast = 1;
+        out->resume_toast_sec = resume_pos;
+    }
     // Les chats composés hors ligne partent maintenant, dans l'ordre.
     flush_chat_queue(e, out);
+    // À partir d'ici, nous avons été connectés à cette salle dans ce processus.
+    e->had_session = 1;
 }
 
 // ------------------------------------------------------------------ lecteur ---
@@ -680,6 +722,7 @@ static void periodic(VsEngine *e, i64 now, VsOutput *out) {
 
 void engine_on_tick(VsEngine *e, i64 now, VsOutput *out) {
     expire_user_hold(e, now);
+    sample_room_position(e, now);
     plan(e, now, out);
     periodic(e, now, out);
 }

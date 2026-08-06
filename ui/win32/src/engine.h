@@ -37,6 +37,11 @@
 // utilisateur) et toute transition play/pause : ces actions figent
 // mécaniquement la position (docs/protocol.md §Comportements client).
 #define VS_BUFFERING_SUSPEND_NS (2000 * 1000000LL)
+// Anti-masquage : une nouvelle suspension ne peut pas démarrer moins de 1 s
+// après la fin de la précédente, et une suspension en cours n'est jamais
+// prolongée. Sans ces deux règles, des seeks de correction en boucle
+// masqueraient indéfiniment un VLC réellement figé.
+#define VS_BUFFERING_COOLDOWN_NS (1000 * 1000000LL)
 // File des chats composés hors ligne : au-delà, les plus anciens sont
 // abandonnés (docs/protocol.md §File d'attente hors ligne).
 #define VS_CHAT_QUEUE_MAX 20
@@ -238,13 +243,30 @@ typedef struct {
     // File des chats composés hors ligne : SEULS les chats sont rejoués. Ni
     // setReady ni setFile (l'état courant est re-déclaré à chaque welcome), et
     // JAMAIS un control — une action périmée écraserait la salle.
+    // La file est LIÉE À LA SALLE : changer de salle ou se déconnecter
+    // volontairement la vide sans envoi (docs/protocol.md §File d'attente).
     StrBuf chat_queue[VS_CHAT_QUEUE_MAX];
     isize chat_queue_count;
+
+    // Mémoire de séance, par salle et par processus : conditions cumulatives de
+    // la reprise « salle vierge ».
+    StrBuf session_room;  // salle visée (posée par engine_set_room)
+    b32 had_session;      // déjà connecté à CETTE salle dans CE processus
+    // Dernière position de salle OBSERVÉE (échantillonnée à chaque tic tant que
+    // la salle est réellement pilotée). Elle survit à la coupure : c'est elle
+    // qu'on propose en reprise, telle quelle — pas une projection, pas la
+    // position brute de VLC.
+    f64 last_room_pos;
+    b32 have_last_room_pos;
 } VsEngine;
 
 void engine_init(VsEngine *e);
 
 // --- transitions de connexion ---
+// engine_set_room déclare la salle visée. Changer de salle vide la file de chat
+// sans envoi et oublie la mémoire de séance : ni les messages ni la position
+// d'une salle ne doivent fuir vers une autre.
+void engine_set_room(VsEngine *e, Str8 room);
 void engine_connecting(VsEngine *e);   // tentative de connexion en cours
 void engine_session_lost(VsEngine *e);  // session perdue : référence invalidée
 void engine_disconnected(VsEngine *e);  // arrêt volontaire

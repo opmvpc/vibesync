@@ -975,9 +975,17 @@ enum {
     ID_TEST,
     ID_CANCEL,
     ID_USE_WSS,
+    // Les bandeaux consomment deux identifiants chacun (corps + fermeture) :
+    // notice_bar utilise id et id+1.
     ID_UPDATE,
     ID_UPDATE_CLOSE,
+    ID_WATCH,
+    ID_WATCH_CLOSE,
+    ID_NOTICE,
+    ID_NOTICE_CLOSE,
     ID_REMEMBER,
+    ID_MEDIA_ADD,
+    ID_MEDIA_ROW,  // + index de la ligne
 };
 
 // gear_button dessine le bouton engrenage (discret, même rendu partout).
@@ -1173,12 +1181,24 @@ static void draw_users(UiApp *a, HDC dc, Rect r) {
     for (isize i = 0; i < a->user_count && y + row_h < r.y + r.h - pad; i++) {
         UiUser *u = &a->users[i];
         Rect row = rect(x, y, w, row_h - S(a, 6));
+        // Double-clic sur la ligne d'un participant qui a déclaré un fichier :
+        // on va le chercher dans les dossiers médias et l'ouvrir.
+        b32 row_hover = !a->input_locked && !u->is_self && u->has_file && rect_hit(row, a->mouse_x, a->mouse_y);
+        if (row_hover) {
+            a->hot = 5000 + (u64)i;
+            if (a->mouse_pressed && a->mouse_double) {
+                a->act_open_user_file = 1;
+                a->act_open_user_index = i;
+            }
+        }
         if (u->is_self) fill_round(dc, row, S(a, 8), mix(UI_ACCENT, UI_PANEL, 210));
+        else if (row_hover) fill_round(dc, row, S(a, 8), UI_PANEL_HI);
         i32 tx = row.x + S(a, 8);
         draw_text(a, dc, rect(tx, row.y + S(a, 4), w - S(a, 90), S(a, 18)), u->name, UI_TEXT,
                   u->is_self ? a->f_bold : a->f_body, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
         const char *sub = u->has_file ? u->file : "aucun fichier";
-        draw_text(a, dc, rect(tx, row.y + S(a, 21), w - S(a, 90), S(a, 16)), sub, UI_FAINT, a->f_small,
+        draw_text(a, dc, rect(tx, row.y + S(a, 21), w - S(a, 90), S(a, 16)), sub,
+                  row_hover ? UI_ACCENT_HI : UI_FAINT, a->f_small,
                   DT_LEFT | DT_TOP | DT_SINGLELINE | DT_PATH_ELLIPSIS);
         // Badge prêt + latence, alignés à droite.
         i32 bw = S(a, 54), bh = S(a, 18);
@@ -1211,30 +1231,64 @@ static void draw_users(UiApp *a, HDC dc, Rect r) {
               DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS);
 }
 
-// update_banner : invitation non bloquante à télécharger une version plus
-// récente. Fermable ; elle ne revient qu'à la prochaine connexion.
-static void update_banner(UiApp *a, HDC dc, Rect r) {
-    fill_round(dc, r, S(a, 8), mix(UI_ACCENT, UI_PANEL, 190));
-    stroke_round(dc, r, S(a, 8), UI_ACCENT_DIM, 1);
+// notice_bar : bandeau cliquable et fermable, non bloquant. Sert aux trois
+// invitations de la salle (mise à jour, « X regarde… », fichier introuvable).
+static void notice_bar(UiApp *a, HDC dc, Rect r, const char *text, u32 tint, u64 id, b32 *clicked,
+                       b32 *closed) {
+    fill_round(dc, r, S(a, 8), mix(tint, UI_PANEL, 190));
+    stroke_round(dc, r, S(a, 8), mix(tint, UI_PANEL, 120), 1);
     i32 pad = S(a, 12);
     i32 close_w = S(a, 30);
-    char msg[128];
-    snprintf(msg, sizeof(msg), "Nouvelle version disponible (v%s) — cliquer pour télécharger",
-             a->update_version);
     Rect click = rect(r.x, r.y, r.w - close_w, r.h);
     b32 hover = !a->input_locked && rect_hit(click, a->mouse_x, a->mouse_y);
-    if (hover) a->hot = ID_UPDATE;
-    if (hover && a->mouse_pressed) a->active = ID_UPDATE;
-    if (a->active == ID_UPDATE && a->mouse_released) {
+    if (hover) a->hot = id;
+    if (hover && a->mouse_pressed) a->active = id;
+    if (a->active == id && a->mouse_released) {
         a->active = 0;
-        if (hover) a->act_update_download = 1;
+        if (hover) *clicked = 1;
     }
-    draw_text(a, dc, rect(r.x + pad, r.y, r.w - pad - close_w, r.h), msg, hover ? UI_TEXT : UI_ACCENT_HI,
+    draw_text(a, dc, rect(r.x + pad, r.y, r.w - pad - close_w, r.h), text, hover ? UI_TEXT : mix(tint, UI_TEXT, 90),
               a->f_small, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     if (button(a, dc, rect(r.x + r.w - close_w - S(a, 4), r.y + (r.h - close_w) / 2, close_w, close_w), "✕",
-               ID_UPDATE_CLOSE, BTN_SUBTLE, 1)) {
-        a->act_update_dismiss = 1;
+               id + 1, BTN_SUBTLE, 1)) {
+        *closed = 1;
     }
+}
+
+// room_notices empile les bandeaux en haut du contenu et renvoie la hauteur
+// consommée. Aucun n'est modal : la salle reste utilisable.
+static i32 room_notices(UiApp *a, HDC dc, i32 x, i32 top, i32 w, i32 gap) {
+    i32 bh = S(a, 34);
+    i32 used = 0;
+    char msg[280];
+    b32 clicked, closed;
+
+    if (a->update_available && !a->update_dismissed) {
+        snprintf(msg, sizeof(msg), "Nouvelle version disponible (v%s) — cliquer pour télécharger",
+                 a->update_version);
+        clicked = closed = 0;
+        notice_bar(a, dc, rect(x, top + used, w, bh), msg, UI_ACCENT, ID_UPDATE, &clicked, &closed);
+        if (clicked) a->act_update_download = 1;
+        if (closed) a->act_update_dismiss = 1;
+        used += bh + gap;
+    }
+    if (a->watch_show) {
+        snprintf(msg, sizeof(msg), "%s regarde %s — cliquer pour l'ouvrir chez vous", a->watch_who,
+                 a->watch_file);
+        clicked = closed = 0;
+        notice_bar(a, dc, rect(x, top + used, w, bh), msg, UI_CYAN, ID_WATCH, &clicked, &closed);
+        if (clicked) a->act_open_watch_file = 1;
+        if (closed) a->act_dismiss_watch = 1;
+        used += bh + gap;
+    }
+    if (a->media_notice_show) {
+        clicked = closed = 0;
+        notice_bar(a, dc, rect(x, top + used, w, bh), a->media_notice, UI_WARN, ID_NOTICE, &clicked, &closed);
+        if (clicked) a->act_notice_settings = 1;
+        if (closed) a->act_dismiss_notice = 1;
+        used += bh + gap;
+    }
+    return used;
 }
 
 static void draw_chat(UiApp *a, HDC dc, Rect r, i64 now_ms) {
@@ -1445,11 +1499,7 @@ static void screen_room(UiApp *a, HDC dc, i64 now_ms) {
     i32 top = header_h + pad;
     i32 bottom = a->height - pad;
 
-    if (a->update_available && !a->update_dismissed) {
-        i32 bh = S(a, 34);
-        update_banner(a, dc, rect(pad, top, a->width - 2 * pad, bh));
-        top += bh + pad;
-    }
+    top += room_notices(a, dc, pad, top, a->width - 2 * pad, pad);
 
     // Colonne gauche : participants + gros bouton Prêt.
     i32 ready_h = S(a, 52);
@@ -1536,14 +1586,16 @@ static void dim_screen(HDC dc, Rect r) {
 static void screen_settings(UiApp *a, HDC dc, i64 now_ms) {
     dim_screen(dc, rect(0, 0, a->width, a->height));
 
-    i32 card_w = VS_MIN(S(a, 520), a->width - S(a, 48));
+    i32 card_w = VS_MIN(S(a, 560), a->width - S(a, 48));
     i32 pad = S(a, 24);
     i32 fh = S(a, 36);
     i32 gap = S(a, 12);
     // Hauteur exacte : marges + en-tête + 3 champs + le bloc VLC + le message
-    // de validation + la rangée de boutons. Rien ne dépasse de la carte.
+    // de validation + les dossiers médias + la rangée de boutons.
     i32 head_h = S(a, 62), msg_h = S(a, 40), btn_h = S(a, 40);
-    i32 card_h = 2 * pad + head_h + 3 * (S(a, 18) + fh + gap) + (S(a, 18) + fh + S(a, 6)) + msg_h +
+    i32 row_h = S(a, 26);
+    i32 media_h = S(a, 18) + (a->media_dir_count > 0 ? (i32)a->media_dir_count * row_h : row_h) + fh + S(a, 8);
+    i32 card_h = 2 * pad + head_h + 3 * (S(a, 18) + fh + gap) + (S(a, 18) + fh + S(a, 6)) + msg_h + media_h +
                  S(a, 8) + btn_h;
     Rect card = rect((a->width - card_w) / 2, VS_MAX(S(a, 16), (a->height - card_h) / 2), card_w, card_h);
     // Ombre portée : le panneau flotte franchement au-dessus de l'écran.
@@ -1616,6 +1668,31 @@ static void screen_settings(UiApp *a, HDC dc, i64 now_ms) {
                        DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
     }
     y += msg_h;
+
+    // --- Dossiers médias : c'est là qu'on ira chercher le fichier d'un ami ---
+    label(a, dc, rect(x, y, w, S(a, 18)), "Dossiers médias (recherche du fichier d'un participant)");
+    y += S(a, 18);
+    if (a->media_dir_count == 0) {
+        draw_text(a, dc, rect(x, y, w, row_h), "Aucun dossier : ajoutez celui de vos films.", UI_WARN,
+                  a->f_small, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        y += row_h;
+    }
+    for (isize i = 0; i < a->media_dir_count; i++) {
+        i32 del_w = S(a, 78);
+        draw_text(a, dc, rect(x, y, w - del_w - S(a, 8), row_h), a->media_dirs[i], UI_MUTED, a->f_small,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_PATH_ELLIPSIS);
+        if (button(a, dc, rect(x + w - del_w, y + S(a, 2), del_w, row_h - S(a, 4)), "Retirer",
+                   ID_MEDIA_ROW + (u64)i, BTN_GHOST, 1)) {
+            a->act_media_remove = 1;
+            a->act_media_remove_index = i;
+        }
+        y += row_h;
+    }
+    if (button(a, dc, rect(x, y + S(a, 4), S(a, 190), fh - S(a, 4)), "Ajouter un dossier…", ID_MEDIA_ADD,
+               BTN_SUBTLE, a->media_dir_count < UI_MAX_MEDIA_DIRS)) {
+        a->act_media_add = 1;
+    }
+    y += fh + S(a, 8);
 
     i32 bw = S(a, 130);
     if (a->settings_msg[0]) {

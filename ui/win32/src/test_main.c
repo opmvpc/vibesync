@@ -13,6 +13,7 @@
 #include "health.h"
 #include "ini.h"
 #include "json.h"
+#include "media.h"
 #include "net.h"
 #include "protocol.h"
 #include "secret.h"
@@ -1623,6 +1624,30 @@ static void test_offline_queue(void) {
     CHECK(count_msgs(&out, VS_MSG_CONTROL) == 0, "aucun control rejoué");
     CHECK(count_msgs(&out, VS_MSG_SET_READY) == 1, "un seul setReady (état courant re-déclaré)");
 
+    // La file est LIÉE À LA SALLE : changer de salle la vide sans envoi.
+    {
+        VsEngine e2;
+        VsOutput o2;
+        engine_init(&e2);
+        vs_output_reset(&o2);
+        engine_set_room(&e2, S("salon"));
+        engine_chat(&e2, S("pour le salon"), &o2);
+        CHECK(engine_pending_chat_count(&e2) == 1, "message en file pour salon");
+        engine_set_room(&e2, S("salon"));
+        CHECK(engine_pending_chat_count(&e2) == 1, "même salle : la file survit");
+        engine_set_room(&e2, S("autre"));
+        CHECK(engine_pending_chat_count(&e2) == 0, "changement de salle : file vidée sans envoi");
+        // Déconnexion volontaire : même règle.
+        engine_chat(&e2, S("hop"), &o2);
+        CHECK(engine_pending_chat_count(&e2) == 1, "remis en file");
+        engine_disconnected(&e2);
+        CHECK(engine_pending_chat_count(&e2) == 0, "départ volontaire : file vidée sans envoi");
+        // Une reconnexion automatique, elle, préserve la file.
+        engine_chat(&e2, S("survivant"), &o2);
+        engine_session_lost(&e2);
+        CHECK(engine_pending_chat_count(&e2) == 1, "reconnexion automatique : la file survit");
+    }
+
     // En ligne : le chat part directement, sans passer par la file.
     vs_output_reset(&out);
     engine_chat(&e, S("direct"), &out);
@@ -1667,76 +1692,137 @@ static void test_offline_queue(void) {
     CHECK(e.ready == 0, "users resynchronise le ready");
 }
 
+// join_room amène le moteur à l'état « connecté à `room`, séance en lecture
+// depuis `pos` », comme après un welcome normal.
+static void join_room(VsEngine *e, i64 now, const char *room, f64 pos, VsOutput *out) {
+    engine_set_room(e, S(room));
+    engine_connecting(e);
+    VsRoomState playing = mk_room(0, pos, "u2", vs_ns_to_unix_ms(now));
+    vs_output_reset(out);
+    engine_on_welcome(e, now, S("u1"), &playing, NULL, out);
+    VsPong p = {vs_ns_to_unix_ms(now), vs_ns_to_unix_ms(now)};
+    engine_on_pong(e, now, p);
+    vs_output_reset(out);
+}
+
+// tick_at joue un poll : c'est lui qui échantillonne la position de séance.
+static void tick_at(VsEngine *e, i64 now, VsOutput *out) {
+    engine_on_tick(e, now, out);
+    vs_output_reset(out);
+}
+
 static void test_virgin_resume(void) {
     section("reprise salle vierge");
+    const i64 SEC = 1000000000LL;
     i64 t0 = 1785960000000LL * 1000000LL;
     VsEngine e;
     VsOutput out;
+    VsRoomState virgin = mk_room(1, 0, "", 1);
+    VsStatus st = mk_status(VS_PLAY_PLAYING, 1806.4, 7200);
 
-    // Salle vierge + lecteur loin dans le film → UNE reprise control seek.
+    // Séance connue dans CETTE salle (dernière position observée 1800,8), puis
+    // serveur revenu vierge : reprise à cette position OBSERVÉE, pas à la
+    // position brute de VLC (1806,4) ni à une projection.
+    i64 lost_at = t0 + 800 * 1000000LL;
+    i64 t1 = t0 + 6400 * 1000000LL;
     engine_init(&e);
     vs_output_reset(&out);
-    VsStatus st = mk_status(VS_PLAY_PLAYING, 1806.4, 7200);
+    join_room(&e, t0, "salon", 1800, &out);
     engine_on_vlc_status(&e, t0, &st, &out);
-    VsRoomState virgin = mk_room(1, 0, "", 1);
+    tick_at(&e, lost_at, &out);
+    engine_session_lost(&e);
     vs_output_reset(&out);
-    engine_on_welcome(&e, t0, S("u1"), &virgin, NULL, &out);
+    engine_on_welcome(&e, t1, S("u1"), &virgin, NULL, &out);
     CHECK(count_msgs(&out, VS_MSG_CONTROL) == 1, "une seule reprise émise");
     isize c = -1;
     for (isize i = 0; i < out.msg_count; i++) {
         if (out.msgs[i].kind == VS_MSG_CONTROL) c = i;
     }
     CHECK(c >= 0 && out.msgs[c].action == VS_ACT_SEEK, "la reprise est un seek");
-    CHECK(c >= 0 && approx(out.msgs[c].position_sec, 1806.4, 1e-6), "reprise à la position locale (%.3f)",
+    CHECK(c >= 0 && approx(out.msgs[c].position_sec, 1800.8, 1e-3),
+          "reprise à la dernière position de salle observée (%.3f, attendu 1800.8)",
           c >= 0 ? out.msgs[c].position_sec : -1);
-    CHECK(out.have_resume_toast && approx(out.resume_toast_sec, 1806.4, 1e-6), "toast « Reprise à … »");
+    CHECK(out.have_resume_toast && approx(out.resume_toast_sec, 1800.8, 1e-3), "toast « Reprise à … »");
     // La reprise arrive APRÈS les re-déclarations : le serveur connaît notre
     // fichier et notre ready avant de recevoir la position.
-    isize sf = -1, sr = -1, pg = -1;
+    isize sr = -1, pg = -1;
     for (isize i = 0; i < out.msg_count; i++) {
         if (out.msgs[i].kind == VS_MSG_SET_READY) sr = i;
-        if (out.msgs[i].kind == VS_MSG_SET_FILE) sf = i;
         if (out.msgs[i].kind == VS_MSG_PING) pg = i;
     }
     CHECK(sr >= 0 && pg >= 0 && c > sr && c > pg, "ordre : setReady/ping puis control");
-    VS_UNUSED(sf);
-    // Le hold post-action est armé : pas d'alignement sur la position 0.
-    CHECK(e.user_hold_until > t0, "hold post-action armé par la reprise");
+    CHECK(e.user_hold_until > t1, "hold post-action armé par la reprise");
 
-    // setBy renseigné : quelqu'un pilote déjà, on ne propose rien.
+    // PREMIER join dans une salle vierge : jamais de reprise, même si VLC est
+    // très loin dans le film. C'est la règle resserrée.
     engine_init(&e);
     vs_output_reset(&out);
+    engine_set_room(&e, S("salon"));
     engine_on_vlc_status(&e, t0, &st, &out);
+    vs_output_reset(&out);
+    engine_on_welcome(&e, t0, S("u1"), &virgin, NULL, &out);
+    CHECK(count_msgs(&out, VS_MSG_CONTROL) == 0 && !out.have_resume_toast,
+          "premier join : aucune reprise, quel que soit l'état de VLC");
+
+    // Séance connue mais dans une AUTRE salle : la mémoire ne fuit pas.
+    engine_init(&e);
+    vs_output_reset(&out);
+    join_room(&e, t0, "salon", 1800, &out);
+    engine_on_vlc_status(&e, t0, &st, &out);
+    tick_at(&e, lost_at, &out);
+    engine_session_lost(&e);
+    engine_set_room(&e, S("autre-salle"));
+    vs_output_reset(&out);
+    engine_on_welcome(&e, t1, S("u1"), &virgin, NULL, &out);
+    CHECK(count_msgs(&out, VS_MSG_CONTROL) == 0, "changement de salle : aucune reprise");
+
+    // setBy renseigné : quelqu'un pilote déjà, on se range derrière lui.
+    engine_init(&e);
+    vs_output_reset(&out);
+    join_room(&e, t0, "salon", 1800, &out);
+    tick_at(&e, lost_at, &out);
+    engine_session_lost(&e);
     VsRoomState owned = mk_room(1, 0, "u2", 1);
     vs_output_reset(&out);
-    engine_on_welcome(&e, t0, S("u1"), &owned, NULL, &out);
+    engine_on_welcome(&e, t1, S("u1"), &owned, NULL, &out);
     CHECK(count_msgs(&out, VS_MSG_CONTROL) == 0 && !out.have_resume_toast,
           "salle déjà pilotée : aucune reprise");
 
     // Position de salle non nulle : ce n'est pas une salle vierge.
     engine_init(&e);
     vs_output_reset(&out);
-    engine_on_vlc_status(&e, t0, &st, &out);
+    join_room(&e, t0, "salon", 1800, &out);
+    tick_at(&e, lost_at, &out);
+    engine_session_lost(&e);
     VsRoomState started = mk_room(1, 42, "", 1);
     vs_output_reset(&out);
-    engine_on_welcome(&e, t0, S("u1"), &started, NULL, &out);
+    engine_on_welcome(&e, t1, S("u1"), &started, NULL, &out);
     CHECK(count_msgs(&out, VS_MSG_CONTROL) == 0, "position de salle non nulle : aucune reprise");
 
-    // Lecteur local sous le seuil : la séance n'avait pas commencé.
+    // Séance connue mais sous le seuil : elle n'avait pas commencé.
     engine_init(&e);
     vs_output_reset(&out);
-    VsStatus early = mk_status(VS_PLAY_PAUSED, 3, 7200);
-    engine_on_vlc_status(&e, t0, &early, &out);
+    join_room(&e, t0, "salon", 2, &out);
+    tick_at(&e, t0, &out);
+    engine_session_lost(&e);
     vs_output_reset(&out);
-    b32 not_ready = 0;
-    engine_on_welcome(&e, t0, S("u1"), &virgin, &not_ready, &out);
-    CHECK(count_msgs(&out, VS_MSG_CONTROL) == 0, "lecteur à 3 s : aucune reprise");
+    engine_on_welcome(&e, t0 + SEC, S("u1"), &virgin, NULL, &out);
+    CHECK(count_msgs(&out, VS_MSG_CONTROL) == 0, "séance à 3 s : aucune reprise");
 
-    // Aucun média chargé : rien à proposer.
+    // Une salle vierge n'écrase pas la mémoire : deux redémarrages d'affilée
+    // proposent toujours la position de la séance.
     engine_init(&e);
     vs_output_reset(&out);
-    engine_on_welcome(&e, t0, S("u1"), &virgin, NULL, &out);
-    CHECK(count_msgs(&out, VS_MSG_CONTROL) == 0, "sans média : aucune reprise");
+    join_room(&e, t0, "salon", 1800, &out);
+    tick_at(&e, lost_at, &out);
+    engine_session_lost(&e);
+    vs_output_reset(&out);
+    engine_on_welcome(&e, t1, S("u1"), &virgin, NULL, &out);
+    CHECK(count_msgs(&out, VS_MSG_CONTROL) == 1, "première reprise");
+    engine_session_lost(&e);
+    vs_output_reset(&out);
+    engine_on_welcome(&e, t1 + 5 * SEC, S("u1"), &virgin, NULL, &out);
+    CHECK(count_msgs(&out, VS_MSG_CONTROL) == 1, "seconde reprise : la mémoire a survécu au vierge");
 }
 
 static void test_buffering_suspend(void) {
@@ -1801,7 +1887,7 @@ static void test_buffering_suspend(void) {
     }
     CHECK(e.buffering == 1, "la détection reprend après la suspension");
 
-    // Une suspension plus lointaine n'est jamais raccourcie par une nouvelle.
+    // Une suspension en cours n'est ni raccourcie ni prolongée.
     engine_init(&e);
     e.phase = VS_PHASE_CONNECTED;
     vs_output_reset(&out);
@@ -1810,6 +1896,223 @@ static void test_buffering_suspend(void) {
     vs_output_reset(&out);
     engine_user_control(&e, t - 500 * MS, VS_ACT_SEEK, 20, 1, &out);
     CHECK(e.buf.suspend_until == far_until, "une suspension antérieure ne raccourcit pas la fenêtre");
+    vs_output_reset(&out);
+    engine_user_control(&e, t + 500 * MS, VS_ACT_SEEK, 30, 1, &out);
+    CHECK(e.buf.suspend_until == far_until, "une suspension en cours n'est pas prolongée");
+
+    // Anti-masquage : la fenêtre de refroidissement empêche un redémarrage
+    // immédiat après la fin d'une suspension.
+    engine_init(&e);
+    e.phase = VS_PHASE_CONNECTED;
+    vs_output_reset(&out);
+    engine_user_control(&e, t, VS_ACT_SEEK, 10, 1, &out);
+    i64 ends = e.buf.suspend_until;
+    vs_output_reset(&out);
+    engine_user_control(&e, ends + 200 * MS, VS_ACT_SEEK, 20, 1, &out);
+    CHECK(e.buf.suspend_until == ends, "pas de nouvelle suspension moins d'1 s après la fin");
+    vs_output_reset(&out);
+    engine_user_control(&e, ends + 1200 * MS, VS_ACT_SEEK, 30, 1, &out);
+    CHECK(e.buf.suspend_until > ends, "nouvelle suspension acceptée passé le refroidissement");
+
+    // LA propriété exigée : un VLC durablement figé est diagnostiqué
+    // bufferisant en ≤ 5 s MALGRÉ une correction (donc une suspension) à
+    // chaque poll de 200 ms.
+    engine_init(&e);
+    e.phase = VS_PHASE_CONNECTED;
+    vs_output_reset(&out);
+    i64 start = t + 60000 * MS;
+    st = mk_status(VS_PLAY_PLAYING, 42, 7200);
+    engine_on_vlc_status(&e, start, &st, &out);
+    i64 diagnosed_at = -1;
+    for (int i = 1; i <= 40 && diagnosed_at < 0; i++) {  // 8 s de simulation
+        i64 tt = start + (i64)i * 200 * MS;
+        vs_output_reset(&out);
+        engine_user_control(&e, tt, VS_ACT_SEEK, 42, 1, &out);  // correction à chaque poll
+        vs_output_reset(&out);
+        engine_on_vlc_status(&e, tt, &st, &out);  // VLC reste figé sur 42
+        if (e.buffering) diagnosed_at = tt - start;
+    }
+    CHECK(diagnosed_at >= 0 && diagnosed_at <= 5000 * MS,
+          "VLC figé diagnostiqué en %lld ms malgré des corrections répétées (≤ 5000 exigé)",
+          (long long)(diagnosed_at < 0 ? -1 : diagnosed_at / MS));
+}
+
+// ------------------------------------- dossiers médias, recherche (VS-026) ---
+
+// mk_tree fabrique une arborescence temporaire et renvoie sa racine.
+static Str8 mk_tree(Arena *a, const char *leaf) {
+    u16 wtmp[MAX_PATH];
+    DWORD n = GetTempPathW(MAX_PATH, (LPWSTR)wtmp);
+    if (n == 0) return str8_lit("");
+    Str8 root = str8_cat(a, utf16_to_utf8(a, wtmp), str8_from_cstr(leaf));
+    u16 *w = utf8_to_utf16(a, root, NULL);
+    CreateDirectoryW((LPCWSTR)w, NULL);
+    return root;
+}
+
+static void mk_dir(Arena *a, Str8 parent, const char *name) {
+    Str8 p = str8_cat(a, str8_cat(a, parent, S("\\")), S(name));
+    u16 *w = utf8_to_utf16(a, p, NULL);
+    CreateDirectoryW((LPCWSTR)w, NULL);
+}
+
+// mk_file crée un fichier de `size` octets (le contenu n'a aucune importance,
+// seule la taille sert à départager les homonymes).
+static void mk_file(Arena *a, Str8 dir, const char *name, isize size) {
+    Str8 p = str8_cat(a, str8_cat(a, dir, S("\\")), S(name));
+    u16 *w = utf8_to_utf16(a, p, NULL);
+    HANDLE h = CreateFileW((LPCWSTR)w, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    if (size > 0) {
+        u8 *buf = arena_push_array(a, u8, size);
+        DWORD written = 0;
+        WriteFile(h, buf, (DWORD)size, &written, NULL);
+    }
+    CloseHandle(h);
+}
+
+// rm_tree efface récursivement (nettoyage de fin de test).
+static void rm_tree(Arena *a, Str8 dir) {
+    TempArena t = temp_begin(a);
+    Str8 pattern = str8_cat(a, dir, S("\\*"));
+    u16 *wp = utf8_to_utf16(a, pattern, NULL);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW((LPCWSTR)wp, &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            Str8 name = utf16_to_utf8(a, (const u16 *)fd.cFileName);
+            if (str8_eq(name, S(".")) || str8_eq(name, S(".."))) continue;
+            Str8 child = str8_cat(a, str8_cat(a, dir, S("\\")), name);
+            u16 *wc = utf8_to_utf16(a, child, NULL);
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) rm_tree(a, child);
+            else DeleteFileW((LPCWSTR)wc);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    u16 *wd = utf8_to_utf16(a, dir, NULL);
+    RemoveDirectoryW((LPCWSTR)wd);
+    temp_end(t);
+}
+
+static void test_media(Arena *a) {
+    section("dossiers médias");
+    TempArena top = temp_begin(a);
+
+    // --- sérialisation dans l'ini ---
+    {
+        StrBuf dirs[MEDIA_MAX_DIRS];
+        memset(dirs, 0, sizeof(dirs));
+        strbuf_set(&dirs[0], S("C:\\Users\\thib\\Downloads"));
+        strbuf_set(&dirs[1], S("D:\\Films & séries"));
+        Str8 packed = media_dirs_join(a, dirs, 2);
+        CHECK(str8_eq(packed, S("C:\\Users\\thib\\Downloads|D:\\Films & séries")), "jointure : « %.*s »",
+              (int)packed.len, packed.data);
+        StrBuf back[MEDIA_MAX_DIRS];
+        memset(back, 0, sizeof(back));
+        isize n = media_dirs_split(packed, back, MEDIA_MAX_DIRS);
+        CHECK(n == 2 && strbuf_eq(&back[0], S("C:\\Users\\thib\\Downloads")) &&
+                  strbuf_eq(&back[1], S("D:\\Films & séries")),
+              "aller-retour exact (%lld)", (long long)n);
+        // Entrées vides et surplus.
+        n = media_dirs_split(S("|A||B|"), back, MEDIA_MAX_DIRS);
+        CHECK(n == 2 && strbuf_eq(&back[0], S("A")), "entrées vides ignorées (%lld)", (long long)n);
+        CHECK(media_dirs_split(S(""), back, MEDIA_MAX_DIRS) == 0, "chaîne vide");
+        n = media_dirs_split(S("A|B|C"), back, 2);
+        CHECK(n == 2, "surplus abandonné au-delà du maximum (%lld)", (long long)n);
+        CHECK(media_dirs_join(a, dirs, 0).len == 0, "jointure vide");
+    }
+
+    // --- recherche sur une arborescence réelle ---
+    Str8 root = mk_tree(a, "vibesync-media-test");
+    CHECK(root.len > 0, "arborescence temporaire créée");
+    if (root.len == 0) {
+        temp_end(top);
+        return;
+    }
+    mk_dir(a, root, "films");
+    Str8 films = str8_cat(a, root, S("\\films"));
+    mk_dir(a, films, "vo");
+    Str8 vo = str8_cat(a, films, S("\\vo"));
+    mk_file(a, root, "autre.mkv", 10);
+    mk_file(a, films, "EP1-VOSTFR.mkv", 100);   // casse différente
+    mk_file(a, vo, "ep1-vostfr.mkv", 5000);     // homonyme, plus gros
+    mk_file(a, vo, "bande-annonce.mp4", 20);
+
+    StrBuf dirs[MEDIA_MAX_DIRS];
+    memset(dirs, 0, sizeof(dirs));
+    strbuf_set(&dirs[0], root);
+    MediaFind r;
+
+    // Trouvé malgré la casse, et le plus gros homonyme l'emporte.
+    CHECK(media_find(a, dirs, 1, S("ep1-vostfr.mkv"), &r), "fichier trouvé");
+    CHECK(r.matches == 2, "deux homonymes vus (%lld)", (long long)r.matches);
+    CHECK(r.size_bytes == 5000, "le plus gros gagne (%lld octets)", (long long)r.size_bytes);
+    CHECK(r.found && strbuf_str(&r.path).len > 0, "chemin complet rendu");
+    {
+        Str8 p = strbuf_str(&r.path);
+        b32 in_vo = 0;
+        for (isize i = 0; i + 3 <= p.len; i++) {
+            if (memcmp(p.data + i, "\\vo\\", 4) == 0) in_vo = 1;
+        }
+        CHECK(in_vo, "chemin du gros fichier : %.*s", (int)p.len, p.data);
+    }
+    // Recherche insensible à la casse dans l'autre sens.
+    CHECK(media_find(a, dirs, 1, S("EP1-VOSTFR.MKV"), &r) && r.matches == 2, "recherche insensible à la casse");
+    // Nom exact : pas de correspondance partielle.
+    CHECK(!media_find(a, dirs, 1, S("ep1"), &r), "pas de correspondance partielle");
+    CHECK(!media_find(a, dirs, 1, S("absent.mkv"), &r), "fichier absent");
+    CHECK(r.visited > 0, "entrées parcourues comptées (%lld)", (long long)r.visited);
+    // Cas dégénérés.
+    CHECK(!media_find(a, dirs, 1, S(""), &r), "nom vide refusé");
+    CHECK(!media_find(a, dirs, 0, S("ep1-vostfr.mkv"), &r), "aucun dossier : rien à chercher");
+    {
+        StrBuf missing[1];
+        memset(missing, 0, sizeof(missing));
+        strbuf_set(&missing[0], str8_cat(a, root, S("\\nexiste-pas")));
+        CHECK(!media_find(a, missing, 1, S("ep1-vostfr.mkv"), &r), "dossier inexistant : échec propre");
+    }
+    // Une barre finale ne casse pas la construction du chemin.
+    {
+        StrBuf slash[1];
+        memset(slash, 0, sizeof(slash));
+        strbuf_set(&slash[0], str8_cat(a, root, S("\\")));
+        CHECK(media_find(a, slash, 1, S("autre.mkv"), &r), "dossier avec barre finale");
+    }
+
+    // --- borne de profondeur : au-delà de 6 niveaux, on ne descend plus ---
+    {
+        Str8 deep = root;
+        for (int i = 0; i < 8; i++) {
+            char name[8];
+            snprintf(name, sizeof(name), "n%d", i);
+            mk_dir(a, deep, name);
+            deep = str8_cat(a, str8_cat(a, deep, S("\\")), S(name));
+        }
+        mk_file(a, deep, "trop-loin.mkv", 10);
+        CHECK(!media_find(a, dirs, 1, S("trop-loin.mkv"), &r),
+              "profondeur > %d : non atteint (%lld entrées)", MEDIA_MAX_DEPTH, (long long)r.visited);
+        // À la profondeur maximale, en revanche, on trouve.
+        Str8 shallow = str8_cat(a, root, S("\\n0\\n1\\n2\\n3\\n4"));
+        mk_file(a, shallow, "juste-assez.mkv", 10);
+        CHECK(media_find(a, dirs, 1, S("juste-assez.mkv"), &r), "profondeur atteignable : trouvé");
+    }
+
+    // --- borne d'entrées : beaucoup de fichiers, la recherche s'écourte ---
+    {
+        mk_dir(a, root, "beaucoup");
+        Str8 many = str8_cat(a, root, S("\\beaucoup"));
+        for (int i = 0; i < 300; i++) {
+            char name[32];
+            snprintf(name, sizeof(name), "f%04d.bin", i);
+            mk_file(a, many, name, 0);
+        }
+        CHECK(media_find(a, dirs, 1, S("f0299.bin"), &r), "trouvé parmi 300 fichiers");
+        CHECK(r.visited <= MEDIA_MAX_ENTRIES, "borne d'entrées respectée (%lld)", (long long)r.visited);
+        CHECK(!r.truncated, "300 fichiers : pas de troncature");
+    }
+
+    rm_tree(a, root);
+    temp_end(top);
 }
 
 // --------------------------------- mot de passe mémorisé (VS-025, DPAPI) ---
@@ -2837,6 +3140,7 @@ int main(int argc, char **argv) {
     test_offline_queue();
     test_virgin_resume();
     test_buffering_suspend();
+    test_media(a);
     test_secret(a);
     test_vlc_live(a);
     test_net_live(a);

@@ -22,7 +22,7 @@ set "WARN=-Wall -Wextra -Werror -Wshadow -Wvla -Wstrict-prototypes -Wmissing-pro
 set "LIBS=-lwinhttp -lws2_32 -lbcrypt -lgdi32 -luser32 -lole32 -luuid -lshell32 -lcrypt32"
 rem Chaque chemin est entre guillemets : un checkout dans un dossier contenant
 rem des espaces doit compiler sans bricolage.
-set "CORE="%ROOT%src\base.c" "%ROOT%src\json.c" "%ROOT%src\protocol.c" "%ROOT%src\engine.c" "%ROOT%src\vlc.c" "%ROOT%src\net.c" "%ROOT%src\ini.c" "%ROOT%src\conn.c" "%ROOT%src\health.c" "%ROOT%src\secret.c" "%ROOT%src\ui.c""
+set "CORE="%ROOT%src\base.c" "%ROOT%src\json.c" "%ROOT%src\protocol.c" "%ROOT%src\engine.c" "%ROOT%src\vlc.c" "%ROOT%src\net.c" "%ROOT%src\ini.c" "%ROOT%src\conn.c" "%ROOT%src\health.c" "%ROOT%src\secret.c" "%ROOT%src\media.c" "%ROOT%src\ui.c""
 set "VECTORS=%ROOT%..\..\test\vectors"
 if not exist "%ROOT%build" mkdir "%ROOT%build"
 

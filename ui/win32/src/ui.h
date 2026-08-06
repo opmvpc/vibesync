@@ -10,6 +10,7 @@
 
 #include "base.h"
 #include "engine.h"
+#include "media.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -19,6 +20,7 @@
 #define UI_MAX_USERS 16
 #define UI_CHAT_LINE_CAP 240
 #define UI_MAX_PENDING VS_CHAT_QUEUE_MAX
+#define UI_MAX_MEDIA_DIRS MEDIA_MAX_DIRS
 
 // --- palette (thème sombre) ---
 #define UI_BG 0x1a1b1eu
@@ -191,6 +193,17 @@ typedef struct {
     b32 retrying_wait;       // attente de backoff : bouton Annuler proposé
     i64 retry_seconds;
 
+    // ---- dossiers médias (VS-026) ----
+    char media_dirs[UI_MAX_MEDIA_DIRS][260];
+    isize media_dir_count;
+    b32 media_searching;        // recherche en cours (hors thread UI)
+    char media_notice[224];     // « … introuvable » : bandeau + raccourci Réglages
+    b32 media_notice_show;
+    // Bandeau « X regarde <fichier> » à l'arrivée en salle.
+    char watch_who[64];
+    char watch_file[160];
+    b32 watch_show;
+
     // ---- versions et mise à jour (VS-023) ----
     char version_client[24];
     char version_server[24];
@@ -232,6 +245,16 @@ typedef struct {
     b32 act_update_download;
     b32 act_update_dismiss;
     b32 act_remember_changed;  // la case « se souvenir » vient de basculer
+    // VS-026 : ouverture du fichier d'un participant, dossiers médias.
+    b32 act_open_user_file;    // double-clic sur la ligne d'un participant
+    isize act_open_user_index;
+    b32 act_open_watch_file;   // clic sur le bandeau « X regarde … »
+    b32 act_dismiss_watch;
+    b32 act_notice_settings;   // « introuvable » → ouvrir les Réglages
+    b32 act_dismiss_notice;
+    b32 act_media_add;         // ajouter un dossier (dialogue natif)
+    b32 act_media_remove;
+    isize act_media_remove_index;
 
     // focus_request : main.c désigne le champ à corriger après une erreur.
     UiFieldRef focus_request;
