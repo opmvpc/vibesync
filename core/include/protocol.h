@@ -115,10 +115,17 @@ void proto_fill(Arena *a, Str8 type, const JsonValue *data, VsInMsg *m);
 // proto_error_is_fatal dit si un code d'erreur serveur interdit de réessayer.
 b32 proto_error_is_fatal(Str8 code);
 
-// proto_semver_cmp compare deux versions « x.y.z » : <0, 0 ou >0. Un « v »
-// initial est toléré, un suffixe de pré-version (« -rc1 », « +build ») est
-// ignoré, un composant manquant ou illisible vaut 0. Ne sert qu'à décider
-// « le serveur est-il plus récent que moi ? » — pas un moteur semver complet.
-int proto_semver_cmp(Str8 a, Str8 b);
+// proto_newer_version dit si la version `server` est strictement plus récente
+// que `client` — la seule question que posent les deux clients, pour proposer
+// une mise à jour. Portage exact de `NewerVersion` (internal/client/version.go).
+//
+// Format : `major[.minor[.patch]]`, chiffres seulement, « v » initial toléré,
+// suffixe de pré-version (« -rc1 ») et métadonnées de build (« +sha ») admis,
+// espaces de bord rognés. Renvoie 0 dès que l'une des deux est ILLISIBLE
+// (« dev », vide, texte, plus de trois composants) : un build non versionné ne
+// doit jamais provoquer d'invitation à mettre à jour. À triplet égal, une
+// pré-version est antérieure à la version nue ; deux pré-versions du même
+// triplet ne sont pas départagées. Pas un moteur semver complet.
+b32 proto_newer_version(Str8 server, Str8 client);
 
 #endif // VS_PROTOCOL_H

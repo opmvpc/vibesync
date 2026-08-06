@@ -1,32 +1,19 @@
-// Version.swift — version applicative du client et comparaison semver simple.
+// Version.swift — version applicative du client, et frontière avec la
+// comparaison de versions du C commun (ADR-010).
 //
-// Port de internal/client/version.go (VS-023). Volontairement minimal : le
-// garde-fou dur de compatibilité reste la version de PROTOCOLE, refusée par le
-// serveur au hello. Ici on ne cherche qu'à dire « le serveur est plus récent que
-// moi » pour proposer un téléchargement — jamais pour bloquer quoi que ce soit.
+// Ce fichier ne décide plus rien. La règle « le serveur est-il plus récent que
+// moi ? » vit dans `proto_newer_version` (core/src/protocol.c), portage exact de
+// internal/client/version.go, et les deux clients natifs l'appellent — c'était
+// le solde du bloc 3 de VS-033, tranché par VS-036. Le port Swift qui vivait
+// ici (parse + comparaison) a disparu avec ses 35 cas de test, qui rejouent
+// maintenant le chemin C ; le C commun porte les mêmes cas (test_core.c).
 //
-// Format accepté : `major[.minor[.patch]]`, chiffres seulement, avec un « v »
-// initial optionnel, un suffixe de pré-release (`-rc1`) et des métadonnées de
-// build (`+sha`). Les composants absents valent 0. Tout le reste (« dev », vide,
-// texte) est illisible : dans le doute, on ne dit rien.
-//
-// VS-033 (phase 4 d'ADR-010) — POURQUOI CE FICHIER N'A PAS BASCULÉ SUR LE C.
-// La couche commune a bien une comparaison de versions, `proto_semver_cmp`
-// (core/src/protocol.c), et c'est elle que le client Windows appelle sans autre
-// précaution (main.c, on_server_message). Elle est plus SIMPLE que ce port de
-// internal/client/version.go : elle ne rogne pas les espaces, n'a pas de notion
-// d'illisibilité (« dev », vide, texte → 0.0.0) et ignore les suffixes de
-// pré-version. Sur les 35 cas de testNewerVersion, 9 divergent — dans les deux
-// sens : bannière indue quand notre propre version est illisible (« dev » →
-// 0.0.0, donc TOUT serveur numéroté paraît plus récent), bannière manquante
-// quand la version du serveur porte un espace de tête. Basculer aurait exigé de
-// réécrire 9 attentes de test pour un comportement moins bon ; le point est
-// remonté tel quel (rapport VS-033) parce que l'écart est CELUI DE WINDOWS, pas
-// celui de macOS : c'est le C commun qu'il faut corriger, pour les deux clients
-// à la fois. `AppVersion.current` (lecture de l'Info.plist) resterait de toute
-// façon ici : c'est de la plateforme.
+// Ce qui reste ici est de la PLATEFORME : d'où sort la version de ce binaire.
+// Rappel : la comparaison ne sert qu'à proposer un téléchargement, jamais à
+// bloquer — le garde-fou dur reste la version de PROTOCOLE, refusée au hello.
 
 import Foundation
+import VSCore
 
 public enum AppVersion {
 
@@ -50,65 +37,15 @@ public enum AppVersion {
         return trimmed.isEmpty ? dev : trimmed
     }()
 
-    /// maxPart borne chaque composant : au-delà, c'est une saisie absurde plutôt
-    /// qu'une version.
-    static let maxPart = 1_000_000
-
-    struct Parsed {
-        var parts: [Int] = [0, 0, 0]
-        var pre: Bool = false
-    }
-
-    static func parse(_ text: String) -> Parsed? {
-        var out = Parsed()
-        // strings.TrimSpace en Go coupe aussi \n, \r, \t et \v : .whitespaces
-        // seul laisserait passer un VERSION lu avec son saut de ligne.
-        var s = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if s.hasPrefix("v") {
-            s.removeFirst()
-        }
-        // Métadonnées de build : hors de l'ordre, on les coupe d'abord.
-        if let i = s.firstIndex(of: "+") {
-            s = String(s[s.startIndex..<i])
-        }
-        // Pré-release : elle ne change pas le triplet mais le déclasse.
-        if let i = s.firstIndex(of: "-") {
-            out.pre = s.index(after: i) < s.endIndex
-            s = String(s[s.startIndex..<i])
-        }
-        if s.isEmpty || s.contains(" ") || s.contains("\t") {
-            return nil
-        }
-        let parts = s.components(separatedBy: ".")
-        if parts.count > 3 {
-            return nil
-        }
-        for (index, part) in parts.enumerated() {
-            if part.isEmpty {
-                return nil
-            }
-            // Comme strconv.Atoi : un signe est toléré (« +1 »), le négatif est
-            // écarté par la borne basse. Aucun signe ne peut de toute façon
-            // survivre aux coupes sur « + » et « - » faites plus haut.
-            guard let n = Int(part), n >= 0, n <= maxPart else {
-                return nil
-            }
-            out.parts[index] = n
-        }
-        return out
-    }
-
     /// Dit si `remote` est strictement plus récente que `local`. Faux dès que
     /// l'une des deux est illisible : un client « dev » ou un serveur muet ne
-    /// doit jamais provoquer d'invitation à mettre à jour.
+    /// doit jamais provoquer d'invitation à mettre à jour. Aucune arène : la
+    /// fonction C ne fait que lire les deux chaînes.
     public static func newer(_ remote: String, than local: String) -> Bool {
-        guard let r = parse(remote), let l = parse(local) else {
-            return false
+        return withStr8(remote) { r in
+            withStr8(local) { l in
+                proto_newer_version(r, l) != 0
+            }
         }
-        for i in 0..<3 where r.parts[i] != l.parts[i] {
-            return r.parts[i] > l.parts[i]
-        }
-        // Même triplet : seule une stable dépasse une pré-release.
-        return !r.pre && l.pre
     }
 }

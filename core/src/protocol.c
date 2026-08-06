@@ -270,38 +270,112 @@ b32 proto_error_is_fatal(Str8 code) {
            str8_eq_cstr(code, "name_taken");
 }
 
-// semver_part lit le composant numérique commençant en *i et avance *i au
-// séparateur suivant. Tout ce qui n'est pas un chiffre arrête le composant ;
-// un suffixe de pré-version fait tomber le reste à zéro.
-static i64 semver_part(Str8 s, isize *i, b32 *stop) {
-    i64 v = 0;
-    b32 any = 0;
-    while (*i < s.len) {
-        u8 c = s.data[*i];
-        if (c >= '0' && c <= '9') {
-            if (v < 1000000) v = v * 10 + (c - '0');  // borne : pas de débordement
-            any = 1;
-            (*i)++;
-            continue;
-        }
-        break;
-    }
-    if (*i < s.len && s.data[*i] == '.') (*i)++;
-    else *stop = 1;  // fin, ou suffixe « -rc1 » / « +build » : on s'arrête là
-    if (!any) v = 0;
-    return v;
+// ---------------------------------------------------------------- versions ---
+//
+// Portage EXACT de `NewerVersion` / `parseVersion` (internal/client/version.go),
+// implémentation de référence (VS-036). Ce qui précédait ici, `proto_semver_cmp`,
+// était plus laxiste — pas de rognage, pas de notion d'illisibilité, suffixes de
+// pré-version ignorés — et faisait diverger la bannière de mise à jour de neuf
+// cas sur trente-cinq, dans les deux sens.
+//
+// La règle tient en une phrase : une version illisible (« dev », vide, texte)
+// ne se compare à RIEN. Dans le doute, pas de bannière ; le garde-fou dur de
+// compatibilité reste la version de PROTOCOLE, refusée par le serveur au hello.
+//
+// Format accepté : `major[.minor[.patch]]`, chiffres seulement, avec un « v »
+// initial optionnel, un suffixe de pré-version (`-rc1`) et des métadonnées de
+// build (`+sha`). Les composants absents valent 0. À triplet égal, une
+// pré-version est ANTÉRIEURE à la version nue (1.2.3-rc1 < 1.2.3) ; deux
+// pré-versions du même triplet ne sont pas départagées (l'ordre alphabétique
+// mentirait sur rc10 vs rc2).
+
+// VS_VERSION_MAX_PART borne chaque composant : au-delà, c'est une saisie
+// absurde plutôt qu'une version — et le calcul ne peut pas déborder.
+#define VS_VERSION_MAX_PART 1000000
+
+typedef struct {
+    i64 parts[3];
+    b32 pre;
+} SemVer;
+
+// version_trim rogne comme `strings.TrimSpace` : str8_trim ne connaît pas la
+// tabulation verticale ni le saut de page, que Go coupe aussi. Les espaces
+// Unicode exotiques (U+00A0, U+2028…) ne sont, eux, pas rognés : la version
+// reste illisible, donc sans bannière — l'écart tombe du côté prudent.
+static b32 version_is_space(u8 c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';
 }
 
-int proto_semver_cmp(Str8 a, Str8 b) {
-    if (a.len > 0 && (a.data[0] == 'v' || a.data[0] == 'V')) a = str8_sub(a, 1, -1);
-    if (b.len > 0 && (b.data[0] == 'v' || b.data[0] == 'V')) b = str8_sub(b, 1, -1);
-    isize ia = 0, ib = 0;
-    b32 stop_a = 0, stop_b = 0;
-    for (int k = 0; k < 3; k++) {
-        i64 va = stop_a ? 0 : semver_part(a, &ia, &stop_a);
-        i64 vb = stop_b ? 0 : semver_part(b, &ib, &stop_b);
-        if (va < vb) return -1;
-        if (va > vb) return 1;
+static Str8 version_trim(Str8 s) {
+    isize i = 0, j = s.len;
+    while (i < j && version_is_space(s.data[i])) i++;
+    while (j > i && version_is_space(s.data[j - 1])) j--;
+    return str8_sub(s, i, j - i);
+}
+
+// version_num lit un composant comme `strconv.Atoi` suivi des bornes de la
+// référence : chiffres seulement, un signe toléré (« +1 »), négatif refusé,
+// au-delà de la borne refusé. Aucun signe ne peut en pratique survivre aux
+// coupes sur « + » et « - » faites plus haut ; on colle à Atoi quand même.
+static b32 version_num(Str8 p, i64 *out) {
+    if (p.len == 0) return 0;
+    isize i = 0;
+    b32 neg = 0;
+    if (p.data[0] == '+' || p.data[0] == '-') {
+        neg = p.data[0] == '-';
+        i = 1;
     }
-    return 0;
+    if (i >= p.len) return 0;
+    i64 v = 0;
+    for (; i < p.len; i++) {
+        u8 c = p.data[i];
+        if (c < '0' || c > '9') return 0;
+        v = v * 10 + (c - '0');
+        if (v > VS_VERSION_MAX_PART) return 0;  // hors borne : Atoi déborderait
+    }
+    if (neg && v != 0) return 0;
+    *out = v;
+    return 1;
+}
+
+// version_parse découpe une version. Renvoie 0 si elle est illisible.
+static b32 version_parse(Str8 s, SemVer *out) {
+    out->parts[0] = out->parts[1] = out->parts[2] = 0;
+    out->pre = 0;
+    s = version_trim(s);
+    // TrimPrefix « v » : minuscule seulement, comme la référence.
+    if (s.len > 0 && s.data[0] == 'v') s = str8_sub(s, 1, -1);
+    // Métadonnées de build : hors de l'ordre, on les coupe d'abord.
+    isize plus = str8_find_char(s, '+', 0);
+    if (plus >= 0) s = str8_sub(s, 0, plus);
+    // Pré-version : elle ne change pas le triplet mais le déclasse.
+    isize dash = str8_find_char(s, '-', 0);
+    if (dash >= 0) {
+        out->pre = s.len > dash + 1;
+        s = str8_sub(s, 0, dash);
+    }
+    if (s.len == 0) return 0;
+    // Découpe sur « . ». Plus de trois composants : illisible. Espaces et
+    // tabulations internes, que la référence écarte explicitement, ne passent
+    // pas la lecture chiffre par chiffre de version_num.
+    int n = 0;
+    isize start = 0;
+    for (isize i = 0; i <= s.len; i++) {
+        if (i < s.len && s.data[i] != '.') continue;
+        if (n >= 3) return 0;
+        if (!version_num(str8_sub(s, start, i - start), &out->parts[n])) return 0;
+        n++;
+        start = i + 1;
+    }
+    return 1;
+}
+
+b32 proto_newer_version(Str8 server, Str8 client) {
+    SemVer r, l;
+    if (!version_parse(server, &r) || !version_parse(client, &l)) return 0;
+    for (int i = 0; i < 3; i++) {
+        if (r.parts[i] != l.parts[i]) return r.parts[i] > l.parts[i];
+    }
+    // Même triplet : seule une version nue dépasse une pré-version.
+    return !r.pre && l.pre;
 }

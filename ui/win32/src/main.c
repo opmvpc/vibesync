@@ -905,7 +905,7 @@ static void on_server_message(App *app, Str8 raw) {
             if (m->server_version.len > 0) {
                 snprintf(app->ui.version_server, sizeof(app->ui.version_server), "%.*s",
                          (int)m->server_version.len, m->server_version.data);
-                if (proto_semver_cmp(m->server_version, str8_lit(VS_VERSION)) > 0) {
+                if (proto_newer_version(m->server_version, str8_lit(VS_VERSION))) {
                     app->ui.update_available = 1;
                     // Fermée d'un clic, la bannière ne revient qu'à la connexion
                     // suivante : c'est ici, pas à la frame suivante.

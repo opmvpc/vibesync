@@ -868,27 +868,73 @@ static void test_conn_address(Arena *a) {
     temp_end(top);
 }
 
+// VS-036 : les 35 cas de la référence (internal/client/version_test.go, repris
+// tels quels par testNewerVersion côté Swift) rejoués sur le C commun. Les neuf
+// premiers sont ceux où l'ancien proto_semver_cmp divergeait — donc les neuf
+// écarts qu'avait le client Windows.
 static void test_semver(void) {
     section("semver");
     struct {
-        const char *a, *b;
-        int want;
+        const char *server, *client;
+        b32 want;
     } cases[] = {
-        {"0.2.0", "0.2.0", 0},   {"0.2.1", "0.2.0", 1},   {"0.2.0", "0.2.1", -1},
-        {"0.10.0", "0.2.0", 1},  {"1.0.0", "0.99.99", 1}, {"v0.3.0", "0.2.0", 1},
-        {"0.2", "0.2.0", 0},     {"0.2.0", "0.2", 0},     {"1", "0.9.9", 1},
-        {"1.0.0-rc1", "1.0.0", 0},  // suffixe ignoré : c'est documenté
-        {"dev", "0.2.0", -1},       // version non numérique = 0.0.0
-        {"", "0.0.0", 0},
+        // --- les 9 divergences de l'ancien proto_semver_cmp (rapport VS-033 §4).
+        {"9.9.9", "dev", 0},                       // build non versionné : jamais de bannière
+        {"1.0.0", "", 0},                          // version locale muette : idem
+        {"1.2.3.4", "1.0.0", 0},                   // quatre composants : illisible
+        {"1..3", "1.0.0", 0},                      // composant vide : illisible
+        {"99999999999999999999.0.0", "1.0.0", 0},  // hors borne : illisible
+        {"  1.2.4  ", "1.2.3", 1},                 // espaces rognés
+        {"\t1.2.4\r\n", "1.2.3", 1},               // ... y compris tabulation et sauts de ligne
+        {"1.2.3", "1.2.3-rc1", 1},                 // la version nue dépasse la pré-version
+        {"1.2.3+b", "1.2.3-rc1", 1},               // métadonnées de build hors de l'ordre
+        // --- le reste de la suite de référence.
+        {"1.2.3", "1.2.3", 0},
+        {"1.2.4", "1.2.3", 1},
+        {"1.2.2", "1.2.3", 0},
+        {"1.3.0", "1.2.9", 1},
+        {"2.0.0", "1.99.99", 1},
+        {"1.0.0", "2.0.0", 0},
+        {"0.3", "0.2.9", 1},
+        {"0.2", "0.2.0", 0},
+        {"v1.2.4", "1.2.3", 1},
+        {"1.2.4-rc1", "1.2.3", 1},
+        {"1.2.3-rc1", "1.2.3", 0},
+        {"1.2.3-rc2", "1.2.3-rc1", 0},  // deux pré-versions : non départagées
+        {"1.2.2-rc1", "1.2.3", 0},
+        {"1.2.3-", "1.2.3", 0},  // tiret nu : pas une pré-version, triplet égal
+        {"1.2.3+build7", "1.2.3", 0},
+        {"1.2.4+build7", "1.2.3", 1},
+        {"1.10.0", "1.9.0", 1},
+        {"dev", "1.0.0", 0},
+        {"on-verra-plus-tard", "1.0.0", 0},
+        {"-1.2.3", "1.0.0", 0},
+        {"1.2.4\n", "1.2.3", 1},
+        {"1.2.3", "1.2.3\n", 0},
+        {"1.2.4", "\n1.2.3\n", 1},
+        {"+1.2.4", "1.2.3", 0},  // « + » en tête : il ne reste rien à lire
+        {"1.+2.4", "1.2.3", 0},
     };
     for (isize i = 0; i < VS_ARRAY_COUNT(cases); i++) {
-        int got = proto_semver_cmp(S(cases[i].a), S(cases[i].b));
-        CHECK(got == cases[i].want, "semver(%s, %s) = %d, attendu %d", cases[i].a, cases[i].b, got,
-              cases[i].want);
+        b32 got = proto_newer_version(S(cases[i].server), S(cases[i].client));
+        CHECK(got == cases[i].want, "newer(%s, %s) = %d, attendu %d", cases[i].server,
+              cases[i].client, got, cases[i].want);
     }
-    // La bannière ne doit jamais apparaître pour une version égale ou plus vieille.
-    CHECK(proto_semver_cmp(S("0.2.0"), S(VS_VERSION)) <= 0 || proto_semver_cmp(S("9.9.9"), S(VS_VERSION)) > 0,
-          "comparaison utilisable contre VS_VERSION");
+
+    // Antisymétrie : deux versions ne peuvent pas être chacune plus récente que
+    // l'autre (testNewerVersionIsAntisymmetric côté Swift).
+    const char *versions[] = {"0.0.1", "0.1.0", "0.2.0",     "1.0.0",
+                              "1.0.1", "1.2.3-rc1", "1.2.3", "v2.0.0"};
+    for (isize i = 0; i < VS_ARRAY_COUNT(versions); i++) {
+        for (isize j = 0; j < VS_ARRAY_COUNT(versions); j++) {
+            CHECK(!(proto_newer_version(S(versions[i]), S(versions[j])) &&
+                    proto_newer_version(S(versions[j]), S(versions[i]))),
+                  "%s et %s chacune plus récente que l'autre", versions[i], versions[j]);
+        }
+    }
+
+    // La bannière ne doit jamais s'afficher contre notre propre version.
+    CHECK(!proto_newer_version(S(VS_VERSION), S(VS_VERSION)), "VS_VERSION jamais plus récente qu'elle-même");
 }
 
 // La règle non négociable : un refus du serveur n'entraîne JAMAIS de nouvelle
