@@ -130,5 +130,20 @@ Source de vérité du protocole client↔serveur. Les types Go correspondants vi
 
 - Reconnexion WS automatique du client (backoff 1 s → 10 s), re-`hello` avec le même
   pseudo, resync via `welcome`.
+- **File d'attente hors ligne** : seuls les messages `chat` composés pendant une
+  déconnexion sont mis en file (bornée à 20, les plus anciens sont abandonnés) et
+  envoyés après le re-hello. `setReady` et `setFile` ne sont pas mis en file :
+  l'état courant est re-déclaré après chaque `welcome`. Les `control` ne sont
+  JAMAIS rejoués (une action périmée écraserait la salle) ; `ping` et `report`
+  jamais mis en file.
+- **Reconnexion sans écrasement** : après un `welcome`, le moteur adopte l'état de
+  la salle (seek local si nécessaire) et n'émet aucun `control` de rattrapage —
+  la détection d'action utilisateur est inhibée pendant cet alignement.
+- **Salle vierge (reprise après perte du serveur)** : si le `welcome` montre une
+  salle qui n'a jamais reçu de control (`setBy` vide, position 0) et que VLC est
+  au-delà de 5 s, le client émet UNE reprise `control seek` à sa position
+  (toast « Reprise à HH:MM:SS »). Couvre le redémarrage du serveur qui a perdu
+  ses salles malgré le linger ; si plusieurs clients reviennent, le dernier gagne
+  (positions quasi identiques par construction).
 - Serveur : ping WS de transport toutes les 30 s, timeout de lecture 60 s.
 - Tout message inconnu est ignoré (forward-compat) mais loggé en debug.
