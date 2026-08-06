@@ -857,6 +857,7 @@ void ui_init(UiApp *app) {
     app->scratch = arena_create(VS_MB(2));
     ui_text_set(&app->f_server, str8_lit("ws://127.0.0.1:8080/ws"));
     ui_text_set(&app->f_room, str8_lit("salon"));
+    snprintf(app->version_client, sizeof(app->version_client), "%s", VS_VERSION);
 }
 
 static void free_fonts(UiApp *app) {
@@ -918,6 +919,11 @@ enum {
     ID_SET_DETECT,
     ID_SET_SAVE,
     ID_SET_CANCEL,
+    ID_TEST,
+    ID_CANCEL,
+    ID_USE_WSS,
+    ID_UPDATE,
+    ID_UPDATE_CLOSE,
 };
 
 // gear_button dessine le bouton engrenage (discret, même rendu partout).
@@ -930,13 +936,44 @@ static b32 gear_button(UiApp *a, HDC dc, Rect r) {
     return clicked;
 }
 
+// health_dot dessine la pastille de joignabilité et son libellé.
+static void health_line(UiApp *a, HDC dc, Rect r) {
+    u32 col = UI_FAINT;
+    const char *label = "Joignabilité non testée";
+    char buf[224];
+    switch (a->health) {
+        case UI_HEALTH_TESTING:
+            col = UI_WARN;
+            label = "Test du serveur…";
+            break;
+        case UI_HEALTH_OK:
+            col = UI_OK;
+            snprintf(buf, sizeof(buf), "Serveur en ligne (%lld ms)", (long long)a->health_latency_ms);
+            label = buf;
+            break;
+        case UI_HEALTH_FAIL:
+            col = UI_DANGER;
+            snprintf(buf, sizeof(buf), "Injoignable — %s", a->health_msg);
+            label = buf;
+            break;
+        case UI_HEALTH_UNKNOWN:
+        default: break;
+    }
+    i32 d = S(a, 8);
+    fill_round(dc, rect(r.x, r.y + (r.h - d) / 2, d, d), d / 2, col);
+    draw_text(a, dc, rect(r.x + d + S(a, 7), r.y, r.w - d - S(a, 7), r.h), label, col == UI_FAINT ? UI_FAINT : UI_MUTED,
+              a->f_small, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+}
+
 static void screen_connect(UiApp *a, HDC dc, i64 now_ms) {
-    i32 card_w = VS_MIN(S(a, 420), a->width - S(a, 48));
+    i32 card_w = VS_MIN(S(a, 440), a->width - S(a, 48));
     i32 pad = S(a, 24);
     i32 fh = S(a, 38);   // hauteur d'un champ
     i32 gap = S(a, 14);
-    i32 card_h = S(a, 118) + 4 * (S(a, 18) + fh + gap) + S(a, 46) + S(a, 46);
-    Rect card = rect((a->width - card_w) / 2, VS_MAX(S(a, 24), (a->height - card_h) / 2), card_w, card_h);
+    i32 hint_h = S(a, 20);  // ligne de joignabilité / d'aide sous le serveur
+    i32 card_h = S(a, 118) + 4 * (S(a, 18) + fh + gap) + hint_h + S(a, 46) + S(a, 46);
+    if (a->server_hint[0]) card_h += hint_h;
+    Rect card = rect((a->width - card_w) / 2, VS_MAX(S(a, 16), (a->height - card_h) / 2), card_w, card_h);
     panel(a, dc, card);
 
     i32 x = card.x + pad, w = card.w - 2 * pad;
@@ -954,6 +991,37 @@ static void screen_connect(UiApp *a, HDC dc, i64 now_ms) {
               DT_LEFT | DT_TOP | DT_SINGLELINE);
     y += S(a, 34);
 
+    b32 submit = 0;
+
+    // --- Serveur : champ + bouton Tester, puis l'état de joignabilité ---
+    label(a, dc, rect(x, y, w, S(a, 18)), "Serveur");
+    y += S(a, 18);
+    i32 test_w = S(a, 74);
+    if (field(a, dc, rect(x, y, w - test_w - S(a, 8), fh), &a->f_server, "vibesync.exemple.fr", ID_SERVER, 0,
+              now_ms)) {
+        submit = 1;
+    }
+    if (button(a, dc, rect(x + w - test_w, y, test_w, fh), "Tester", ID_TEST, BTN_GHOST,
+               a->health != UI_HEALTH_TESTING)) {
+        a->act_test_server = 1;
+    }
+    y += fh + S(a, 4);
+    health_line(a, dc, rect(x, y, w, hint_h));
+    y += hint_h;
+    if (a->server_hint[0]) {
+        // Adresse normalisée ou bascule TLS proposée : un clic pour l'adopter.
+        u32 col = a->health_tls_hint ? UI_WARN : UI_FAINT;
+        i32 use_w = S(a, 78);
+        draw_text(a, dc, rect(x, y, w - use_w - S(a, 6), hint_h), a->server_hint, col, a->f_small,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        if (button(a, dc, rect(x + w - use_w, y - S(a, 3), use_w, hint_h + S(a, 6)), "Utiliser", ID_USE_WSS,
+                   BTN_SUBTLE, 1)) {
+            a->act_use_wss = 1;
+        }
+        y += hint_h;
+    }
+    y += gap - S(a, 4);
+
     struct {
         const char *lab;
         UiText *t;
@@ -961,12 +1029,10 @@ static void screen_connect(UiApp *a, HDC dc, i64 now_ms) {
         const char *ph;
         b32 pwd;
     } fields[] = {
-        {"Serveur", &a->f_server, ID_SERVER, "wss://vibesync.exemple.fr/ws", 0},
         {"Pseudo", &a->f_name, ID_NAME, "votre pseudo", 0},
         {"Salle", &a->f_room, ID_ROOM, "salon", 0},
         {"Mot de passe (optionnel)", &a->f_password, ID_PASSWORD, "aucun", 1},
     };
-    b32 submit = 0;
     for (isize i = 0; i < VS_ARRAY_COUNT(fields); i++) {
         label(a, dc, rect(x, y, w, S(a, 18)), fields[i].lab);
         y += S(a, 18);
@@ -976,12 +1042,25 @@ static void screen_connect(UiApp *a, HDC dc, i64 now_ms) {
         y += fh + gap;
     }
 
-    b32 busy = a->connecting;
-    if (button(a, dc, rect(x, y, w, S(a, 44)), busy ? "Connexion…" : "Se connecter", ID_CONNECT, BTN_PRIMARY,
-               !busy)) {
+    // --- Connexion : pendant une tentative, Annuler rend la main ---
+    b32 busy = a->connecting || a->retrying_wait;
+    i32 bh = S(a, 44);
+    if (busy) {
+        i32 cancel_w = S(a, 108);
+        char lab[64];
+        if (a->retrying_wait && a->retry_seconds > 0) {
+            snprintf(lab, sizeof(lab), "Nouvel essai dans %lld s…", (long long)a->retry_seconds);
+        } else {
+            snprintf(lab, sizeof(lab), "Connexion…");
+        }
+        button(a, dc, rect(x, y, w - cancel_w - S(a, 8), bh), lab, ID_CONNECT, BTN_PRIMARY, 0);
+        if (button(a, dc, rect(x + w - cancel_w, y, cancel_w, bh), "Annuler", ID_CANCEL, BTN_GHOST, 1)) {
+            a->act_cancel_connect = 1;
+        }
+    } else if (button(a, dc, rect(x, y, w, bh), "Se connecter", ID_CONNECT, BTN_PRIMARY, 1)) {
         submit = 1;
     }
-    y += S(a, 44) + S(a, 12);
+    y += bh + S(a, 12);
 
     if (a->status[0]) {
         draw_text(a, dc, rect(x, y, w, S(a, 40)), a->status, a->status_error ? UI_DANGER : UI_MUTED, a->f_small,
@@ -991,8 +1070,28 @@ static void screen_connect(UiApp *a, HDC dc, i64 now_ms) {
     // Entrée valide le formulaire depuis n'importe quel champ.
     if (submit && !busy) a->act_connect = 1;
 
-    Rect foot = rect(card.x, card.y + card.h + S(a, 12), card.w, S(a, 18));
-    draw_text(a, dc, foot, "Réglages mémorisés dans %APPDATA%\\vibesync.ini", UI_FAINT, a->f_small,
+    // Demande de focus venue de main.c : le champ fautif est prêt à corriger.
+    if (a->focus_request != UI_FIELD_NONE) {
+        UiText *t = NULL;
+        switch (a->focus_request) {
+            case UI_FIELD_SERVER: a->focus = ID_SERVER; t = &a->f_server; break;
+            case UI_FIELD_NAME: a->focus = ID_NAME; t = &a->f_name; break;
+            case UI_FIELD_ROOM: a->focus = ID_ROOM; t = &a->f_room; break;
+            case UI_FIELD_PASSWORD: a->focus = ID_PASSWORD; t = &a->f_password; break;
+            case UI_FIELD_NONE: break;
+        }
+        if (t) ui_text_select_all(t);  // prêt à être remplacé d'une frappe
+        a->focus_request = UI_FIELD_NONE;
+        a->caret_blink_ms = now_ms;
+    }
+
+    Rect foot = rect(card.x, card.y + card.h + S(a, 10), card.w, S(a, 18));
+    char version[64];
+    snprintf(version, sizeof(version), "client v%s · protocole v%s", a->version_client,
+             VS_PROTOCOL_VERSION_TEXT);
+    draw_text(a, dc, foot, version, UI_FAINT, a->f_small, DT_CENTER | DT_TOP | DT_SINGLELINE);
+    draw_text(a, dc, rect(foot.x, foot.y + S(a, 16), foot.w, S(a, 18)),
+              "Réglages mémorisés dans %APPDATA%\\vibesync.ini", UI_FAINT, a->f_small,
               DT_CENTER | DT_TOP | DT_SINGLELINE);
 }
 
@@ -1035,6 +1134,44 @@ static void draw_users(UiApp *a, HDC dc, Rect r) {
     if (a->user_count == 0) {
         draw_text(a, dc, rect(x, y, w, S(a, 20)), "Personne d'autre pour l'instant.", UI_FAINT, a->f_small,
                   DT_LEFT | DT_TOP | DT_SINGLELINE);
+    }
+
+    // Versions en pied de colonne : discret, mais toujours sous les yeux quand
+    // il faut diagnostiquer un décalage client/serveur.
+    char ver[96];
+    if (a->version_server[0]) {
+        snprintf(ver, sizeof(ver), "client v%s · serveur v%s · protocole v%s", a->version_client,
+                 a->version_server, VS_PROTOCOL_VERSION_TEXT);
+    } else {
+        snprintf(ver, sizeof(ver), "client v%s · protocole v%s", a->version_client, VS_PROTOCOL_VERSION_TEXT);
+    }
+    draw_text(a, dc, rect(x, r.y + r.h - pad - S(a, 14), w, S(a, 16)), ver, UI_FAINT, a->f_small,
+              DT_LEFT | DT_BOTTOM | DT_SINGLELINE | DT_END_ELLIPSIS);
+}
+
+// update_banner : invitation non bloquante à télécharger une version plus
+// récente. Fermable ; elle ne revient qu'à la prochaine connexion.
+static void update_banner(UiApp *a, HDC dc, Rect r) {
+    fill_round(dc, r, S(a, 8), mix(UI_ACCENT, UI_PANEL, 190));
+    stroke_round(dc, r, S(a, 8), UI_ACCENT_DIM, 1);
+    i32 pad = S(a, 12);
+    i32 close_w = S(a, 30);
+    char msg[128];
+    snprintf(msg, sizeof(msg), "Nouvelle version disponible (v%s) — cliquer pour télécharger",
+             a->update_version);
+    Rect click = rect(r.x, r.y, r.w - close_w, r.h);
+    b32 hover = !a->input_locked && rect_hit(click, a->mouse_x, a->mouse_y);
+    if (hover) a->hot = ID_UPDATE;
+    if (hover && a->mouse_pressed) a->active = ID_UPDATE;
+    if (a->active == ID_UPDATE && a->mouse_released) {
+        a->active = 0;
+        if (hover) a->act_update_download = 1;
+    }
+    draw_text(a, dc, rect(r.x + pad, r.y, r.w - pad - close_w, r.h), msg, hover ? UI_TEXT : UI_ACCENT_HI,
+              a->f_small, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    if (button(a, dc, rect(r.x + r.w - close_w - S(a, 4), r.y + (r.h - close_w) / 2, close_w, close_w), "✕",
+               ID_UPDATE_CLOSE, BTN_SUBTLE, 1)) {
+        a->act_update_dismiss = 1;
     }
 }
 
@@ -1224,6 +1361,12 @@ static void screen_room(UiApp *a, HDC dc, i64 now_ms) {
     i32 left_w = VS_MIN(S(a, 300), a->width / 3);
     i32 top = header_h + pad;
     i32 bottom = a->height - pad;
+
+    if (a->update_available && !a->update_dismissed) {
+        i32 bh = S(a, 34);
+        update_banner(a, dc, rect(pad, top, a->width - 2 * pad, bh));
+        top += bh + pad;
+    }
 
     // Colonne gauche : participants + gros bouton Prêt.
     i32 ready_h = S(a, 52);
@@ -1472,6 +1615,13 @@ void ui_frame(UiApp *app, HDC dc, i32 w, i32 h, i64 now_ms) {
     app->input_locked = 0;
     if (app->settings_open) screen_settings(app, dc, now_ms);
 
+    // Sortie du champ Serveur : on teste la joignabilité sans rien demander à
+    // l'utilisateur. C'est le moment où il vient de finir de taper l'adresse.
+    if (app->focus != app->focus_prev) {
+        if (app->focus_prev == ID_SERVER && app->screen == UI_SCREEN_CONNECT) app->act_test_server = 1;
+        app->focus_prev = app->focus;
+    }
+
     draw_toast(app, dc, now_ms);
 
     // Curseur : barre en I sur les champs, main sur le reste des zones
@@ -1483,7 +1633,8 @@ void ui_frame(UiApp *app, HDC dc, i32 w, i32 h, i64 now_ms) {
 
     // Rafraîchissement périodique seulement si quelque chose bouge.
     app->need_timer = (app->screen == UI_SCREEN_ROOM && !app->paused && app->vlc_running) || app->focus != 0 ||
-                      (app->toast[0] != 0 && now_ms < app->toast_until_ms) || app->connecting;
+                      (app->toast[0] != 0 && now_ms < app->toast_until_ms) || app->connecting ||
+                      app->retrying_wait || app->health == UI_HEALTH_TESTING;
 
     // Fin de frame : les entrées non consommées sont oubliées.
     app->mouse_pressed = 0;

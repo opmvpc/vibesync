@@ -8,7 +8,9 @@
 // Sortie non nulle en cas d'échec, avec diagnostic.
 
 #include "base.h"
+#include "conn.h"
 #include "engine.h"
+#include "health.h"
 #include "ini.h"
 #include "json.h"
 #include "net.h"
@@ -1400,6 +1402,154 @@ static void test_text_edit(void) {
     }
 }
 
+// ------------------------------ adresse, versions, connexion (VS-022/023) ---
+
+static void test_conn_address(Arena *a) {
+    section("adresse serveur");
+    TempArena top = temp_begin(a);
+
+    // Cas portés de internal/webui/address_test.go : les deux implémentations
+    // doivent normaliser à l'identique, sinon un ami sur Windows et un ami sur
+    // le client Go ne visent pas le même serveur.
+    struct {
+        const char *in, *want;
+    } ok[] = {
+        {"vibesync.exemple.fr", "wss://vibesync.exemple.fr/ws"},
+        {"  vibesync.exemple.fr  ", "wss://vibesync.exemple.fr/ws"},
+        {"vibesync.exemple.fr:8443", "wss://vibesync.exemple.fr:8443/ws"},
+        {"localhost:8080", "ws://localhost:8080/ws"},
+        {"127.0.0.1:8080", "ws://127.0.0.1:8080/ws"},
+        {"ws://127.0.0.1:8080", "ws://127.0.0.1:8080/ws"},
+        {"ws://127.0.0.1:8080/", "ws://127.0.0.1:8080/ws"},
+        {"ws://127.0.0.1:8080/ws", "ws://127.0.0.1:8080/ws"},
+        {"wss://vibesync.exemple.fr/ws", "wss://vibesync.exemple.fr/ws"},
+        {"http://vibesync.exemple.fr", "ws://vibesync.exemple.fr/ws"},
+        {"https://vibesync.exemple.fr", "wss://vibesync.exemple.fr/ws"},
+        {"HTTPS://vibesync.exemple.fr", "wss://vibesync.exemple.fr/ws"},
+        {"https://vibesync.exemple.fr/salon", "wss://vibesync.exemple.fr/salon"},
+        {"wss://exemple.fr/ws#frag", "wss://exemple.fr/ws"},
+        // Compléments propres au client C.
+        {"localhost", "ws://localhost/ws"},
+        {"[::1]:8080", "ws://[::1]:8080/ws"},
+        {"//vibesync.exemple.fr", "wss://vibesync.exemple.fr/ws"},
+        {"wss://user:mdp@exemple.fr/ws", "wss://exemple.fr/ws"},
+        {"vibesync.exemple.fr/", "wss://vibesync.exemple.fr/ws"},
+        {"exemple.fr?x=1", "wss://exemple.fr/ws?x=1"},
+    };
+    for (isize i = 0; i < VS_ARRAY_COUNT(ok); i++) {
+        Str8 got;
+        const char *err = NULL;
+        if (!conn_normalize_url(a, S(ok[i].in), &got, &err)) {
+            failf("« %s » refusé : %s", ok[i].in, err ? err : "?");
+            g_checks++;
+            continue;
+        }
+        CHECK(str8_eq(got, S(ok[i].want)), "« %s » → « %.*s », attendu « %s »", ok[i].in, (int)got.len,
+              got.data, ok[i].want);
+    }
+
+    const char *bad[] = {"", "   ", "ftp://exemple.fr", "wss://", "ws://", "http://"};
+    for (isize i = 0; i < VS_ARRAY_COUNT(bad); i++) {
+        Str8 got;
+        const char *err = NULL;
+        b32 accepted = conn_normalize_url(a, S(bad[i]), &got, &err);
+        CHECK(!accepted && err != NULL, "« %s » aurait dû être refusé avec un message", bad[i]);
+    }
+    // Le message doit dire quoi faire, pas seulement que c'est faux.
+    {
+        Str8 got;
+        const char *err = NULL;
+        conn_normalize_url(a, S(""), &got, &err);
+        CHECK(err && strstr(err, "adresse") != NULL, "message d'adresse vide explicite");
+    }
+
+    CHECK(conn_is_local_host(S("localhost")) && conn_is_local_host(S("127.0.0.1:9")) &&
+              conn_is_local_host(S("[::1]:80")),
+          "hôtes locaux reconnus");
+    CHECK(!conn_is_local_host(S("exemple.fr")) && !conn_is_local_host(S("127.0.0.2")),
+          "hôtes distants non confondus avec le local");
+
+    temp_end(top);
+}
+
+static void test_semver(void) {
+    section("semver");
+    struct {
+        const char *a, *b;
+        int want;
+    } cases[] = {
+        {"0.2.0", "0.2.0", 0},   {"0.2.1", "0.2.0", 1},   {"0.2.0", "0.2.1", -1},
+        {"0.10.0", "0.2.0", 1},  {"1.0.0", "0.99.99", 1}, {"v0.3.0", "0.2.0", 1},
+        {"0.2", "0.2.0", 0},     {"0.2.0", "0.2", 0},     {"1", "0.9.9", 1},
+        {"1.0.0-rc1", "1.0.0", 0},  // suffixe ignoré : c'est documenté
+        {"dev", "0.2.0", -1},       // version non numérique = 0.0.0
+        {"", "0.0.0", 0},
+    };
+    for (isize i = 0; i < VS_ARRAY_COUNT(cases); i++) {
+        int got = proto_semver_cmp(S(cases[i].a), S(cases[i].b));
+        CHECK(got == cases[i].want, "semver(%s, %s) = %d, attendu %d", cases[i].a, cases[i].b, got,
+              cases[i].want);
+    }
+    // La bannière ne doit jamais apparaître pour une version égale ou plus vieille.
+    CHECK(proto_semver_cmp(S("0.2.0"), S(VS_VERSION)) <= 0 || proto_semver_cmp(S("9.9.9"), S(VS_VERSION)) > 0,
+          "comparaison utilisable contre VS_VERSION");
+}
+
+// La règle non négociable : un refus du serveur n'entraîne JAMAIS de nouvelle
+// tentative, alors qu'une panne réseau en programme une.
+static void test_conn_policy(void) {
+    section("politique de connexion");
+    const i64 SEC = 1000000000;
+    Conn c;
+    conn_reset(&c);
+    CHECK(c.phase == CONN_IDLE && !conn_is_busy(&c), "état initial");
+    CHECK(!conn_should_attempt(&c, 0), "au repos : aucune tentative");
+
+    // Panne réseau : réessai avec backoff croissant.
+    conn_start(&c, 0);
+    conn_attempt_started(&c);
+    CHECK(c.phase == CONN_TRYING && conn_is_busy(&c), "tentative en cours");
+    conn_on_socket_down(&c, 10 * SEC);
+    CHECK(c.phase == CONN_WAITING && conn_is_busy(&c), "panne réseau → attente");
+    CHECK(!conn_should_attempt(&c, 10 * SEC), "pas de tentative avant l'échéance");
+    CHECK(conn_should_attempt(&c, 10 * SEC + c.backoff_ns), "tentative à l'échéance");
+    i64 first = c.backoff_ns;
+    conn_attempt_started(&c);
+    conn_on_socket_down(&c, 20 * SEC);
+    CHECK(c.backoff_ns > first, "backoff croissant (%lld → %lld ms)", (long long)(first / 1000000),
+          (long long)(c.backoff_ns / 1000000));
+    CHECK(conn_seconds_until_retry(&c, 20 * SEC) >= 1, "compte à rebours affichable");
+
+    // Refus du serveur : arrêt net, et la fermeture de socket qui suit ne
+    // relance rien (c'est le bug de terrain : « Nouvelle tentative… » en boucle
+    // après un mauvais mot de passe).
+    conn_on_refused(&c);
+    CHECK(c.phase == CONN_REFUSED && !conn_is_busy(&c), "refus → arrêt");
+    conn_on_socket_down(&c, 30 * SEC);
+    CHECK(c.phase == CONN_REFUSED, "la socket qui tombe après un refus ne relance rien");
+    CHECK(!conn_should_attempt(&c, 1000 * SEC), "aucune tentative, même bien plus tard");
+
+    // Annulation : même garantie.
+    conn_start(&c, 0);
+    conn_attempt_started(&c);
+    conn_cancel(&c);
+    CHECK(c.phase == CONN_IDLE && !conn_is_busy(&c), "annulation → repos");
+    conn_on_socket_down(&c, 40 * SEC);
+    CHECK(c.phase == CONN_IDLE && !conn_should_attempt(&c, 1000 * SEC), "annulé : aucune relance");
+
+    // Reprise manuelle après un refus : conn_start doit tout remettre à plat.
+    conn_on_refused(&c);
+    conn_start(&c, 100 * SEC);
+    CHECK(c.phase == CONN_TRYING && c.backoff_ns == 0 && c.attempts == 0, "reprise manuelle repart à neuf");
+
+    // Session établie puis coupure : là, on réessaie (panne, pas refus).
+    conn_attempt_started(&c);
+    conn_on_open(&c);
+    CHECK(c.phase == CONN_OPEN && c.backoff_ns == 0 && !conn_is_busy(&c), "session ouverte");
+    conn_on_socket_down(&c, 200 * SEC);
+    CHECK(c.phase == CONN_WAITING, "coupure en cours de session → reconnexion");
+}
+
 // --------------------------------------------- faux VLC HTTP (sur socket) ---
 //
 // Sert /requests/status.json comme le vrai VLC, pour exercer le chemin réseau
@@ -2271,6 +2421,9 @@ int main(int argc, char **argv) {
     test_engine_units();
     test_ini(a);
     test_text_edit();
+    test_conn_address(a);
+    test_semver();
+    test_conn_policy();
     test_vlc_live(a);
     test_net_live(a);
     test_net_queue_saturation(a);

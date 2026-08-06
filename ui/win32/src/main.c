@@ -12,7 +12,9 @@
 // Aucune structure du moteur n'est touchée hors du thread UI.
 
 #include "base.h"
+#include "conn.h"
 #include "engine.h"
+#include "health.h"
 #include "ini.h"
 #include "json.h"
 #include "net.h"
@@ -23,6 +25,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <windowsx.h>
+#include <shellapi.h>
 #include <shobjidl.h>
 
 #include <stdio.h>
@@ -31,6 +34,7 @@
 #define WM_APP_NET (WM_APP + 1)
 #define WM_APP_VLC (WM_APP + 2)
 #define WM_APP_VLC_OPEN (WM_APP + 3)
+#define WM_APP_HEALTH (WM_APP + 4)
 
 #define TIMER_ENGINE 1
 #define TIMER_UI 2
@@ -195,6 +199,106 @@ static void worker_push_cmds(VlcWorker *w, const VsCmd *cmds, isize count) {
     SetEvent(w->wake);
 }
 
+// --------------------------------------------------- travailleur healthz ---
+//
+// La sonde bloque (DNS, TCP, TLS) : elle vit sur son propre thread, comme le
+// pilotage de VLC. Le thread UI ne fait que poser une demande et lire un
+// résultat sous verrou.
+
+typedef struct {
+    HWND hwnd;
+    HANDLE thread;
+    HANDLE wake;
+    volatile long stop;
+    SRWLOCK lock;
+
+    b32 pending;      // une demande attend (sous lock)
+    StrBuf req_host;
+    int req_port;
+    b32 req_secure;
+    i64 req_gen;      // génération : un résultat périmé est ignoré
+
+    b32 has_result;
+    HealthResult result;
+    i64 result_gen;
+} HealthWorker;
+
+static DWORD WINAPI health_thread(LPVOID param) {
+    HealthWorker *w = (HealthWorker *)param;
+    Arena *scratch = arena_create(VS_MB(1));
+    if (!scratch) return 1;
+    while (!InterlockedCompareExchange(&w->stop, 0, 0)) {
+        WaitForSingleObject(w->wake, 500);
+        if (InterlockedCompareExchange(&w->stop, 0, 0)) break;
+        StrBuf host;
+        int port = 0;
+        b32 secure = 0, want = 0;
+        i64 gen = 0;
+        AcquireSRWLockExclusive(&w->lock);
+        if (w->pending) {
+            host = w->req_host;
+            port = w->req_port;
+            secure = w->req_secure;
+            gen = w->req_gen;
+            w->pending = 0;
+            want = 1;
+        }
+        ReleaseSRWLockExclusive(&w->lock);
+        if (!want) continue;
+
+        HealthResult r;
+        TempArena t = temp_begin(scratch);
+        health_probe(scratch, strbuf_str(&host), port, secure, 4000, &r);
+        temp_end(t);
+
+        AcquireSRWLockExclusive(&w->lock);
+        w->result = r;
+        w->result_gen = gen;
+        w->has_result = 1;
+        ReleaseSRWLockExclusive(&w->lock);
+        PostMessageW(w->hwnd, WM_APP_HEALTH, 0, 0);
+    }
+    arena_destroy(scratch);
+    return 0;
+}
+
+static void health_start(HealthWorker *w, HWND hwnd) {
+    memset(w, 0, sizeof(*w));
+    InitializeSRWLock(&w->lock);
+    w->hwnd = hwnd;
+    w->wake = CreateEventW(NULL, FALSE, FALSE, NULL);
+    w->thread = CreateThread(NULL, 0, health_thread, w, 0, NULL);
+}
+
+static void health_stop(HealthWorker *w) {
+    InterlockedExchange(&w->stop, 1);
+    if (w->wake) SetEvent(w->wake);
+    if (w->thread) {
+        WaitForSingleObject(w->thread, 15000);
+        CloseHandle(w->thread);
+        w->thread = NULL;
+    }
+    if (w->wake) {
+        CloseHandle(w->wake);
+        w->wake = NULL;
+    }
+}
+
+// health_request remplace toute demande en attente : seule la dernière adresse
+// tapée compte.
+static i64 health_request(HealthWorker *w, Str8 host, int port, b32 secure) {
+    AcquireSRWLockExclusive(&w->lock);
+    strbuf_set(&w->req_host, host);
+    w->req_port = port;
+    w->req_secure = secure;
+    w->req_gen++;
+    w->pending = 1;
+    i64 gen = w->req_gen;
+    ReleaseSRWLockExclusive(&w->lock);
+    SetEvent(w->wake);
+    return gen;
+}
+
 // -------------------------------------------------------------- application ---
 
 typedef struct {
@@ -215,8 +319,10 @@ typedef struct {
     char session[VS_SESSION_TOKEN_LEN + 1];
     Str8 url, name, room, password;
     b32 ws_open;
-    i64 backoff_ns;
-    i64 next_attempt;
+    Conn conn;  // politique de reconnexion (conn.c) : source unique de vérité
+    HealthWorker health;
+    i64 health_gen;      // génération attendue
+    StrBuf download_url;  // welcome.downloadUrl
     b32 engine_timer_on;
     b32 ui_timer_on;
     i64 start_ticks;
@@ -224,6 +330,7 @@ typedef struct {
     // Mode « smoke » : capture de l'écran réel après connexion, puis sortie.
     Str8 shot_path;
     Str8 auto_chat;  // message envoyé dès le welcome (diagnostic)
+    StrBuf suggested_url;  // adresse proposée par le bouton « Utiliser »
 
     // Réglages : chemin VLC détecté au démarrage, AVANT que %VIBESYNC_VLC% ne
     // soit forcé par le réglage — sinon la « détection automatique » affichée
@@ -355,6 +462,77 @@ static b32 settings_validate(App *app) {
     return changed;
 }
 
+// --- adresse du serveur et joignabilité ---
+
+// to_wss réécrit une URL ws:// en wss:// (le port explicite est conservé).
+static Str8 to_wss(Arena *a, Str8 url) {
+    if (!str8_starts_with(url, str8_lit("ws://"))) return url;
+    return str8_cat(a, str8_lit("wss://"), str8_sub(url, 5, -1));
+}
+
+// probe_health normalise l'adresse saisie puis lance un GET /healthz hors du
+// thread UI. L'aperçu de l'adresse réellement utilisée est publié au passage.
+static void probe_health(App *app) {
+    UiApp *ui = &app->ui;
+    TempArena t = temp_begin(app->scratch);
+    Str8 raw = str8_trim(ui_text_str(&ui->f_server));
+    Str8 norm;
+    const char *err = NULL;
+    if (!conn_normalize_url(app->scratch, raw, &norm, &err)) {
+        ui->health = UI_HEALTH_FAIL;
+        snprintf(ui->health_msg, sizeof(ui->health_msg), "%s", err ? err : "adresse invalide");
+        ui->server_hint[0] = 0;
+        ui->health_tls_hint = 0;
+        temp_end(t);
+        return;
+    }
+    NetUrl u;
+    if (!net_parse_url(norm, &u)) {
+        ui->health = UI_HEALTH_FAIL;
+        snprintf(ui->health_msg, sizeof(ui->health_msg), "adresse illisible");
+        ui->server_hint[0] = 0;
+        temp_end(t);
+        return;
+    }
+    // Aperçu : l'utilisateur voit ce qui sera réellement contacté.
+    ui->health_tls_hint = 0;
+    if (!str8_eq(raw, norm)) {
+        snprintf(ui->server_hint, sizeof(ui->server_hint), "Adresse utilisée : %.*s", (int)norm.len,
+                 norm.data);
+        strbuf_set(&app->suggested_url, norm);
+    } else {
+        ui->server_hint[0] = 0;
+    }
+    ui->health = UI_HEALTH_TESTING;
+    ui->health_msg[0] = 0;
+    app->health_gen = health_request(&app->health, str8_from_cstr(u.host), u.port, u.secure);
+    temp_end(t);
+}
+
+static void apply_health(App *app, const HealthResult *r) {
+    UiApp *ui = &app->ui;
+    ui->health_latency_ms = r->latency_ms;
+    if (r->kind == HEALTH_OK) {
+        ui->health = UI_HEALTH_OK;
+        ui->health_msg[0] = 0;
+    } else {
+        ui->health = UI_HEALTH_FAIL;
+        snprintf(ui->health_msg, sizeof(ui->health_msg), "%s", health_text(r));
+    }
+    // Le serveur ne répond qu'en TLS : c'est le piège ws:// vu sur le terrain.
+    if (r->tls_available) {
+        TempArena t = temp_begin(app->scratch);
+        Str8 norm;
+        if (conn_normalize_url(app->scratch, str8_trim(ui_text_str(&ui->f_server)), &norm, NULL)) {
+            strbuf_set(&app->suggested_url, to_wss(app->scratch, norm));
+        }
+        temp_end(t);
+        ui->health_tls_hint = 1;
+        snprintf(ui->server_hint, sizeof(ui->server_hint),
+                 "Le serveur répond en chiffré : passez en wss://");
+    }
+}
+
 // --- sorties du moteur ---
 
 static void dispatch_output(App *app, VsOutput *out) {
@@ -381,8 +559,12 @@ static void dispatch_output(App *app, VsOutput *out) {
 static void refresh_view(App *app) {
     UiApp *ui = &app->ui;
     ui->phase = app->engine.phase;
-    ui->connecting = app->engine.phase == VS_PHASE_CONNECTING;
-    ui->retrying = ui->connecting && app->backoff_ns > 0;
+    // L'état affiché vient de conn.c, pas du moteur : c'est lui qui sait si on
+    // réessaie, si on attend, ou si le serveur nous a refusés.
+    ui->connecting = app->conn.phase == CONN_TRYING;
+    ui->retrying_wait = app->conn.phase == CONN_WAITING;
+    ui->retry_seconds = conn_seconds_until_retry(&app->conn, vs_now_ns());
+    ui->retrying = ui->retrying_wait || (ui->connecting && app->conn.attempts > 1);
     ui->ready = app->engine.ready;
     ui->paused = app->engine.room_state.paused || !app->engine.have_state;
     ui->latency_ms = app->engine.latency_ms;
@@ -444,13 +626,12 @@ static void engine_step(App *app) {
     engine_on_tick(&app->engine, now, &out);
     dispatch_output(app, &out);
 
-    // Reconnexion : backoff 1 s → 10 s.
-    if (!app->ws_open && app->engine.phase != VS_PHASE_IDLE && now >= app->next_attempt &&
-        net_state(app->net) == NET_STATE_DEAD) {
+    // Reconnexion : backoff 1 s → 10 s, et uniquement sur panne réseau.
+    if (!app->ws_open && conn_should_attempt(&app->conn, now) && net_state(app->net) == NET_STATE_DEAD) {
+        conn_attempt_started(&app->conn);
         if (!net_connect(app->net, app->url)) {
-            app->backoff_ns = engine_next_backoff(app->backoff_ns);
-            app->next_attempt = now + app->backoff_ns;
-            ui_set_status(&app->ui, "URL de serveur invalide.", 1);
+            conn_on_socket_down(&app->conn, now);
+            ui_set_status(&app->ui, "Adresse de serveur inutilisable : corrigez le champ Serveur.", 1);
         }
     }
     refresh_view(app);
@@ -490,7 +671,23 @@ static void on_server_message(App *app, Str8 raw) {
         case VS_IN_WELCOME:
             engine_on_welcome(&app->engine, now, m->self_id, &m->state,
                               m->have_self_ready ? &m->self_ready : NULL, &out);
-            app->backoff_ns = 0;
+            conn_on_open(&app->conn);
+            // Versions (VS-023) : champs additifs, absents des vieux serveurs.
+            app->ui.version_server[0] = 0;
+            app->ui.update_available = 0;
+            if (m->server_version.len > 0) {
+                snprintf(app->ui.version_server, sizeof(app->ui.version_server), "%.*s",
+                         (int)m->server_version.len, m->server_version.data);
+                if (proto_semver_cmp(m->server_version, str8_lit(VS_VERSION)) > 0) {
+                    app->ui.update_available = 1;
+                    // Fermée d'un clic, la bannière ne revient qu'à la connexion
+                    // suivante : c'est ici, pas à la frame suivante.
+                    app->ui.update_dismissed = 0;
+                    snprintf(app->ui.update_version, sizeof(app->ui.update_version), "%.*s",
+                             (int)m->server_version.len, m->server_version.data);
+                }
+            }
+            if (m->download_url.len > 0) strbuf_set(&app->download_url, m->download_url);
             fill_users(app, m);
             app->ui.screen = UI_SCREEN_ROOM;
             app->ui.connecting = 0;
@@ -522,24 +719,38 @@ static void on_server_message(App *app, Str8 raw) {
         }
         case VS_IN_CHATEVENT: ui_chat_add(&app->ui, m->from, m->text, 0); break;
         case VS_IN_ERROR: {
+            // Sur les refus connus, notre message prime sur celui du serveur :
+            // il doit dire QUOI corriger, et le champ fautif prend le focus.
             char text[224];
-            if (m->text.len > 0) {
-                snprintf(text, sizeof(text), "%.*s", (int)m->text.len, m->text.data);
-            } else if (str8_eq_cstr(m->code, "name_taken")) {
-                snprintf(text, sizeof(text), "Ce pseudo est déjà pris dans la salle.");
+            UiFieldRef focus = UI_FIELD_NONE;
+            if (str8_eq_cstr(m->code, "name_taken")) {
+                snprintf(text, sizeof(text),
+                         "Ce pseudo est déjà pris dans la salle. Choisissez-en un autre puis reconnectez-vous.");
+                focus = UI_FIELD_NAME;
             } else if (str8_eq_cstr(m->code, "bad_password")) {
-                snprintf(text, sizeof(text), "Mot de passe du serveur incorrect.");
+                snprintf(text, sizeof(text),
+                         "Mot de passe du serveur incorrect. Corrigez-le puis cliquez sur Se connecter.");
+                focus = UI_FIELD_PASSWORD;
             } else if (str8_eq_cstr(m->code, "version_mismatch")) {
-                snprintf(text, sizeof(text), "Version de protocole incompatible avec le serveur.");
+                snprintf(text, sizeof(text),
+                         "Ce serveur ne parle pas le protocole v%s de ce client (v%s). Mettez le client à jour.",
+                         VS_PROTOCOL_VERSION_TEXT, VS_VERSION);
+                focus = UI_FIELD_SERVER;
+            } else if (m->text.len > 0) {
+                snprintf(text, sizeof(text), "%.*s", (int)m->text.len, m->text.data);
             } else {
                 snprintf(text, sizeof(text), "Erreur serveur : %.*s", (int)m->code.len, m->code.data);
             }
             if (proto_error_is_fatal(m->code)) {
+                // ARRÊT NET : pas de backoff, pas de nouvelle tentative. La
+                // fermeture de socket qui suit sera ignorée (phase REFUSED).
                 net_close(app->net);
                 app->ws_open = 0;
                 engine_disconnected(&app->engine);
+                conn_on_refused(&app->conn);
                 app->ui.screen = UI_SCREEN_CONNECT;
                 app->ui.connecting = 0;
+                app->ui.focus_request = focus;
                 ui_set_status(&app->ui, text, 1);
             } else {
                 ui_toast(&app->ui, text, 1, now_ms());
@@ -576,11 +787,22 @@ static void pump_net(App *app) {
             case NET_EV_ERROR: {
                 net_close(app->net);
                 app->ws_open = 0;
+                // Refusé par le serveur, ou annulé : la socket qui tombe est la
+                // CONSÉQUENCE, pas une panne. Réessayer ici était exactement la
+                // boucle « Nouvelle tentative… » signalée sur le terrain.
+                if (app->conn.phase == CONN_REFUSED || app->conn.phase == CONN_IDLE) break;
                 engine_session_lost(&app->engine);
-                app->backoff_ns = engine_next_backoff(app->backoff_ns);
-                app->next_attempt = vs_now_ns() + app->backoff_ns;
+                b32 first = app->conn.attempts <= 1;
+                conn_on_socket_down(&app->conn, vs_now_ns());
                 if (app->ui.screen == UI_SCREEN_CONNECT) {
-                    ui_set_status(&app->ui, "Serveur injoignable. Nouvelle tentative…", 1);
+                    ui_set_status(&app->ui,
+                                  "Serveur injoignable. Nouvel essai automatique — ou cliquez sur Annuler "
+                                  "pour corriger l'adresse.",
+                                  1);
+                    // Un diagnostic vaut mieux qu'un compteur : on sonde une
+                    // fois pour dire DNS, TLS ou port fermé (et détecter le
+                    // serveur qui ne répond qu'en chiffré).
+                    if (first) probe_health(app);
                 } else {
                     ui_toast(&app->ui, "Connexion perdue, reconnexion en cours…", 1, now_ms());
                 }
@@ -597,44 +819,70 @@ static void pump_net(App *app) {
 // --- actions de l'UI ---
 
 static void do_connect(App *app) {
-    Str8 server = str8_trim(ui_text_str(&app->ui.f_server));
-    Str8 name = str8_trim(ui_text_str(&app->ui.f_name));
-    Str8 room = str8_trim(ui_text_str(&app->ui.f_room));
-    if (server.len == 0 || name.len == 0 || room.len == 0) {
-        ui_set_status(&app->ui, "Serveur, pseudo et salle sont obligatoires.", 1);
+    UiApp *ui = &app->ui;
+    Str8 name = str8_trim(ui_text_str(&ui->f_name));
+    Str8 room = str8_trim(ui_text_str(&ui->f_room));
+
+    // 1. L'adresse est normalisée AVANT tout : « vibesync.exemple.fr » suffit.
+    //    La forme retenue est réécrite dans le champ, pour que l'utilisateur
+    //    voie exactement ce qui part.
+    Str8 norm;
+    const char *err = NULL;
+    if (!conn_normalize_url(app->perm, ui_text_str(&ui->f_server), &norm, &err)) {
+        ui_set_status(ui, err ? err : "Adresse de serveur invalide.", 1);
+        ui->focus_request = UI_FIELD_SERVER;
         return;
     }
-    NetUrl probe;
-    if (!net_parse_url(server, &probe)) {
-        ui_set_status(&app->ui, "Adresse invalide : attendu ws://hôte/ws ou wss://hôte/ws.", 1);
+    ui_text_set(&ui->f_server, norm);
+    if (name.len == 0) {
+        ui_set_status(ui, "Choisissez un pseudo : c'est lui qui vous identifie dans la salle.", 1);
+        ui->focus_request = UI_FIELD_NAME;
         return;
     }
-    app->url = str8_copy(app->perm, server);
+    if (room.len == 0) {
+        ui_set_status(ui, "Indiquez une salle : tous vos amis doivent taper la même.", 1);
+        ui->focus_request = UI_FIELD_ROOM;
+        return;
+    }
+
+    app->url = norm;
     app->name = str8_copy(app->perm, name);
     app->room = str8_copy(app->perm, room);
-    app->password = str8_copy(app->perm, ui_text_str(&app->ui.f_password));
+    app->password = str8_copy(app->perm, ui_text_str(&ui->f_password));
     settings_save(app);
 
-    app->backoff_ns = 0;
-    app->next_attempt = vs_now_ns();
+    conn_start(&app->conn, vs_now_ns());
+    conn_attempt_started(&app->conn);
     engine_connecting(&app->engine);
-    app->ui.connecting = 1;
-    ui_set_status(&app->ui, "Connexion au serveur…", 0);
+    ui_set_status(ui, "Connexion au serveur…", 0);
     if (!net_connect(app->net, app->url)) {
-        ui_set_status(&app->ui, "Connexion impossible.", 1);
+        ui_set_status(ui, "Connexion impossible : vérifiez l'adresse du serveur.", 1);
         engine_disconnected(&app->engine);
-        app->ui.connecting = 0;
+        conn_cancel(&app->conn);
+        ui->focus_request = UI_FIELD_SERVER;
     }
+}
+
+// do_cancel_connect rend la main à l'utilisateur pendant une tentative.
+static void do_cancel_connect(App *app) {
+    net_close(app->net);
+    app->ws_open = 0;
+    engine_disconnected(&app->engine);
+    conn_cancel(&app->conn);
+    app->ui.connecting = 0;
+    ui_set_status(&app->ui, "Tentative interrompue. Corrigez les champs puis relancez la connexion.", 0);
 }
 
 static void do_disconnect(App *app) {
     net_close(app->net);
     app->ws_open = 0;
     engine_disconnected(&app->engine);
+    conn_cancel(&app->conn);
     app->ui.screen = UI_SCREEN_CONNECT;
     app->ui.connecting = 0;
     app->ui.user_count = 0;
     app->ui.chat_count = 0;
+    app->ui.update_available = 0;
     ui_set_status(&app->ui, "Déconnecté.", 0);
 }
 
@@ -712,6 +960,45 @@ static void handle_actions(App *app) {
         if (open_file_dialog(app, &path)) {
             ui_toast(ui, "Ouverture de VLC…", 0, now_ms());
             worker_open(&app->vlc, path);
+        }
+    }
+    if (ui->act_test_server) {
+        ui->act_test_server = 0;
+        probe_health(app);
+        redraw(app);
+    }
+    if (ui->act_cancel_connect) {
+        ui->act_cancel_connect = 0;
+        do_cancel_connect(app);
+        redraw(app);
+    }
+    if (ui->act_use_wss) {
+        ui->act_use_wss = 0;
+        if (app->suggested_url.len > 0) {
+            ui_text_set(&ui->f_server, strbuf_str(&app->suggested_url));
+            ui->server_hint[0] = 0;
+            ui->health_tls_hint = 0;
+            probe_health(app);  // vérifier tout de suite que la bascule marche
+        }
+        redraw(app);
+    }
+    if (ui->act_update_dismiss) {
+        ui->act_update_dismiss = 0;
+        ui->update_dismissed = 1;
+        redraw(app);
+    }
+    if (ui->act_update_download) {
+        ui->act_update_download = 0;
+        // Ouverture dans le navigateur : le client ne télécharge ni n'installe
+        // rien lui-même. Adresse fournie par le serveur, donc validée d'abord.
+        Str8 url = strbuf_str(&app->download_url);
+        if (str8_starts_with(url, str8_lit("https://")) || str8_starts_with(url, str8_lit("http://"))) {
+            TempArena t = temp_begin(app->scratch);
+            u16 *w = utf8_to_utf16(app->scratch, url, NULL);
+            ShellExecuteW(app->hwnd, L"open", (LPCWSTR)w, NULL, NULL, SW_SHOWNORMAL);
+            temp_end(t);
+        } else {
+            ui_toast(ui, "Le serveur n'a pas fourni d'adresse de téléchargement valide.", 1, now_ms());
         }
     }
     if (ui->act_settings_open) {
@@ -883,6 +1170,21 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             engine_step(app);
             redraw(app);
             return 0;
+        case WM_APP_HEALTH: {
+            HealthResult r;
+            i64 gen = 0;
+            b32 has = 0;
+            AcquireSRWLockExclusive(&app->health.lock);
+            has = app->health.has_result;
+            r = app->health.result;
+            gen = app->health.result_gen;
+            app->health.has_result = 0;
+            ReleaseSRWLockExclusive(&app->health.lock);
+            // Une réponse à une adresse qu'on a déjà quittée n'intéresse plus.
+            if (has && gen == app->health_gen) apply_health(app, &r);
+            redraw(app);
+            return 0;
+        }
         case WM_APP_VLC_OPEN: {
             b32 ok, failed;
             char err[192];
@@ -1099,8 +1401,20 @@ static void capture_screens(App *app, Str8 dir) {
     ensure_backbuffer(app, w, h);
 
     UiApp *ui = &app->ui;
-    ui_set_status(ui, "Serveur injoignable. Nouvelle tentative…", 1);
-    ui_text_set(&ui->f_server, str8_lit("wss://vibesync.thibault.fr/ws"));
+    // Scénario documenté : l'utilisateur a tapé ws://, le serveur ne répond
+    // qu'en chiffré. Diagnostic explicite + bascule proposée, pas de boucle.
+    ui_set_status(ui, "Serveur injoignable. Nouvel essai automatique — ou cliquez sur Annuler pour "
+                      "corriger l'adresse.",
+                  1);
+    ui->health = UI_HEALTH_FAIL;
+    snprintf(ui->health_msg, sizeof(ui->health_msg), "connexion refusée");
+    ui->health_latency_ms = 42;
+    ui->health_tls_hint = 1;
+    snprintf(ui->server_hint, sizeof(ui->server_hint),
+             "Le serveur répond en chiffré : passez en wss://");
+    ui->retrying_wait = 1;
+    ui->retry_seconds = 4;
+    ui_text_set(&ui->f_server, str8_lit("ws://vibesync.thibault.fr/ws"));
     ui_text_set(&ui->f_name, str8_lit("thibault"));
     ui_text_set(&ui->f_room, str8_lit("soirée-film"));
     ui_text_set(&ui->f_password, str8_lit("secret"));
@@ -1126,7 +1440,11 @@ static void capture_screens(App *app, Str8 dir) {
     png_write(app->scratch, str8_cat(app->scratch, dir, str8_lit("\\ui-connexion.png")),
               (const u8 *)app->bits, w, h);
 
-    // Panneau Réglages, superposé au même écran.
+    // Panneau Réglages, superposé au même écran (état nominal, sans l'alerte).
+    ui->retrying_wait = 0;
+    ui->server_hint[0] = 0;
+    ui->health = UI_HEALTH_OK;
+    ui->health_latency_ms = 113;
     settings_open(app);
     ui_text_set(&ui->f_set_server, str8_lit("wss://vibesync.thibault.fr/ws"));
     ui_text_set(&ui->f_set_name, str8_lit("thibault"));
@@ -1164,6 +1482,10 @@ static void capture_screens(App *app, Str8 dir) {
     ui->drift_sec = 0.04;
     ui->latency_ms = 12;
     snprintf(ui->file_name, sizeof(ui->file_name), "ep1-vostfr.mkv");
+    snprintf(ui->version_server, sizeof(ui->version_server), "0.3.0");
+    snprintf(ui->update_version, sizeof(ui->update_version), "0.3.0");
+    ui->update_available = 1;
+    ui->update_dismissed = 0;
     ui_chat_add(ui, str8_lit(""), str8_lit("Connecté à la salle."), 1);
     ui_chat_add(ui, str8_lit("camille"), str8_lit("prête quand vous voulez !"), 0);
     ui_chat_add(ui, str8_lit("moi"), str8_lit("je lance dans 10 secondes"), 0);
@@ -1281,6 +1603,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show) {
 
     net_set_notify(app->net, hwnd, WM_APP_NET);
     worker_start(&app->vlc, hwnd);
+    health_start(&app->health, hwnd);
 
     Str8 cl = utf16_to_utf8(scratch, (const u16 *)GetCommandLineW());
 
@@ -1294,6 +1617,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show) {
                      (long long)((i64)GetTickCount64() - start));
             vs_write_stderr(str8_from_cstr(msg));
             worker_stop(&app->vlc);
+            health_stop(&app->health);
             net_destroy(app->net);
             return 0;
         }
@@ -1320,6 +1644,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show) {
         }
     }
 
+    // Premier diagnostic de joignabilité : la pastille est renseignée avant même
+    // que l'utilisateur touche au formulaire.
+    if (app->ui.f_server.len > 0) probe_health(app);
+
     ShowWindow(hwnd, show);
     UpdateWindow(hwnd);
 
@@ -1331,6 +1659,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show) {
 
     settings_save(app);
     worker_stop(&app->vlc);
+    health_stop(&app->health);
     net_destroy(app->net);
     ui_release(&app->ui);
     CoUninitialize();

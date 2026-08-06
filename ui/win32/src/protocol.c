@@ -198,6 +198,10 @@ void proto_fill(Arena *a, Str8 type, const JsonValue *data, VsInMsg *m) {
         m->kind = VS_IN_WELCOME;
         Str8 room;
         if (need_str(data, "room", &room)) m->room = room;
+        // Champs additifs : un serveur qui ne les envoie pas reste valide.
+        Str8 sv;
+        if (need_str(data, "serverVersion", &sv)) m->server_version = sv;
+        if (need_str(data, "downloadUrl", &sv)) m->download_url = sv;
         m->user_count = read_users(a, json_get(data, "users"), &m->users);
         for (isize i = 0; i < m->user_count; i++) {
             if (str8_eq(m->users[i].id, m->self_id)) {
@@ -253,4 +257,40 @@ void proto_fill(Arena *a, Str8 type, const JsonValue *data, VsInMsg *m) {
 b32 proto_error_is_fatal(Str8 code) {
     return str8_eq_cstr(code, "version_mismatch") || str8_eq_cstr(code, "bad_password") ||
            str8_eq_cstr(code, "name_taken");
+}
+
+// semver_part lit le composant numérique commençant en *i et avance *i au
+// séparateur suivant. Tout ce qui n'est pas un chiffre arrête le composant ;
+// un suffixe de pré-version fait tomber le reste à zéro.
+static i64 semver_part(Str8 s, isize *i, b32 *stop) {
+    i64 v = 0;
+    b32 any = 0;
+    while (*i < s.len) {
+        u8 c = s.data[*i];
+        if (c >= '0' && c <= '9') {
+            if (v < 1000000) v = v * 10 + (c - '0');  // borne : pas de débordement
+            any = 1;
+            (*i)++;
+            continue;
+        }
+        break;
+    }
+    if (*i < s.len && s.data[*i] == '.') (*i)++;
+    else *stop = 1;  // fin, ou suffixe « -rc1 » / « +build » : on s'arrête là
+    if (!any) v = 0;
+    return v;
+}
+
+int proto_semver_cmp(Str8 a, Str8 b) {
+    if (a.len > 0 && (a.data[0] == 'v' || a.data[0] == 'V')) a = str8_sub(a, 1, -1);
+    if (b.len > 0 && (b.data[0] == 'v' || b.data[0] == 'V')) b = str8_sub(b, 1, -1);
+    isize ia = 0, ib = 0;
+    b32 stop_a = 0, stop_b = 0;
+    for (int k = 0; k < 3; k++) {
+        i64 va = stop_a ? 0 : semver_part(a, &ia, &stop_a);
+        i64 vb = stop_b ? 0 : semver_part(b, &ib, &stop_b);
+        if (va < vb) return -1;
+        if (va > vb) return 1;
+    }
+    return 0;
 }

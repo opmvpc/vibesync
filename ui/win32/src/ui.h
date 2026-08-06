@@ -40,6 +40,24 @@ typedef enum {
     UI_SCREEN_ROOM,
 } UiScreen;
 
+// État de la sonde /healthz affichée sur l'écran de connexion.
+typedef enum {
+    UI_HEALTH_UNKNOWN = 0,
+    UI_HEALTH_TESTING,
+    UI_HEALTH_OK,
+    UI_HEALTH_FAIL,
+} UiHealth;
+
+// Champ visé par une demande de focus venue de main.c (message d'erreur qui
+// désigne le champ à corriger).
+typedef enum {
+    UI_FIELD_NONE = 0,
+    UI_FIELD_SERVER,
+    UI_FIELD_NAME,
+    UI_FIELD_ROOM,
+    UI_FIELD_PASSWORD,
+} UiFieldRef;
+
 // --- modèle d'édition (découplé du rendu, donc testable sans fenêtre) ---
 //
 // UiText est un champ de saisie mono-ligne : contenu UTF-8, plus deux bornes en
@@ -159,6 +177,22 @@ typedef struct {
     i64 toast_until_ms;
     int toast_level;  // 0 info, 1 warn, 2 erreur
 
+    // ---- joignabilité du serveur (écran de connexion) ----
+    UiHealth health;
+    char health_msg[160];    // « en ligne », « nom introuvable (DNS) »…
+    i64 health_latency_ms;
+    b32 health_tls_hint;     // le serveur répond en TLS alors qu'on vise ws://
+    char server_hint[280];   // adresse normalisée, si elle diffère de la saisie
+    b32 retrying_wait;       // attente de backoff : bouton Annuler proposé
+    i64 retry_seconds;
+
+    // ---- versions et mise à jour (VS-023) ----
+    char version_client[24];
+    char version_server[24];
+    b32 update_available;   // serveur plus récent que ce client
+    b32 update_dismissed;   // bannière fermée pour cette session
+    char update_version[24];
+
     // ---- saisie ----
     UiText f_server, f_name, f_room, f_password, f_chat;
 
@@ -184,9 +218,17 @@ typedef struct {
     b32 act_settings_save;
     b32 act_settings_cancel;
     b32 act_settings_detect;
+    b32 act_test_server;       // « Tester » ou sortie du champ Serveur
+    b32 act_cancel_connect;    // interrompt une tentative / une attente
+    b32 act_use_wss;           // accepte la bascule ws:// → wss://
+    b32 act_update_download;
+    b32 act_update_dismiss;
+
+    // focus_request : main.c désigne le champ à corriger après une erreur.
+    UiFieldRef focus_request;
 
     // ---- interne ----
-    u64 hot, active, focus;
+    u64 hot, active, focus, focus_prev;
     i32 mouse_x, mouse_y;
     b32 mouse_down, mouse_pressed, mouse_released, mouse_double;
     i32 wheel;

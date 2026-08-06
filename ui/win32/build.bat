@@ -11,12 +11,18 @@ set "RC=C:\Users\thibs\tools\llvm-mingw\bin\x86_64-w64-mingw32-windres.exe"
 if not exist "%CC%" set "CC=x86_64-w64-mingw32-clang.exe"
 if not exist "%RC%" set "RC=x86_64-w64-mingw32-windres.exe"
 
-set "STD=-std=c11 -ffp-contract=off"
+rem Version : source unique = fichier VERSION a la racine du depot. Elle est
+rem passee en jeton brut (0.2.0 est un pp-number valide) et transformee en
+rem chaine par le preprocesseur cote C : aucun echappement de guillemets a
+rem travers cmd.exe, donc rien qui casse selon le shell.
+set "VERSION=dev"
+if exist "%ROOT%..\..\VERSION" set /p VERSION=<"%ROOT%..\..\VERSION"
+set "STD=-std=c11 -ffp-contract=off -DVIBESYNC_VERSION_RAW=%VERSION%"
 set "WARN=-Wall -Wextra -Werror -Wshadow -Wvla -Wstrict-prototypes -Wmissing-prototypes"
-set "LIBS=-lwinhttp -lws2_32 -lbcrypt -lgdi32 -luser32 -lole32 -luuid"
+set "LIBS=-lwinhttp -lws2_32 -lbcrypt -lgdi32 -luser32 -lole32 -luuid -lshell32"
 rem Chaque chemin est entre guillemets : un checkout dans un dossier contenant
 rem des espaces doit compiler sans bricolage.
-set "CORE="%ROOT%src\base.c" "%ROOT%src\json.c" "%ROOT%src\protocol.c" "%ROOT%src\engine.c" "%ROOT%src\vlc.c" "%ROOT%src\net.c" "%ROOT%src\ini.c" "%ROOT%src\ui.c""
+set "CORE="%ROOT%src\base.c" "%ROOT%src\json.c" "%ROOT%src\protocol.c" "%ROOT%src\engine.c" "%ROOT%src\vlc.c" "%ROOT%src\net.c" "%ROOT%src\ini.c" "%ROOT%src\conn.c" "%ROOT%src\health.c" "%ROOT%src\ui.c""
 set "VECTORS=%ROOT%..\..\test\vectors"
 if not exist "%ROOT%build" mkdir "%ROOT%build"
 
@@ -29,6 +35,7 @@ echo cible inconnue "%~1" (cibles : ^<vide^>, test, asan, capture, clean)
 exit /b 2
 
 :release
+echo [release] version %VERSION%
 echo [release] ressources
 "%RC%" "%ROOT%vibesync.rc" -O coff -o "%ROOT%build\vibesync.res" -I "%ROOT%"
 if errorlevel 1 exit /b 1

@@ -22,6 +22,18 @@ typedef double f64;
 typedef int32_t b32;
 typedef ptrdiff_t isize;
 
+// Version applicative : injectée par build.bat depuis le fichier VERSION de la
+// racine, sous forme de jeton brut que le préprocesseur met en chaîne. Sans
+// injection (compilation à la main), on assume « dev ».
+#define VS_STRINGIFY_(x) #x
+#define VS_STRINGIFY(x) VS_STRINGIFY_(x)
+#ifdef VIBESYNC_VERSION_RAW
+#define VS_VERSION VS_STRINGIFY(VIBESYNC_VERSION_RAW)
+#else
+#define VS_VERSION "dev"
+#endif
+#define VS_PROTOCOL_VERSION_TEXT "1"
+
 #define VS_ARRAY_COUNT(a) ((isize)(sizeof(a) / sizeof((a)[0])))
 #define VS_MIN(a, b) ((a) < (b) ? (a) : (b))
 #define VS_MAX(a, b) ((a) > (b) ? (a) : (b))

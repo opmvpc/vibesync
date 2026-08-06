@@ -65,6 +65,11 @@ typedef struct {
     Str8 room;
     b32 have_self_ready;
     b32 self_ready;
+    // Champs additifs (VS-023) : version applicative du serveur et adresse de
+    // téléchargement des clients. Absents des serveurs plus anciens — leur
+    // absence n'invalide pas le welcome.
+    Str8 server_version;
+    Str8 download_url;
 
     // welcome.state / roomState
     VsRoomState state;
@@ -97,5 +102,11 @@ void proto_fill(Arena *a, Str8 type, const JsonValue *data, VsInMsg *m);
 
 // proto_error_is_fatal dit si un code d'erreur serveur interdit de réessayer.
 b32 proto_error_is_fatal(Str8 code);
+
+// proto_semver_cmp compare deux versions « x.y.z » : <0, 0 ou >0. Un « v »
+// initial est toléré, un suffixe de pré-version (« -rc1 », « +build ») est
+// ignoré, un composant manquant ou illisible vaut 0. Ne sert qu'à décider
+// « le serveur est-il plus récent que moi ? » — pas un moteur semver complet.
+int proto_semver_cmp(Str8 a, Str8 b);
 
 #endif // VS_PROTOCOL_H
