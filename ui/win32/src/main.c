@@ -625,6 +625,14 @@ static void refresh_view(App *app) {
     if (app->engine.have_file) {
         snprintf(ui->file_name, sizeof(ui->file_name), "%s", (const char *)app->engine.file_name.data);
     }
+    // Chats composés hors ligne : recopiés à chaque frame depuis le moteur,
+    // jamais insérés dans l'historique — sinon l'écho du serveur après la
+    // reconnexion les afficherait en double.
+    ui->pending_count = VS_MIN(engine_pending_chat_count(&app->engine), (isize)UI_MAX_PENDING);
+    for (isize i = 0; i < ui->pending_count; i++) {
+        Str8 s = engine_pending_chat(&app->engine, i);
+        snprintf(ui->pending[i], sizeof(ui->pending[i]), "%.*s", (int)s.len, s.data);
+    }
 }
 
 static void redraw(App *app) {
@@ -734,6 +742,16 @@ static void on_server_message(App *app, Str8 raw) {
                 }
             }
             if (m->download_url.len > 0) strbuf_set(&app->download_url, m->download_url);
+            // Reprise « salle vierge » : le moteur a émis UN control seek,
+            // l'utilisateur doit savoir pourquoi le film ne repart pas à zéro.
+            if (out.have_resume_toast) {
+                i64 total = (i64)f64_round(out.resume_toast_sec);
+                if (total < 0) total = 0;
+                char resume[80];
+                snprintf(resume, sizeof(resume), "Reprise à %02lld:%02lld:%02lld", (long long)(total / 3600),
+                         (long long)(total / 60 % 60), (long long)(total % 60));
+                ui_toast(&app->ui, resume, 0, now_ms());
+            }
             fill_users(app, m);
             app->ui.screen = UI_SCREEN_ROOM;
             app->ui.connecting = 0;

@@ -52,6 +52,8 @@ void vs_output_reset(VsOutput *o) {
     o->cmd_count = 0;
     o->msg_count = 0;
     o->dropped = 0;
+    o->have_resume_toast = 0;
+    o->resume_toast_sec = 0;
 }
 
 static void out_cmd(VsOutput *o, VsCmdKind kind, f64 value) {
@@ -71,7 +73,7 @@ static VsMsg *out_msg(VsOutput *o, VsMsgKind kind) {
         memset(&sink, 0, sizeof(sink));
         return &sink;
     }
-    if (o->msg_count >= VS_MAX_MSGS) {
+    if (o->msg_count >= VS_MAX_MSGS_QUEUED) {
         o->dropped = 1;
         memset(&sink, 0, sizeof(sink));
         return &sink;
@@ -133,16 +135,54 @@ i64 engine_next_backoff(i64 current_ns) {
 
 // ------------------------------------------------ détecteur de buffering ---
 
+// buf_init remet le détecteur à neuf, suspension comprise (démarrage moteur).
+static void buf_init(VsBufferDetect *b) {
+    b->have = 0;
+    b->buffering = 0;
+    b->stall_from = VS_TIME_ZERO;
+    b->last_pos = 0;
+    b->last_at = VS_TIME_ZERO;
+    b->suspend_until = VS_TIME_ZERO;
+}
+
+// buf_reset oublie l'historique ET le stall en cours (après un changement de
+// fichier). Sans l'oubli du stall, une stagnation entamée avant le reset
+// ferait basculer en buffering dès la deuxième observation suivante. La
+// suspension éventuelle, elle, n'est pas levée.
 static void buf_reset(VsBufferDetect *b) {
     b->have = 0;
     b->buffering = 0;
     b->stall_from = VS_TIME_ZERO;
 }
 
+static b32 buf_suspended(const VsBufferDetect *b, i64 now) {
+    return b->suspend_until != VS_TIME_ZERO && now < b->suspend_until;
+}
+
+// buf_suspend oublie le stall en cours et neutralise la détection jusqu'à
+// now+d. Une suspension déjà en cours et plus lointaine n'est jamais
+// raccourcie. Le verdict courant est délibérément conservé (cf. engine.h).
+static void buf_suspend(VsBufferDetect *b, i64 now, i64 d) {
+    b->have = 0;
+    b->stall_from = VS_TIME_ZERO;
+    i64 until = now + d;
+    if (b->suspend_until == VS_TIME_ZERO || until > b->suspend_until) b->suspend_until = until;
+}
+
 #define VS_BUF_WINDOW_NS (700 * 1000000LL)
 #define VS_BUF_MIN_RATIO 0.25
 
 static b32 buf_observe(VsBufferDetect *b, const VsStatus *st, i64 now) {
+    if (buf_suspended(b, now)) {
+        // On continue d'ancrer la position pour que la reprise de la détection
+        // ne voie pas d'un coup tout le saut accumulé pendant la suspension.
+        // Aucun nouveau diagnostic n'est posé, l'ancien n'est pas levé.
+        b->have = 1;
+        b->last_pos = st->position_sec;
+        b->last_at = now;
+        b->stall_from = VS_TIME_ZERO;
+        return b->buffering;
+    }
     if (st->state != VS_PLAY_PLAYING) {
         b->have = 1;
         b->last_pos = st->position_sec;
@@ -188,8 +228,7 @@ void engine_init(VsEngine *e) {
     e->user_hold_until = VS_TIME_ZERO;
     e->last_ping = VS_TIME_ZERO;
     e->last_report = VS_TIME_ZERO;
-    buf_reset(&e->buf);
-    e->buf.stall_from = VS_TIME_ZERO;
+    buf_init(&e->buf);
 }
 
 // invalidate_reference oublie tout ce qui sert à corriger : hors état
@@ -298,6 +337,39 @@ void engine_on_pong(VsEngine *e, i64 now, VsPong p) {
 
 void engine_on_self_ready(VsEngine *e, b32 ready) { e->ready = ready; }
 
+static void emit_user_control(VsEngine *e, i64 now, VsAction action, f64 pos, VsOutput *out);
+
+// flush_chat_queue livre les chats composés hors ligne, dans leur ordre de
+// composition. Appelé au welcome : la salle existe, le hello est passé.
+static void flush_chat_queue(VsEngine *e, VsOutput *out) {
+    for (isize i = 0; i < e->chat_queue_count; i++) {
+        VsMsg *m = out_msg(out, VS_MSG_CHAT);
+        m->text = e->chat_queue[i];
+    }
+    e->chat_queue_count = 0;
+}
+
+// virgin_resume traite le cas « salle vierge » (docs/protocol.md §Erreurs et
+// robustesse) : un welcome montrant une salle qui n'a jamais reçu de control
+// (setBy vide, position 0) alors que notre lecteur est au-delà de
+// VS_VIRGIN_RESUME_SEC signifie que le serveur a perdu la séance — typiquement
+// un redémarrage. Plutôt que de se laisser ramener à 0, le client propose sa
+// propre position par UN control seek.
+//
+// C'est un control comme un autre : il arme le hold post-action, ce qui suspend
+// l'alignement sur l'état vierge jusqu'à l'écho du serveur. Une seule reprise
+// par connexion, puisqu'il n'y a qu'un welcome par session. Si un autre client
+// a été plus rapide, setBy n'est plus vide et on se range derrière lui.
+static void virgin_resume(VsEngine *e, i64 now, const VsRoomState *rs, VsOutput *out) {
+    if (rs->set_by.len != 0 || rs->position_sec != 0) return;
+    if (!e->have_status || !vs_status_loaded(&e->status)) return;
+    if (e->status.position_sec <= VS_VIRGIN_RESUME_SEC) return;
+    f64 pos = engine_clamp_position(e->status.position_sec, engine_duration(e));
+    emit_user_control(e, now, VS_ACT_SEEK, pos, out);
+    out->have_resume_toast = 1;
+    out->resume_toast_sec = pos;
+}
+
 void engine_on_welcome(VsEngine *e, i64 now, Str8 self_id, const VsRoomState *st,
                        const b32 *self_ready, VsOutput *out) {
     strbuf_set(&e->self_id, self_id);
@@ -309,8 +381,15 @@ void engine_on_welcome(VsEngine *e, i64 now, Str8 self_id, const VsRoomState *st
     e->hold_until = VS_TIME_ZERO;
     e->nudging = 0;
     engine_on_roomstate(e, now, st);
-    if (self_ready) e->ready = *self_ready;
-    // Re-déclarer notre état après un (re)join.
+    // Volontairement PAS de reprise du ready vu par le serveur : il vient de
+    // nous créer un membre neuf, donc « pas prêt ». C'est notre état local qui
+    // fait foi au (re)join — sinon toute reconnexion, et tout redémarrage du
+    // serveur, effacerait le ready de l'utilisateur. Le broadcast `users` qui
+    // suit notre setReady nous resynchronisera (engine_on_self_ready).
+    VS_UNUSED(self_ready);
+    // Re-déclarer systématiquement notre état après un (re)join : ni setFile ni
+    // setReady ne sont mis en file, c'est l'état courant qui fait foi
+    // (docs/protocol.md §File d'attente hors ligne).
     if (e->have_file) {
         VsMsg *m = out_msg(out, VS_MSG_SET_FILE);
         m->name = e->file_name;
@@ -322,6 +401,10 @@ void engine_on_welcome(VsEngine *e, i64 now, Str8 self_id, const VsRoomState *st
     VsMsg *p = out_msg(out, VS_MSG_PING);
     p->t = vs_ns_to_unix_ms(now);
     e->last_ping = now;
+    // Salle vierge : proposer notre position avant tout alignement.
+    virgin_resume(e, now, st, out);
+    // Les chats composés hors ligne partent maintenant, dans l'ordre.
+    flush_chat_queue(e, out);
 }
 
 // ------------------------------------------------------------------ lecteur ---
@@ -334,6 +417,9 @@ void engine_open_file(VsEngine *e, Str8 name, i64 size_bytes, VsOutput *out) {
     memset(&e->status, 0, sizeof(e->status));
     e->have_status = 0;
     memset(&e->expect, 0, sizeof(e->expect));
+    // buf_reset suffit ici : sans historique, aucune stagnation ne peut être
+    // diagnostiquée avant la deuxième observation. La suspension est réservée
+    // aux seeks et aux transitions (docs/protocol.md §Buffering).
     buf_reset(&e->buf);
     e->buffering = 0;
     e->vlc_error = 0;
@@ -370,6 +456,9 @@ static void user_action(VsEngine *e, i64 now, VsAction act, f64 pos, VsOutput *o
     e->grace_until = now + VS_GRACE_NS;
     e->user_hold_until = now + VS_USER_HOLD_NS;
     e->have_pending_rs = 0;
+    // Seek ou transition faite à la main dans VLC : la position se fige le
+    // temps que VLC obéisse, ce n'est pas un buffering.
+    buf_suspend(&e->buf, now, VS_BUFFERING_SUSPEND_NS);
 }
 
 // detect_user_action compare l'observation à ce que le moteur attendait ;
@@ -424,22 +513,26 @@ static void arm(VsEngine *e, i64 now, const VsCmd *cmds, isize count) {
     b32 hold = 0;
     for (isize i = 0; i < count; i++) {
         switch (cmds[i].kind) {
+            // Pause, reprise et seek figent la position le temps que VLC
+            // obéisse : la détection de buffering est neutralisée 2 s.
             case VS_CMD_PAUSE:
                 e->expect.pos = expect_predict(&e->expect, now);
                 e->expect.paused = 1;
                 e->expect.at = now;
+                buf_suspend(&e->buf, now, VS_BUFFERING_SUSPEND_NS);
                 hold = 1;
                 break;
             case VS_CMD_RESUME:
                 e->expect.pos = expect_predict(&e->expect, now);
                 e->expect.paused = 0;
                 e->expect.at = now;
+                buf_suspend(&e->buf, now, VS_BUFFERING_SUSPEND_NS);
                 hold = 1;
                 break;
             case VS_CMD_SEEK:
                 e->expect.pos = f64_round(cmds[i].value);  // VLC arrondit à la seconde
                 e->expect.at = now;
-                buf_reset(&e->buf);
+                buf_suspend(&e->buf, now, VS_BUFFERING_SUSPEND_NS);
                 hold = 1;
                 break;
             case VS_CMD_RATE:
@@ -593,6 +686,21 @@ void engine_on_tick(VsEngine *e, i64 now, VsOutput *out) {
 
 // -------------------------------------------------------- actions de l'UI ---
 
+// emit_user_control met un control en file et arme le hold post-action : les
+// corrections sont suspendues jusqu'à l'écho du serveur (roomState setBy = soi)
+// ou l'expiration. TOUTE émission volontaire de control passe par ici, y
+// compris la reprise « salle vierge ».
+static void emit_user_control(VsEngine *e, i64 now, VsAction action, f64 pos, VsOutput *out) {
+    VsMsg *m = out_msg(out, VS_MSG_CONTROL);
+    m->action = action;
+    m->position_sec = pos;
+    e->user_hold_until = now + VS_USER_HOLD_NS;
+    e->have_pending_rs = 0;
+    // Même raison que pour une action faite dans VLC : le seek (ou la
+    // transition) qui va suivre fige la position, ce n'est pas un buffering.
+    buf_suspend(&e->buf, now, VS_BUFFERING_SUSPEND_NS);
+}
+
 void engine_user_control(VsEngine *e, i64 now, VsAction action, f64 position_sec, b32 use_pos, VsOutput *out) {
     f64 pos = position_sec;
     if (!use_pos) {
@@ -600,13 +708,7 @@ void engine_user_control(VsEngine *e, i64 now, VsAction action, f64 position_sec
                                                               : engine_expected_position(e, now);
     }
     if (!f64_is_finite(pos)) return;  // §Assainissement
-    pos = engine_clamp_position(pos, engine_duration(e));
-    VsMsg *m = out_msg(out, VS_MSG_CONTROL);
-    m->action = action;
-    m->position_sec = pos;
-    // Hold post-action : corrections suspendues jusqu'à l'écho ou l'expiration.
-    e->user_hold_until = now + VS_USER_HOLD_NS;
-    e->have_pending_rs = 0;
+    emit_user_control(e, now, action, engine_clamp_position(pos, engine_duration(e)), out);
 }
 
 void engine_set_ready(VsEngine *e, b32 ready, VsOutput *out) {
@@ -615,9 +717,28 @@ void engine_set_ready(VsEngine *e, b32 ready, VsOutput *out) {
     m->ready = ready;
 }
 
+// engine_chat envoie un message de salle. Composé hors ligne, il est mis en
+// file et livré dans l'ordre après le welcome de reconnexion — c'est le SEUL
+// type de message rejoué (docs/protocol.md §File d'attente hors ligne).
 void engine_chat(VsEngine *e, Str8 text, VsOutput *out) {
-    VS_UNUSED(e);
     if (text.len == 0) return;
-    VsMsg *m = out_msg(out, VS_MSG_CHAT);
-    strbuf_set(&m->text, text);
+    if (e->phase == VS_PHASE_CONNECTED) {
+        VsMsg *m = out_msg(out, VS_MSG_CHAT);
+        strbuf_set(&m->text, text);
+        return;
+    }
+    // File pleine : on abandonne les plus anciens. Mieux vaut perdre le début
+    // d'une longue tirade que de garder indéfiniment ce qui ne partira jamais.
+    if (e->chat_queue_count >= VS_CHAT_QUEUE_MAX) {
+        memmove(e->chat_queue, e->chat_queue + 1, sizeof(StrBuf) * (VS_CHAT_QUEUE_MAX - 1));
+        e->chat_queue_count = VS_CHAT_QUEUE_MAX - 1;
+    }
+    strbuf_set(&e->chat_queue[e->chat_queue_count++], text);
+}
+
+isize engine_pending_chat_count(const VsEngine *e) { return e->chat_queue_count; }
+
+Str8 engine_pending_chat(const VsEngine *e, isize index) {
+    if (index < 0 || index >= e->chat_queue_count) return str8_lit("");
+    return strbuf_str(&e->chat_queue[index]);
 }

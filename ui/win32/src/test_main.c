@@ -1551,6 +1551,267 @@ static void test_conn_policy(void) {
     CHECK(c.phase == CONN_WAITING, "coupure en cours de session → reconnexion");
 }
 
+// ------------------------------- robustesse : file, reprise, buffering ---
+//
+// Ces tests exercent directement l'API du moteur : ils ne dépendent pas de la
+// convention d'enregistrement des vecteurs.
+
+static VsStatus mk_status(VsPlayState state, f64 pos, f64 len) {
+    VsStatus st;
+    memset(&st, 0, sizeof(st));
+    st.state = state;
+    st.position_sec = pos;
+    st.length_sec = len;
+    st.rate = 1;
+    strbuf_set(&st.file_name, S("ep1.mkv"));
+    return st;
+}
+
+static VsRoomState mk_room(b32 paused, f64 pos, const char *set_by, i64 ref_ms) {
+    VsRoomState rs;
+    memset(&rs, 0, sizeof(rs));
+    rs.paused = paused;
+    rs.position_sec = pos;
+    rs.rate = 1;
+    rs.ref_server_ms = ref_ms;
+    strbuf_set(&rs.set_by, S(set_by));
+    return rs;
+}
+
+// count_msgs compte les messages d'un type dans une sortie.
+static isize count_msgs(const VsOutput *o, VsMsgKind kind) {
+    isize n = 0;
+    for (isize i = 0; i < o->msg_count; i++) {
+        if (o->msgs[i].kind == kind) n++;
+    }
+    return n;
+}
+
+static void test_offline_queue(void) {
+    section("file de chat hors ligne");
+    const i64 SEC = 1000000000LL;
+    i64 t0 = 1785960000000LL * 1000000LL;
+    VsEngine e;
+    VsOutput out;
+
+    // Hors ligne : rien ne part, tout s'empile dans l'ordre.
+    engine_init(&e);
+    vs_output_reset(&out);
+    engine_chat(&e, S("un"), &out);
+    engine_chat(&e, S("deux"), &out);
+    CHECK(out.msg_count == 0, "hors ligne : aucun message émis (%lld)", (long long)out.msg_count);
+    CHECK(engine_pending_chat_count(&e) == 2, "deux messages en file");
+    CHECK(str8_eq(engine_pending_chat(&e, 0), S("un")) && str8_eq(engine_pending_chat(&e, 1), S("deux")),
+          "ordre de composition préservé");
+    CHECK(engine_pending_chat(&e, 5).len == 0 && engine_pending_chat(&e, -1).len == 0,
+          "index hors bornes : chaîne vide");
+
+    // Le welcome vide la file, dans l'ordre, après les re-déclarations.
+    VsRoomState rs = mk_room(1, 0, "u2", 1785960000000LL);
+    vs_output_reset(&out);
+    engine_on_welcome(&e, t0, S("u1"), &rs, NULL, &out);
+    CHECK(engine_pending_chat_count(&e) == 0, "file vidée par le welcome");
+    CHECK(count_msgs(&out, VS_MSG_CHAT) == 2, "les deux chats sont partis");
+    isize first_chat = -1;
+    for (isize i = 0; i < out.msg_count; i++) {
+        if (out.msgs[i].kind == VS_MSG_CHAT && first_chat < 0) first_chat = i;
+    }
+    CHECK(first_chat >= 0 && str8_eq(strbuf_str(&out.msgs[first_chat].text), S("un")) &&
+              str8_eq(strbuf_str(&out.msgs[first_chat + 1].text), S("deux")),
+          "rejeu dans l'ordre de composition");
+    // Jamais de control rejoué, et un seul setReady/setFile (état courant).
+    CHECK(count_msgs(&out, VS_MSG_CONTROL) == 0, "aucun control rejoué");
+    CHECK(count_msgs(&out, VS_MSG_SET_READY) == 1, "un seul setReady (état courant re-déclaré)");
+
+    // En ligne : le chat part directement, sans passer par la file.
+    vs_output_reset(&out);
+    engine_chat(&e, S("direct"), &out);
+    CHECK(out.msg_count == 1 && out.msgs[0].kind == VS_MSG_CHAT, "en ligne : envoi direct");
+    CHECK(engine_pending_chat_count(&e) == 0, "rien mis en file quand on est connecté");
+    engine_chat(&e, S(""), &out);
+    CHECK(out.msg_count == 1, "message vide ignoré");
+
+    // Bornage : au-delà de 20, les PLUS ANCIENS sont abandonnés.
+    engine_init(&e);
+    vs_output_reset(&out);
+    for (int i = 0; i < VS_CHAT_QUEUE_MAX + 7; i++) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "m%d", i);
+        engine_chat(&e, S(buf), &out);
+    }
+    CHECK(engine_pending_chat_count(&e) == VS_CHAT_QUEUE_MAX, "file bornée à %d (%lld)", VS_CHAT_QUEUE_MAX,
+          (long long)engine_pending_chat_count(&e));
+    CHECK(str8_eq(engine_pending_chat(&e, 0), S("m7")), "les plus anciens sont tombés");
+    CHECK(str8_eq(engine_pending_chat(&e, VS_CHAT_QUEUE_MAX - 1), S("m26")), "le plus récent est gardé");
+    // Une file pleine tient dans une seule sortie de welcome.
+    vs_output_reset(&out);
+    engine_on_welcome(&e, t0, S("u1"), &rs, NULL, &out);
+    CHECK(!out.dropped, "file pleine + re-déclarations : pas de débordement de sortie");
+    CHECK(count_msgs(&out, VS_MSG_CHAT) == VS_CHAT_QUEUE_MAX, "les 20 chats sont partis");
+
+    // Le ready local survit au welcome (le serveur nous voit « pas prêt »).
+    engine_init(&e);
+    vs_output_reset(&out);
+    engine_set_ready(&e, 1, &out);
+    b32 server_says_not_ready = 0;
+    vs_output_reset(&out);
+    engine_on_welcome(&e, t0 + SEC, S("u1"), &rs, &server_says_not_ready, &out);
+    CHECK(e.ready == 1, "le welcome n'écrase pas le ready local");
+    isize r = -1;
+    for (isize i = 0; i < out.msg_count; i++) {
+        if (out.msgs[i].kind == VS_MSG_SET_READY) r = i;
+    }
+    CHECK(r >= 0 && out.msgs[r].ready == 1, "le ready est re-déclaré au serveur");
+    // Le broadcast `users` reste la source de vérité ensuite.
+    engine_on_self_ready(&e, 0);
+    CHECK(e.ready == 0, "users resynchronise le ready");
+}
+
+static void test_virgin_resume(void) {
+    section("reprise salle vierge");
+    i64 t0 = 1785960000000LL * 1000000LL;
+    VsEngine e;
+    VsOutput out;
+
+    // Salle vierge + lecteur loin dans le film → UNE reprise control seek.
+    engine_init(&e);
+    vs_output_reset(&out);
+    VsStatus st = mk_status(VS_PLAY_PLAYING, 1806.4, 7200);
+    engine_on_vlc_status(&e, t0, &st, &out);
+    VsRoomState virgin = mk_room(1, 0, "", 1);
+    vs_output_reset(&out);
+    engine_on_welcome(&e, t0, S("u1"), &virgin, NULL, &out);
+    CHECK(count_msgs(&out, VS_MSG_CONTROL) == 1, "une seule reprise émise");
+    isize c = -1;
+    for (isize i = 0; i < out.msg_count; i++) {
+        if (out.msgs[i].kind == VS_MSG_CONTROL) c = i;
+    }
+    CHECK(c >= 0 && out.msgs[c].action == VS_ACT_SEEK, "la reprise est un seek");
+    CHECK(c >= 0 && approx(out.msgs[c].position_sec, 1806.4, 1e-6), "reprise à la position locale (%.3f)",
+          c >= 0 ? out.msgs[c].position_sec : -1);
+    CHECK(out.have_resume_toast && approx(out.resume_toast_sec, 1806.4, 1e-6), "toast « Reprise à … »");
+    // La reprise arrive APRÈS les re-déclarations : le serveur connaît notre
+    // fichier et notre ready avant de recevoir la position.
+    isize sf = -1, sr = -1, pg = -1;
+    for (isize i = 0; i < out.msg_count; i++) {
+        if (out.msgs[i].kind == VS_MSG_SET_READY) sr = i;
+        if (out.msgs[i].kind == VS_MSG_SET_FILE) sf = i;
+        if (out.msgs[i].kind == VS_MSG_PING) pg = i;
+    }
+    CHECK(sr >= 0 && pg >= 0 && c > sr && c > pg, "ordre : setReady/ping puis control");
+    VS_UNUSED(sf);
+    // Le hold post-action est armé : pas d'alignement sur la position 0.
+    CHECK(e.user_hold_until > t0, "hold post-action armé par la reprise");
+
+    // setBy renseigné : quelqu'un pilote déjà, on ne propose rien.
+    engine_init(&e);
+    vs_output_reset(&out);
+    engine_on_vlc_status(&e, t0, &st, &out);
+    VsRoomState owned = mk_room(1, 0, "u2", 1);
+    vs_output_reset(&out);
+    engine_on_welcome(&e, t0, S("u1"), &owned, NULL, &out);
+    CHECK(count_msgs(&out, VS_MSG_CONTROL) == 0 && !out.have_resume_toast,
+          "salle déjà pilotée : aucune reprise");
+
+    // Position de salle non nulle : ce n'est pas une salle vierge.
+    engine_init(&e);
+    vs_output_reset(&out);
+    engine_on_vlc_status(&e, t0, &st, &out);
+    VsRoomState started = mk_room(1, 42, "", 1);
+    vs_output_reset(&out);
+    engine_on_welcome(&e, t0, S("u1"), &started, NULL, &out);
+    CHECK(count_msgs(&out, VS_MSG_CONTROL) == 0, "position de salle non nulle : aucune reprise");
+
+    // Lecteur local sous le seuil : la séance n'avait pas commencé.
+    engine_init(&e);
+    vs_output_reset(&out);
+    VsStatus early = mk_status(VS_PLAY_PAUSED, 3, 7200);
+    engine_on_vlc_status(&e, t0, &early, &out);
+    vs_output_reset(&out);
+    b32 not_ready = 0;
+    engine_on_welcome(&e, t0, S("u1"), &virgin, &not_ready, &out);
+    CHECK(count_msgs(&out, VS_MSG_CONTROL) == 0, "lecteur à 3 s : aucune reprise");
+
+    // Aucun média chargé : rien à proposer.
+    engine_init(&e);
+    vs_output_reset(&out);
+    engine_on_welcome(&e, t0, S("u1"), &virgin, NULL, &out);
+    CHECK(count_msgs(&out, VS_MSG_CONTROL) == 0, "sans média : aucune reprise");
+}
+
+static void test_buffering_suspend(void) {
+    section("suspension du buffering");
+    const i64 MS = 1000000LL;
+    i64 t = 1785960000000LL * MS;
+    VsEngine e;
+    VsOutput out;
+
+    // Référence : une position figée en lecture finit par valoir buffering.
+    engine_init(&e);
+    vs_output_reset(&out);
+    e.phase = VS_PHASE_CONNECTED;
+    VsStatus st = mk_status(VS_PLAY_PLAYING, 100, 7200);
+    engine_on_vlc_status(&e, t, &st, &out);
+    for (int i = 0; i < 6; i++) {  // 1,2 s sans progresser
+        t += 200 * MS;
+        vs_output_reset(&out);
+        engine_on_vlc_status(&e, t, &st, &out);
+    }
+    CHECK(e.buffering == 1, "position figée > 700 ms = buffering");
+
+    // Un seek n'efface PAS un buffering déjà diagnostiqué.
+    vs_output_reset(&out);
+    engine_user_control(&e, t, VS_ACT_SEEK, 500, 1, &out);
+    t += 200 * MS;
+    st.position_sec = 500;
+    vs_output_reset(&out);
+    engine_on_vlc_status(&e, t, &st, &out);
+    CHECK(e.buffering == 1, "le verdict de buffering survit à la suspension");
+
+    // Depuis un état sain : un seek fige la position sans crier au buffering.
+    engine_init(&e);
+    vs_output_reset(&out);
+    e.phase = VS_PHASE_CONNECTED;
+    t += 10000 * MS;
+    st = mk_status(VS_PLAY_PLAYING, 100, 7200);
+    engine_on_vlc_status(&e, t, &st, &out);
+    t += 200 * MS;
+    st.position_sec = 100.2;
+    vs_output_reset(&out);
+    engine_on_vlc_status(&e, t, &st, &out);
+    CHECK(e.buffering == 0, "lecture normale");
+    vs_output_reset(&out);
+    engine_user_control(&e, t, VS_ACT_SEEK, 900, 1, &out);
+    i64 seek_at = t;
+    for (int i = 0; i < 9; i++) {  // 1,8 s figées, sous la suspension de 2 s
+        t += 200 * MS;
+        vs_output_reset(&out);
+        engine_on_vlc_status(&e, t, &st, &out);
+        CHECK(e.buffering == 0, "pas de faux buffering pendant la suspension (+%lldms)",
+              (long long)((t - seek_at) / MS));
+    }
+    // Passé la suspension, la détection reprend ses droits.
+    t += 400 * MS;
+    vs_output_reset(&out);
+    engine_on_vlc_status(&e, t, &st, &out);
+    for (int i = 0; i < 6; i++) {
+        t += 200 * MS;
+        vs_output_reset(&out);
+        engine_on_vlc_status(&e, t, &st, &out);
+    }
+    CHECK(e.buffering == 1, "la détection reprend après la suspension");
+
+    // Une suspension plus lointaine n'est jamais raccourcie par une nouvelle.
+    engine_init(&e);
+    e.phase = VS_PHASE_CONNECTED;
+    vs_output_reset(&out);
+    engine_user_control(&e, t, VS_ACT_SEEK, 10, 1, &out);
+    i64 far_until = e.buf.suspend_until;
+    vs_output_reset(&out);
+    engine_user_control(&e, t - 500 * MS, VS_ACT_SEEK, 20, 1, &out);
+    CHECK(e.buf.suspend_until == far_until, "une suspension antérieure ne raccourcit pas la fenêtre");
+}
+
 // --------------------------------- mot de passe mémorisé (VS-025, DPAPI) ---
 
 static void test_secret(Arena *a) {
@@ -2436,6 +2697,12 @@ static void run_vector(Arena *a, Str8 dir, Str8 file) {
 
     JsonValue *ev = events->first;
     isize step_index = 0;
+    // keepOutput : par défaut, ce que le moteur émet en réaction immédiate à un
+    // message serveur ne fait pas partie de la trace (le générateur Go le
+    // draine). Un événement marqué « keepOutput » garde cette réaction, qui est
+    // alors attendue dans le premier pas de trace qui suit — c'est le cas quand
+    // la réaction EST la règle testée (reprise « salle vierge »).
+    b32 keep_pending = 0;
     for (JsonValue *step = trace->first; step; step = step->next, step_index++) {
         i64 step_ms = json_get_i64(step, "atMs", 0);
 
@@ -2468,7 +2735,8 @@ static void run_vector(Arena *a, Str8 dir, Str8 file) {
                     default: break;
                 }
             }
-            vs_output_reset(&out);  // les réponses immédiates ne font pas partie de la trace
+            if (json_get_bool(ev, "keepOutput", 0)) keep_pending = 1;
+            else if (!keep_pending) vs_output_reset(&out);
             ev = ev->next;
         }
 
@@ -2485,7 +2753,8 @@ static void run_vector(Arena *a, Str8 dir, Str8 file) {
             failf("%s : status.json simulé illisible", vec_name);
             break;
         }
-        vs_output_reset(&out);
+        if (!keep_pending) vs_output_reset(&out);
+        keep_pending = 0;
         engine_on_vlc_status(&e, now, &st, &out);
         engine_on_tick(&e, now, &out);
         CHECK(!out.dropped, "%s : débordement de la file de décisions", vec_name);
@@ -2565,6 +2834,9 @@ int main(int argc, char **argv) {
     test_conn_address(a);
     test_semver();
     test_conn_policy();
+    test_offline_queue();
+    test_virgin_resume();
+    test_buffering_suspend();
     test_secret(a);
     test_vlc_live(a);
     test_net_live(a);

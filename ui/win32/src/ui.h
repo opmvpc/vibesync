@@ -18,6 +18,7 @@
 #define UI_MAX_CHAT 128
 #define UI_MAX_USERS 16
 #define UI_CHAT_LINE_CAP 240
+#define UI_MAX_PENDING VS_CHAT_QUEUE_MAX
 
 // --- palette (thème sombre) ---
 #define UI_BG 0x1a1b1eu
@@ -172,6 +173,10 @@ typedef struct {
     UiChatLine chat[UI_MAX_CHAT];
     isize chat_count;
     isize chat_scroll;  // 0 = collé en bas
+    // File hors ligne (VS_CHAT_QUEUE_MAX côté moteur) : affichée en gris sous
+    // l'historique, jamais mêlée à lui.
+    char pending[UI_MAX_PENDING][UI_CHAT_LINE_CAP];
+    isize pending_count;
 
     char toast[224];
     i64 toast_until_ms;

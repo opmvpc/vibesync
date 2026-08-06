@@ -33,6 +33,15 @@
 // Départ de lecture : au-delà de cet écart, on cale VLC par un seek AVANT de
 // jouer plutôt que de compter sur le nudge (5 %/s = 10 s pour 0,5 s).
 #define VS_START_SEEK_SEC 0.3
+// Détection de buffering neutralisée pendant 2 s après tout seek (commandé ou
+// utilisateur) et toute transition play/pause : ces actions figent
+// mécaniquement la position (docs/protocol.md §Comportements client).
+#define VS_BUFFERING_SUSPEND_NS (2000 * 1000000LL)
+// File des chats composés hors ligne : au-delà, les plus anciens sont
+// abandonnés (docs/protocol.md §File d'attente hors ligne).
+#define VS_CHAT_QUEUE_MAX 20
+// Salle vierge : un lecteur local au-delà de ce seuil déclenche UNE reprise.
+#define VS_VIRGIN_RESUME_SEC 5.0
 
 // Bornes des horodatages epoch en millisecondes acceptés (1970 → 2100). Toute
 // valeur hors bornes est rejetée : les soustractions de l'offset d'horloge
@@ -125,12 +134,20 @@ typedef struct {
 #define VS_MAX_CMDS 8
 #define VS_MAX_MSGS 8
 
+#define VS_MAX_MSGS_QUEUED (VS_MAX_MSGS + VS_CHAT_QUEUE_MAX)
+
 typedef struct {
     VsCmd cmds[VS_MAX_CMDS];
     isize cmd_count;
-    VsMsg msgs[VS_MAX_MSGS];
+    // Le welcome peut rendre d'un coup setFile + setReady + ping + control de
+    // reprise + toute la file de chat hors ligne : la capacité en tient compte.
+    VsMsg msgs[VS_MAX_MSGS_QUEUED];
     isize msg_count;
     b32 dropped;  // débordement : ne doit jamais arriver, sinon bug
+    // Reprise « salle vierge » : le moteur reste pur, il signale seulement
+    // qu'un toast « Reprise à … » est à afficher, à la position donnée.
+    b32 have_resume_toast;
+    f64 resume_toast_sec;
 } VsOutput;
 
 void vs_output_reset(VsOutput *o);
@@ -165,6 +182,12 @@ typedef struct {
     i64 stall_from;  // VS_TIME_ZERO = pas de stagnation en cours
     f64 last_pos;
     i64 last_at;
+    // suspend_until : instant jusqu'auquel la détection est neutralisée. Le
+    // VERDICT courant survit à la suspension — envoyer un seek ne prouve pas
+    // que la lecture est repartie, et le seek de correction envoyé justement
+    // parce que le lecteur décroche effacerait sinon le diagnostic à chaque
+    // fois. Survit aussi à buf_reset, comme en Go.
+    i64 suspend_until;
 } VsBufferDetect;
 
 typedef struct {
@@ -211,6 +234,12 @@ typedef struct {
     // tâches périodiques
     i64 last_ping;
     i64 last_report;
+
+    // File des chats composés hors ligne : SEULS les chats sont rejoués. Ni
+    // setReady ni setFile (l'état courant est re-déclaré à chaque welcome), et
+    // JAMAIS un control — une action périmée écraserait la salle.
+    StrBuf chat_queue[VS_CHAT_QUEUE_MAX];
+    isize chat_queue_count;
 } VsEngine;
 
 void engine_init(VsEngine *e);
@@ -239,7 +268,12 @@ void engine_on_tick(VsEngine *e, i64 now, VsOutput *out);
 // --- actions de l'utilisateur venues de l'UI ---
 void engine_user_control(VsEngine *e, i64 now, VsAction action, f64 position_sec, b32 use_pos, VsOutput *out);
 void engine_set_ready(VsEngine *e, b32 ready, VsOutput *out);
+// engine_chat envoie un message… ou le met en file s'il est composé hors ligne.
 void engine_chat(VsEngine *e, Str8 text, VsOutput *out);
+
+// --- file de chat hors ligne (affichage « en attente » dans l'UI) ---
+isize engine_pending_chat_count(const VsEngine *e);
+Str8 engine_pending_chat(const VsEngine *e, isize index);
 
 // --- lecture d'état (UI, tests) ---
 f64 engine_expected_position(const VsEngine *e, i64 now);

@@ -1257,6 +1257,27 @@ static void draw_chat(UiApp *a, HDC dc, Rect r, i64 now_ms) {
     // Les lignes sont mesurées puis empilées du bas vers le haut.
     HGDIOBJ of = SelectObject(dc, a->f_body);
     i32 y = hist.y + hist.h;
+
+    // Messages composés hors ligne : les plus récents, donc tout en bas, en
+    // gris et marqués « en attente ». Ils redeviendront des lignes normales
+    // quand le serveur les rediffusera après la reconnexion.
+    for (isize i = a->pending_count - 1; i >= 0 && y > hist.y; i--) {
+        Builder b;
+        builder_init(&b, a->scratch, 256);
+        builder_cstr(&b, a->pending[i]);
+        builder_cstr(&b, "   · en attente");
+        Str8 line = builder_result(&b);
+        isize n = 0;
+        const wchar_t *wtext = wide(a, line, &n);
+        RECT calc = {0, 0, hist.w, 0};
+        DrawTextW(dc, wtext, (int)n, &calc, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+        i32 lh = calc.bottom - calc.top + S(a, 6);
+        y -= lh;
+        if (y + lh < hist.y) break;
+        draw_text_rect(a, dc, rect(hist.x, y, hist.w, lh), line, UI_FAINT, a->f_body,
+                       DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
+    }
+
     isize last = a->chat_count - a->chat_scroll;
     for (isize i = last - 1; i >= 0 && y > hist.y; i--) {
         UiChatLine *l = &a->chat[i];
@@ -1290,7 +1311,7 @@ static void draw_chat(UiApp *a, HDC dc, Rect r, i64 now_ms) {
         }
     }
     SelectObject(dc, of);
-    if (a->chat_count == 0) {
+    if (a->chat_count == 0 && a->pending_count == 0) {
         draw_text(a, dc, hist, "Dites bonjour !", UI_FAINT, a->f_small, DT_LEFT | DT_TOP | DT_SINGLELINE);
     }
 
