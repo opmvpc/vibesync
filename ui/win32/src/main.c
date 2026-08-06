@@ -41,6 +41,10 @@
 #define TIMER_UI 2
 #define TIMER_SHOT 3
 
+// Message d'échec d'ouverture : cause + piste actionnable (VS-029). Il est
+// affiché en toast (tronqué à sa capacité) et journalisé en entier.
+#define VLC_OPEN_ERROR_CAP 256
+
 // --------------------------------------------------------- travailleur VLC ---
 
 typedef struct {
@@ -62,7 +66,7 @@ typedef struct {
     StrBuf open_path;
     b32 open_ok;
     b32 open_failed;
-    char open_error[192];
+    char open_error[VLC_OPEN_ERROR_CAP];
     StrBuf open_name;
     i64 open_size;
 
@@ -134,6 +138,8 @@ static DWORD WINAPI vlc_thread(LPVOID param) {
             TempArena t = temp_begin(scratch);
             if (vlc_locate(scratch, &binary)) {
                 err = vlc_launch(scratch, &fresh, binary, strbuf_str(&path), 20000);
+            } else {
+                vs_log("vlc: exécutable introuvable (réglage VIBESYNC_VLC et emplacements standards)");
             }
             temp_end(t);
             AcquireSRWLockExclusive(&w->lock);
@@ -159,7 +165,11 @@ static DWORD WINAPI vlc_thread(LPVOID param) {
             } else {
                 w->open_ok = 0;
                 w->open_failed = 1;
-                snprintf(w->open_error, sizeof(w->open_error), "%s", vlc_error_text(err));
+                // Cause ET piste : « interface HTTP de VLC muette » tout seul
+                // n'apprend rien à l'utilisateur (VS-029).
+                const char *hint = vlc_error_hint(err);
+                snprintf(w->open_error, sizeof(w->open_error), "%s%s%s", vlc_error_text(err),
+                         hint[0] ? " — " : "", hint);
             }
             ReleaseSRWLockExclusive(&w->lock);
             PostMessageW(w->hwnd, WM_APP_VLC_OPEN, 0, 0);
@@ -370,7 +380,10 @@ typedef struct {
     void *bits;
     i32 bw, bh;
 
-    char session[VS_SESSION_TOKEN_LEN + 1];
+    // Jeton de reprise de session, persisté dans l'ini (VS-028). Dimensionné
+    // sur la borne de RELECTURE, pas sur les 32 caractères qu'on génère : le
+    // fichier est éditable et peut venir d'une autre version.
+    char session[VS_SESSION_TOKEN_MAX + 1];
     Str8 url, name, room;
     // Le mot de passe vit dans un tampon fixe, pas dans l'arène : on peut
     // l'effacer (SecureZeroMemory) sans laisser de copie derrière soi.
@@ -515,6 +528,68 @@ static void settings_save(App *app) {
     ini_set(app->perm, &app->ini, "pseudo", ui_text_str(&app->ui.f_name));
     ini_set(app->perm, &app->ini, "salle", ui_text_str(&app->ui.f_room));
     ini_flush(app);
+}
+
+// Clés que l'application gère. Tout le reste de vibesync.ini appartient à
+// l'utilisateur ou à une version future : ini_flush le conserve tel quel. La
+// liste ne sert qu'à savoir ce qu'on a le droit d'évincer si le fichier est
+// saturé — voir session_load().
+static const char *const g_ini_keys[] = {
+    "serveur", "pseudo", "salle", "retenir_mdp", "password_enc", "dossiers_medias", "vlc", "session",
+};
+
+// session_load récupère le jeton de reprise de session persisté (VS-028).
+//
+// Il DOIT survivre au redémarrage de l'exe : un jeton neuf à chaque lancement,
+// c'est `name_taken` tant que la connexion zombie n'a pas expiré côté serveur
+// (timeout de lecture 60 s) — c'est très exactement le « on peut pas se
+// reconnecter juste après avec le même pseudo » remonté du terrain. Avec un
+// jeton stable, la reprise de session (docs/protocol.md, règle serveur 6)
+// couvre aussi le cas « je ferme l'app et je la relance ».
+//
+// Un jeton absent, tronqué ou bricolé à la main est remplacé par un jeton neuf
+// puis écrit : mieux vaut un jeton neuf qu'un jeton que le serveur refusera.
+// Un échec d'écriture n'est PAS bloquant — on retombe simplement sur le
+// comportement d'avant VS-028.
+static void session_load(App *app) {
+    Str8 stored = str8_trim(ini_get(&app->ini, "session", str8_lit("")));
+    if (proto_session_token_valid(stored)) {
+        memcpy(app->session, stored.data, (size_t)stored.len);
+        app->session[stored.len] = 0;
+        return;
+    }
+    if (!proto_session_token(app->session, (isize)sizeof(app->session))) {
+        // Sans générateur, pas de jeton : le hello l'omettra (il est optionnel)
+        // et on perd seulement la reprise de session.
+        app->session[0] = 0;
+        vs_log("session: génération du jeton impossible, reprise de session désactivée");
+        return;
+    }
+    if (stored.len > 0) vs_log("session: jeton persisté invalide, remplacé");
+
+    Str8 token = str8_from_cstr(app->session);
+    if (!ini_set(app->perm, &app->ini, "session", token)) {
+        // vibesync.ini saturé (INI_MAX_ENTRIES). Le fichier est éditable à la
+        // main : ignorer ce retour rendrait l'échec SILENCIEUX — ini_flush
+        // réussirait sans la clé et le pseudo resterait bloqué au redémarrage,
+        // c'est-à-dire très exactement le bug que VS-028 corrige. On évince donc
+        // une entrée qui ne nous appartient pas plutôt que d'abandonner.
+        Str8 evicted = str8_lit("");
+        if (ini_make_room(&app->ini, g_ini_keys, VS_ARRAY_COUNT(g_ini_keys), &evicted)) {
+            vs_log("ini: fichier saturé, entrée inconnue évincée pour le jeton de session : %.*s",
+                   (int)evicted.len, (const char *)evicted.data);
+        }
+        if (!ini_set(app->perm, &app->ini, "session", token)) {
+            vs_log("session: vibesync.ini saturé et rien à évincer, jeton NON persisté — le pseudo pourra "
+                   "être refusé pendant 60 s après un redémarrage");
+            ui_toast(&app->ui,
+                     "vibesync.ini est plein : le jeton de session n'a pas pu être enregistré. "
+                     "Retirez-en des lignes inutiles.",
+                     1, now_ms());
+            return;
+        }
+    }
+    if (!ini_flush(app)) vs_log("session: jeton non persisté (vibesync.ini non modifiable)");
 }
 
 // --- panneau Réglages ---
@@ -1043,7 +1118,10 @@ static void do_cancel_connect(App *app) {
 }
 
 static void do_disconnect(App *app) {
-    net_close(app->net);
+    // « Quitter la salle » est un départ VOLONTAIRE : close 1000 avant de
+    // couper, pour que le serveur retire le membre tout de suite et libère le
+    // pseudo (docs/protocol.md §Erreurs et robustesse, VS-028).
+    net_close_graceful(app->net, NET_CLOSE_GRACE_MS);
     app->ws_open = 0;
     // Plus de session : le clair conservé pour les reconnexions ne sert plus.
     secret_wipe(app->password.data, (isize)sizeof(app->password.data));
@@ -1376,6 +1454,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_DESTROY: PostQuitMessage(0); return 0;
         case WM_CLOSE:
             settings_save(app);
+            // Fermer la fenêtre est un départ volontaire au même titre que
+            // « Quitter la salle » : la close 1000 part AVANT la destruction de
+            // la socket (VS-028). Coût au pire NET_CLOSE_GRACE_MS, et zéro
+            // quand la connexion est déjà tombée.
+            net_close_graceful(app->net, NET_CLOSE_GRACE_MS);
+            app->ws_open = 0;
             DestroyWindow(hwnd);
             return 0;
         case WM_ERASEBKGND: return 1;  // tout est repeint sur le back-buffer
@@ -1470,7 +1554,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_APP_VLC_OPEN: {
             b32 ok, failed, find_done, find_found;
-            char err[192];
+            char err[VLC_OPEN_ERROR_CAP];
             StrBuf name;
             i64 size;
             MediaFind found;
@@ -1863,8 +1947,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show) {
     app->start_ticks = start;
     engine_init(&app->engine);
     ui_init(&app->ui);
-    proto_session_token(app->session, (isize)sizeof(app->session));
     settings_load(app);
+    session_load(app);  // après settings_load : le jeton vient de l'ini relu
 
     app->net = arena_push_struct(perm, Net);
     if (!net_init(app->net)) return 2;

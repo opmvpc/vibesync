@@ -14,6 +14,11 @@
 //     garantit que le handle survit à l'opération en cours après un close.
 //   - `net_close` ferme les handles (ce qui débloque la réception) PUIS joint
 //     le thread SANS timeout : rien n'est libéré tant que le thread vit.
+//   - `net_close_graceful` ne ferme AUCUN handle : elle n'émet qu'un envoi
+//     (autorisé concurremment d'une réception, contrairement à un close), pose
+//     l'intention d'arrêt et attend que le thread réseau constate la close du
+//     pair et ferme ses handles lui-même. Repli sur `net_close` uniquement si
+//     le pair reste muet.
 //   - La file d'événements ne perd jamais rien : nœuds de taille exacte dans
 //     une arène dédiée, remise à zéro quand la file se vide. Si l'arène sature
 //     (consommateur bloqué), la connexion est fermée avec une erreur explicite
@@ -28,6 +33,10 @@
 #define NET_MSG_MAX VS_KB(64)
 // Mémoire de la file d'événements en attente (bornée, jamais silencieuse).
 #define NET_QUEUE_ARENA VS_MB(4)
+// NET_CLOSE_GRACE_MS : plafond d'attente de la close echo du serveur après un
+// départ volontaire (net_close_graceful). Le thread réseau meurt dès qu'elle
+// arrive, donc en pratique bien moins.
+#define NET_CLOSE_GRACE_MS 250
 
 typedef enum {
     NET_EV_NONE = 0,
@@ -120,6 +129,14 @@ void net_set_notify(Net *n, void *hwnd, unsigned msg);
 NetState net_state(Net *n);
 // net_close ferme la connexion et joint le thread réseau (idempotent).
 void net_close(Net *n);
+// net_close_graceful signale un DÉPART VOLONTAIRE (bouton « Quitter la salle »,
+// fermeture de la fenêtre) : trame de fermeture WebSocket 1000, attente bornée
+// que le thread réseau constate la close echo et se retire, puis net_close.
+// Sans elle, le serveur garde un membre zombie jusqu'à son timeout de lecture
+// (60 s) et le pseudo reste pris — exactement le retour terrain de VS-028.
+// Thread principal uniquement. Ne ferme aucun handle elle-même (voir les règles
+// de concurrence en tête de fichier).
+void net_close_graceful(Net *n, i64 grace_ms);
 // net_destroy ferme puis libère l'événement de réveil et l'arène de la file.
 void net_destroy(Net *n);
 

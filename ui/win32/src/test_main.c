@@ -64,6 +64,17 @@ static void section(const char *name) {
 
 static Str8 S(const char *s) { return str8_from_cstr(s); }
 
+// contains : recherche naïve de sous-chaîne, suffisante pour vérifier qu'un
+// drapeau figure bien dans une ligne de commande.
+static b32 contains(Str8 hay, const char *needle) {
+    Str8 n = str8_from_cstr(needle);
+    if (n.len == 0) return 1;
+    for (isize i = 0; i + n.len <= hay.len; i++) {
+        if (memcmp(hay.data + i, n.data, (size_t)n.len) == 0) return 1;
+    }
+    return 0;
+}
+
 // ------------------------------------------------------------ base ---
 
 static void test_base(Arena *a) {
@@ -387,6 +398,30 @@ static void test_protocol(Arena *a) {
         }
         char small[4];
         CHECK(!proto_session_token(small, sizeof(small)), "tampon trop petit accepté");
+        // Un jeton fraîchement tiré doit être relisible tel quel : c'est ce qui
+        // fait qu'un redémarrage réutilise le même (VS-028).
+        CHECK(proto_session_token_valid(S(t1)), "jeton généré refusé à la relecture");
+    }
+
+    // Validation d'un jeton RELU des réglages (VS-028) : mêmes règles que
+    // validSessionToken() du client Go — hexadécimal, longueur paire, de 16
+    // octets à VS_SESSION_TOKEN_MAX caractères.
+    {
+        CHECK(proto_session_token_valid(S("0123456789abcdef0123456789abcdef")), "jeton hexa 32 refusé");
+        CHECK(proto_session_token_valid(S("0123456789ABCDEF0123456789ABCDEF")), "hexa majuscule refusé");
+        CHECK(!proto_session_token_valid(S("")), "jeton vide accepté");
+        CHECK(!proto_session_token_valid(S("0123456789abcdef0123456789abcde")), "jeton trop court accepté");
+        CHECK(!proto_session_token_valid(S("0123456789abcdef0123456789abcdeg")), "caractère non hexa accepté");
+        CHECK(!proto_session_token_valid(S("0123456789abcdef 123456789abcdef")), "espace accepté");
+        // Longueur impaire : ne peut pas être un nombre entier d'octets.
+        char odd[VS_SESSION_TOKEN_LEN + 2];
+        memset(odd, 'a', sizeof(odd));
+        CHECK(!proto_session_token_valid(str8((u8 *)odd, VS_SESSION_TOKEN_LEN + 1)), "longueur impaire acceptée");
+        // Borne haute : exactement VS_SESSION_TOKEN_MAX passe, un de plus non.
+        char big[VS_SESSION_TOKEN_MAX + 2];
+        memset(big, 'f', sizeof(big));
+        CHECK(proto_session_token_valid(str8((u8 *)big, VS_SESSION_TOKEN_MAX)), "128 caractères refusés");
+        CHECK(!proto_session_token_valid(str8((u8 *)big, VS_SESSION_TOKEN_MAX + 2)), "au-delà de 128 accepté");
     }
 
     // Encodage des messages sortants.
@@ -598,6 +633,45 @@ static void test_vlc(Arena *a) {
     Str8 req = vlc_build_request(a, S("/requests/status.json"), S("OmFiYw=="), 8080);
     CHECK(str8_starts_with(req, str8_lit("GET /requests/status.json HTTP/1.1\r\n")), "ligne de requête");
 
+    // Ligne de lancement (VS-029) : chaque drapeau neutralise un réglage que le
+    // vlcrc de l'utilisateur pourrait imposer. Les perdre, c'est reproduire le
+    // retour terrain « VLC s'ouvre et joue, l'app dit aucun fichier ouvert » —
+    // d'où ce gel explicite.
+    {
+        Str8 cmd = vlc_build_command(a, S("C:\\Program Files\\VideoLAN\\VLC\\vlc.exe"),
+                                     S("D:\\films\\ep 1.mkv"), 41234, S("deadbeef"));
+        CHECK(str8_starts_with(cmd, S("\"C:\\Program Files\\VideoLAN\\VLC\\vlc.exe\" ")),
+              "exécutable non protégé par des guillemets");
+        static const char *flags[] = {
+            "--extraintf=http",
+            "--lua-intf=http",
+            "--http-host=127.0.0.1",
+            "--http-port=41234",
+            "--http-password=deadbeef",
+            "--no-one-instance ",
+            "--no-one-instance-when-started-from-file",
+            "--no-playlist-enqueue",
+            "--playlist-autostart",
+            "--start-paused",
+            "--no-random",
+            "--no-loop",
+            "--no-repeat",
+            "--no-play-and-exit",
+            "--no-video-title-show",
+        };
+        for (isize i = 0; i < VS_ARRAY_COUNT(flags); i++) {
+            CHECK(contains(cmd, flags[i]), "drapeau manquant : %s", flags[i]);
+        }
+        // Le média vient en dernier, entre guillemets (un chemin a des espaces)
+        // et surtout APRÈS les options : VLC prendrait le reste pour des MRL.
+        CHECK(contains(cmd, "\"D:\\films\\ep 1.mkv\""), "média non protégé par des guillemets");
+        CHECK(cmd.len > 0 && cmd.data[cmd.len - 1] == '"', "le média n'est pas en dernier");
+        // `--one-instance` seul est un piège : VLC le réactive quand le média
+        // vient d'un fichier. Les deux formes doivent être là.
+        CHECK(!contains(cmd, " --one-instance"), "one-instance activé");
+        CHECK(!contains(cmd, " --playlist-enqueue"), "playlist-enqueue activé");
+    }
+
     // Réponses HTTP.
     {
         int code = 0;
@@ -750,6 +824,11 @@ typedef struct {
     volatile long flood;       // nombre de messages à pousser dès la connexion
     volatile long flood_size;  // taille de chaque message poussé
     volatile long drop_after;  // fermer brutalement après N messages reçus
+    // Départ volontaire (VS-028) : ce que le serveur a VU arriver. C'est la
+    // seule preuve automatisable que la trame de fermeture est bien partie
+    // avant que le client ne démonte sa socket.
+    volatile long saw_close;
+    volatile long close_status;
 } MiniWs;
 
 static b32 sock_send_all(SOCKET s, const u8 *data, isize len) {
@@ -897,7 +976,11 @@ static DWORD WINAPI mini_ws_thread(LPVOID param) {
             isize n = 0;
             int opcode = 0;
             if (!ws_recv_frame(c, buf, VS_KB(128), &n, &opcode)) break;
-            if (opcode == 0x8) break;  // close
+            if (opcode == 0x8) {  // close : on relève le code (2 octets, gros-boutiste)
+                if (n >= 2) InterlockedExchange(&srv->close_status, ((long)buf[0] << 8) | (long)buf[1]);
+                InterlockedIncrement(&srv->saw_close);
+                break;
+            }
             if (opcode != 0x1 && opcode != 0x2 && opcode != 0x0) continue;
             long count = InterlockedIncrement(&srv->received);
             long drop = InterlockedCompareExchange(&srv->drop_after, 0, 0);
@@ -1068,6 +1151,43 @@ static void test_net_live(Arena *a) {
         InterlockedExchange(&srv.drop_after, 0);
     }
 
+    // 4. DÉPART VOLONTAIRE (VS-028) : net_close_graceful doit faire partir une
+    //    trame de fermeture 1000 que le serveur voit arriver, puis laisser le
+    //    thread réseau se retirer de lui-même — c'est lui, et lui seul, qui
+    //    ferme ses handles WinHTTP (revue terra).
+    //    Serveur DÉDIÉ : les sections précédentes ferment aussi des sockets, et
+    //    une trame en retard y fausserait le compte.
+    MiniWs bye;
+    if (!mini_ws_start(&bye)) {
+        failf("mini serveur WebSocket (départ volontaire) indisponible");
+    } else {
+        Str8 bye_url = mini_ws_url(a, &bye);
+        CHECK(net_connect(net, bye_url), "connexion pour départ volontaire");
+        if (wait_event(net, slot, NET_EV_CONNECTED, 5000)) {
+            i64 t0 = vs_now_ns();
+            net_close_graceful(net, NET_CLOSE_GRACE_MS);
+            i64 elapsed_ms = (vs_now_ns() - t0) / 1000000LL;
+            CHECK(net_state(net) == NET_STATE_DEAD, "état != DEAD après départ volontaire");
+            // Le repli dur ne doit pas être le chemin nominal : la sortie du
+            // thread se compte en millisecondes, pas en délai de grâce écoulé.
+            CHECK(elapsed_ms < NET_CLOSE_GRACE_MS + 2000, "fermeture volontaire trop lente (%lld ms)",
+                  (long long)elapsed_ms);
+            // Le serveur peut mettre un instant à lire la trame.
+            i64 deadline = vs_now_ns() + 3000LL * 1000000LL;
+            while (vs_now_ns() < deadline && !InterlockedCompareExchange(&bye.saw_close, 0, 0)) Sleep(10);
+            long seen = InterlockedCompareExchange(&bye.saw_close, 0, 0);
+            long status = InterlockedCompareExchange(&bye.close_status, 0, 0);
+            CHECK(seen == 1, "%ld trame(s) de fermeture vue(s) par le serveur, attendu 1", seen);
+            CHECK(status == 1000, "code de fermeture = %ld, attendu 1000", status);
+        }
+        // Idempotence : un second appel sur une connexion déjà morte ne doit ni
+        // bloquer ni rouvrir quoi que ce soit.
+        net_close_graceful(net, NET_CLOSE_GRACE_MS);
+        CHECK(net_state(net) == NET_STATE_DEAD, "second départ volontaire : état != DEAD");
+        while (net_poll(net, slot)) { /* vidange */ }
+        mini_ws_stop(&bye);
+    }
+
     net_destroy(net);
     mini_ws_stop(&srv);
     temp_end(top);
@@ -1158,6 +1278,46 @@ static void test_ini(Arena *a) {
     ini_set(a, &ini, "nouveau", S("valeur"));
     CHECK(str8_eq(ini_get(&ini, "nouveau", S("")), S("valeur")), "ini_set ajoute");
 
+    // Jeton de session dans l'ini (VS-028) : aller-retour avec et sans, plus
+    // les cas que session_load() doit remplacer au lieu de réutiliser.
+    {
+        Ini vierge;
+        CHECK(ini_parse(a, S("pseudo=thib\r\nsalle=salon\r\n"), &vierge), "ini sans jeton");
+        Str8 absent = ini_get(&vierge, "session", S(""));
+        CHECK(absent.len == 0 && !proto_session_token_valid(absent), "jeton absent réputé valide");
+
+        char tok[VS_SESSION_TOKEN_LEN + 1];
+        CHECK(proto_session_token(tok, sizeof(tok)), "génération du jeton à persister");
+        CHECK(ini_set(a, &vierge, "session", S(tok)), "écriture du jeton");
+        Ini relu;
+        CHECK(ini_parse(a, ini_write(a, &vierge), &relu), "relecture de l'ini avec jeton");
+        Str8 back_tok = ini_get(&relu, "session", S(""));
+        CHECK(str8_eq(back_tok, S(tok)), "jeton altéré par l'aller-retour");
+        CHECK(proto_session_token_valid(back_tok), "jeton relu refusé");
+        // Les autres réglages survivent : l'ini reste la référence, on n'en
+        // réécrit pas une version amputée.
+        CHECK(str8_eq(ini_get(&relu, "pseudo", S("")), S("thib")), "pseudo perdu");
+
+        // Valeurs hostiles écrites à la main : refusées, donc régénérées.
+        const char *mauvais[] = {"", "abc", "zzzz56789abcdef0123456789abcdef0", "  "};
+        for (isize i = 0; i < VS_ARRAY_COUNT(mauvais); i++) {
+            Ini sale;
+            Str8 line = str8_cat(a, str8_cat(a, S("session="), S(mauvais[i])), S("\r\n"));
+            CHECK(ini_parse(a, line, &sale), "ini hostile %lld", (long long)i);
+            CHECK(!proto_session_token_valid(str8_trim(ini_get(&sale, "session", S("")))),
+                  "jeton hostile %lld accepté", (long long)i);
+        }
+        // Un jeton de 128 caractères écrit à la main est relu tel quel : la
+        // borne colle à maxSessionTokenLen du client Go.
+        char long_tok[VS_SESSION_TOKEN_MAX + 1];
+        memset(long_tok, 'a', VS_SESSION_TOKEN_MAX);
+        long_tok[VS_SESSION_TOKEN_MAX] = 0;
+        Ini borne;
+        CHECK(ini_parse(a, str8_cat(a, str8_cat(a, S("session="), S(long_tok)), S("\r\n")), &borne),
+              "ini jeton long");
+        CHECK(proto_session_token_valid(ini_get(&borne, "session", S(""))), "jeton de 128 refusé");
+    }
+
     // Débordement : refus propre, pas d'écriture hors bornes.
     Ini big;
     ini_clear(&big);
@@ -1168,6 +1328,47 @@ static void test_ini(Arena *a) {
         if (!ini_set(a, &big, key, S("v"))) all = 0;
     }
     CHECK(!all && big.count == INI_MAX_ENTRIES, "plafond d'entrées (%lld)", (long long)big.count);
+
+    // Fichier SATURÉ (revue terra, VS-028) : un vibesync.ini bricolé à la main
+    // et plein empêcherait d'écrire le jeton de session, donc de corriger le
+    // pseudo bloqué. ini_make_room évince une entrée qui n'est pas à nous.
+    {
+        static const char *const keep[] = {"serveur", "pseudo", "session"};
+        Ini plein;
+        ini_clear(&plein);
+        CHECK(ini_set(a, &plein, "pseudo", S("thib")), "clé réservée refusée");
+        for (isize i = 0; i < INI_MAX_ENTRIES + 4 && plein.count < INI_MAX_ENTRIES; i++) {
+            char k[32];
+            snprintf(k, sizeof(k), "inconnu%lld", (long long)i);
+            ini_set(a, &plein, k, S("x"));
+        }
+        CHECK(plein.count == INI_MAX_ENTRIES, "ini non rempli (%lld)", (long long)plein.count);
+        Str8 token = S("0123456789abcdef0123456789abcdef");
+        CHECK(!ini_set(a, &plein, "session", token), "ini plein : ini_set aurait dû refuser");
+
+        Str8 evicted = S("");
+        CHECK(ini_make_room(&plein, keep, VS_ARRAY_COUNT(keep), &evicted), "aucune entrée évinçable");
+        CHECK(str8_starts_with(evicted, S("inconnu")), "mauvaise entrée évincée : %.*s", (int)evicted.len,
+              evicted.data);
+        CHECK(plein.count == INI_MAX_ENTRIES - 1, "éviction sans effet (%lld)", (long long)plein.count);
+        CHECK(ini_set(a, &plein, "session", token), "place non libérée");
+        CHECK(str8_eq(ini_get(&plein, "session", S("")), token), "jeton non écrit");
+        CHECK(str8_eq(ini_get(&plein, "pseudo", S("")), S("thib")), "clé réservée perdue");
+
+        // Rien à évincer : que des clés à garder — on refuse plutôt que de
+        // sacrifier un réglage de l'utilisateur.
+        Ini reserve;
+        ini_clear(&reserve);
+        for (isize i = 0; i < VS_ARRAY_COUNT(keep); i++) ini_set(a, &reserve, keep[i], S("v"));
+        CHECK(!ini_make_room(&reserve, keep, VS_ARRAY_COUNT(keep), NULL), "clé réservée évincée à tort");
+        CHECK(reserve.count == VS_ARRAY_COUNT(keep), "entrées perdues");
+
+        // ini_remove_at : bornes, et cohérence avec ini_remove.
+        CHECK(!ini_remove_at(&reserve, -1), "indice négatif accepté");
+        CHECK(!ini_remove_at(&reserve, reserve.count), "indice hors bornes accepté");
+        CHECK(ini_remove_at(&reserve, 0) && reserve.count == VS_ARRAY_COUNT(keep) - 1, "suppression par indice");
+        CHECK(str8_eq(ini_get(&reserve, keep[1], S("")), S("v")), "entrée suivante non remontée");
+    }
 
     // Fichier : écriture, relecture, BOM toléré.
     {

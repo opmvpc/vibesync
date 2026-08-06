@@ -417,6 +417,53 @@ void net_close(Net *n) {
     ReleaseSRWLockExclusive(SRW(n->lock));
 }
 
+// net_close_graceful — départ volontaire (docs/protocol.md §Erreurs et
+// robustesse) : la trame de fermeture 1000 doit PARTIR et le serveur doit
+// pouvoir y répondre avant qu'on démonte quoi que ce soit.
+//
+// PROPRIÉTÉ DES HANDLES (revue terra) : ce chemin ne ferme JAMAIS un handle
+// WinHTTP. Il n'émet qu'un envoi — WinHTTP autorise explicitement un envoi
+// concurrent d'une réception sur un handle WebSocket, ce que ne fait pas
+// WinHttpCloseHandle — puis il pose l'intention d'arrêt et ATTEND. C'est le
+// thread réseau qui constate la close echo du serveur
+// (WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE), sort de sa boucle et ferme ses
+// handles lui-même dans thread_finish() : un seul propriétaire, jamais deux
+// threads sur le même handle.
+//
+// Si le pair ne répond pas dans le délai de grâce (serveur muet, réseau coupé),
+// on retombe sur net_close() — le mécanisme « fermer pour annuler la réception
+// bloquante » qui est le contrat documenté du module depuis l'origine, et le
+// seul moyen de ne pas laisser fuir un thread et ses handles. Ce repli est
+// exceptionnel par construction : une close echo se mesure en millisecondes.
+void net_close_graceful(Net *n, i64 grace_ms) {
+    if (grace_ms < 0) grace_ms = 0;
+    if (grace_ms > 5000) grace_ms = 5000;  // fermeture d'app : jamais un gel
+
+    b32 sent = 0;
+    AcquireSRWLockExclusive(SRW(n->lock));
+    if (n->state == NET_STATE_OPEN && n->websock) {
+        DWORD rc = WinHttpWebSocketShutdown((HINTERNET)n->websock, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS,
+                                            NULL, 0);
+        sent = (rc == NO_ERROR);
+        // Plus rien à envoyer sur cette socket : un net_send_text concurrent
+        // doit échouer plutôt que d'écrire après la trame de fermeture.
+        if (sent) n->state = NET_STATE_CLOSING;
+    }
+    ReleaseSRWLockExclusive(SRW(n->lock));
+
+    if (sent) {
+        // Intention d'arrêt SANS toucher aux handles : le thread réseau reste
+        // seul maître à bord. `stop` lui dit aussi que la coupure qui va suivre
+        // est voulue — il ne remontera pas d'événement d'erreur parasite.
+        InterlockedExchange(&n->stop, 1);
+        if (grace_ms > 0 && n->thread) WaitForSingleObject((HANDLE)n->thread, (DWORD)grace_ms);
+    }
+    // Cas nominal : le thread est déjà sorti et a fermé ses handles, net_close
+    // ne fait plus que joindre et remettre l'état à DEAD (close_handles_locked
+    // ne voit que des NULL). Cas dégradé : elle applique le repli ci-dessus.
+    net_close(n);
+}
+
 void net_destroy(Net *n) {
     net_close(n);
     if (n->wakeup) {

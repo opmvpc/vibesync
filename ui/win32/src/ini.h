@@ -32,6 +32,17 @@ b32 ini_set(Arena *a, Ini *ini, const char *key, Str8 value);
 // retiré. Sert à effacer un secret mémorisé : la clé doit DISPARAÎTRE du
 // fichier, pas se retrouver avec une valeur vide.
 b32 ini_remove(Ini *ini, const char *key);
+// ini_remove_at supprime l'entrée d'indice `i` (les suivantes remontent).
+// Renvoie 0 si l'indice est hors bornes.
+b32 ini_remove_at(Ini *ini, isize i);
+// ini_make_room évince la DERNIÈRE entrée dont la clé ne figure pas dans
+// `keep`, pour qu'une clé indispensable puisse encore être écrite dans un
+// fichier saturé (INI_MAX_ENTRIES). Sans elle, un vibesync.ini bricolé à la
+// main bloquerait SILENCIEUSEMENT l'écriture du jeton de session — c'est-à-dire
+// rendrait le bug VS-028 incorrigible. `out_key` (optionnel) reçoit la clé
+// évincée ; sa mémoire vit dans l'arène et reste lisible après l'éviction.
+// Renvoie 0 s'il n'y a rien à évincer (tout est à garder).
+b32 ini_make_room(Ini *ini, const char *const *keep, isize keep_count, Str8 *out_key);
 // ini_write sérialise, prêt à être écrit sur disque (lignes CRLF).
 Str8 ini_write(Arena *a, const Ini *ini);
 

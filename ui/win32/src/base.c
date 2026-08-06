@@ -34,6 +34,83 @@ void vs_fatal(const char *file, int line, const char *fmt, ...) {
     ExitProcess(3);
 }
 
+// ----------------------------------------------------------------- journal ---
+
+// Toutes les écritures du journal passent par ce verrou : au moins deux threads
+// appellent vs_log (le thread UI et le thread VLC), et « lire la taille puis
+// décider de tronquer ou d'ajouter » doit être indivisible, sans quoi deux
+// rotations concurrentes peuvent se perdre mutuellement une ligne. Un SRWLOCK
+// statique vaut SRWLOCK_INIT à zéro : aucune initialisation à ordonnancer,
+// contrairement à une CRITICAL_SECTION.
+static SRWLOCK g_log_lock;
+
+// log_path écrit %APPDATA%\vibesync.log dans `out` (UTF-16 terminé par 0).
+// 0 si %APPDATA% n'existe pas : le journal reste alors purement console.
+static b32 log_path(u16 *out, isize cap) {
+    DWORD n = GetEnvironmentVariableW(L"APPDATA", (LPWSTR)out, (DWORD)cap);
+    if (n == 0 || (isize)n >= cap) return 0;
+    static const u16 name[] = {'\\', 'v', 'i', 'b', 'e', 's', 'y', 'n', 'c', '.', 'l', 'o', 'g', 0};
+    isize k = (isize)n;
+    for (isize i = 0; name[i]; i++) {
+        if (k + 1 >= cap) return 0;
+        out[k++] = name[i];
+    }
+    out[k] = 0;
+    return 1;
+}
+
+void vs_log(const char *fmt, ...) {
+    char line[1024];
+    SYSTEMTIME t;
+    GetSystemTime(&t);
+    int n = snprintf(line, sizeof(line), "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ vibesync[%lu] ", t.wYear,
+                     t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds,
+                     (unsigned long)GetCurrentProcessId());
+    if (n < 0 || n >= (int)sizeof(line)) n = 0;
+    va_list ap;
+    va_start(ap, fmt);
+    int m = vsnprintf(line + n, sizeof(line) - (size_t)n, fmt, ap);
+    va_end(ap);
+    if (m < 0) m = 0;
+    isize len = (isize)n + (isize)m;
+    if (len > (isize)sizeof(line) - 3) len = (isize)sizeof(line) - 3;
+    line[len++] = '\r';
+    line[len++] = '\n';
+    line[len] = 0;
+
+    OutputDebugStringA(line);
+    vs_write_stderr(str8((u8 *)line, len));
+
+    u16 path[MAX_PATH + 32];
+    if (!log_path(path, VS_ARRAY_COUNT(path))) return;
+
+    // Tout le cycle « ouvrir, mesurer, tourner, écrire » est sous verrou : la
+    // décision de rotation dépend de la taille lue juste avant.
+    AcquireSRWLockExclusive(&g_log_lock);
+    // FILE_APPEND_DATA : l'écriture se fait toujours en fin de fichier, même si
+    // une autre instance du client écrit en même temps. FILE_READ_ATTRIBUTES
+    // est exigé par GetFileSizeEx — sans lui, la taille n'est pas fiable.
+    HANDLE h = CreateFileW((LPCWSTR)path, FILE_APPEND_DATA | FILE_READ_ATTRIBUTES,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                           NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        LARGE_INTEGER size;
+        // Plafond STRICT : on tourne AVANT d'écrire la ligne qui ferait
+        // déborder, pas après avoir dépassé.
+        if (GetFileSizeEx(h, &size) && size.QuadPart + (i64)len > VS_LOG_MAX) {
+            CloseHandle(h);
+            h = CreateFileW((LPCWSTR)path, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        }
+    }
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD written = 0;
+        WriteFile(h, line, (DWORD)len, &written, NULL);
+        CloseHandle(h);
+    }
+    ReleaseSRWLockExclusive(&g_log_lock);
+}
+
 // ----------------------------------------------------------------- arènes ---
 
 // Sous AddressSanitizer, l'arène marque elle-même sa mémoire : ASan ne voit

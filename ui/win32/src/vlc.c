@@ -24,6 +24,29 @@ const char *vlc_error_text(VlcError e) {
     return "erreur inconnue";
 }
 
+const char *vlc_error_hint(VlcError e) {
+    switch (e) {
+        case VLC_OK: return "";
+        case VLC_ERR_NOT_FOUND: return "installez VLC, ou indiquez son chemin dans Réglages";
+        case VLC_ERR_SPAWN: return "Windows a refusé de démarrer VLC : vérifiez le chemin dans Réglages";
+        case VLC_ERR_SOCKET: return "aucun port local disponible ; redémarrez la machine si cela persiste";
+        case VLC_ERR_AUTH:
+            // Un mot de passe d'interface figé dans le vlcrc (ce que pose
+            // Syncplay) écrase le nôtre : VLC répond 401 à chaque requête.
+            return "un mot de passe d'interface figé dans la configuration de VLC remplace le nôtre — "
+                   "videz-le, détails dans vibesync.log";
+        case VLC_ERR_CONNECT:
+        case VLC_ERR_TIMEOUT:
+        case VLC_ERR_SEND:
+        case VLC_ERR_RECV:
+        case VLC_ERR_HTTP:
+        case VLC_ERR_JSON:
+            return "configuration VLC personnalisée probable (Syncplay) — VLC a été fermé, "
+                   "détails et marche à suivre dans vibesync.log";
+    }
+    return "";
+}
+
 // ------------------------------------------------------------------ base64 ---
 
 isize base64_encode(const u8 *in, isize n, char *out, isize cap) {
@@ -426,6 +449,65 @@ static int free_port(void) {
     return port;
 }
 
+// vlc_build_command — TOUT ce dont on dépend est forcé explicitement.
+//
+// Le vlcrc de l'utilisateur gagne sur les défauts de VLC, jamais sur la ligne
+// de commande. Un VLC configuré par Syncplay faisait échouer l'attache HTTP et
+// laissait un VLC orphelin en train de jouer (VS-029, retour terrain). Chaque
+// drapeau ci-dessous neutralise un réglage qui peut venir du vlcrc :
+//
+//   --extraintf=http     notre besoin : l'interface de pilotage. Sur la ligne
+//                        de commande, elle REMPLACE l'`extraintf` du vlcrc
+//                        (l'interface lua de Syncplay, typiquement).
+//   --lua-intf=http      filet : si le vlcrc a fait de `luaintf` l'interface
+//                        PRINCIPALE (`intf=luaintf`), notre extraintf ne la
+//                        remplace pas — au moins elle exécutera notre script
+//                        http et non syncplay.lua.
+//   --no-one-instance                          les deux : sinon le média est
+//   --no-one-instance-when-started-from-file   renvoyé à l'instance VLC déjà
+//                        ouverte — qui JOUE — pendant que le process qu'on
+//                        vient de lancer s'en va, et notre attache expire sur
+//                        un port que plus personne n'écoute. Le second vaut
+//                        VRAI par défaut chez VLC : le désactiver n'est pas
+//                        redondant, c'est la cause racine la plus probable.
+//   --no-playlist-enqueue    sinon le média est enfilé au lieu d'être ouvert.
+//   --playlist-autostart     sinon rien ne démarre et le statut reste
+//                            « stopped » : la préparation tourne dans le vide.
+//   --start-paused       l'autoplay est dompté AVANT l'attache, pas après :
+//                        même si l'attache échoue, rien ne part en lecture
+//                        sauvage chez l'utilisateur (l'autre moitié du retour
+//                        terrain). vlc_prepare_paused reste nécessaire — il
+//                        constate l'état — mais converge immédiatement.
+//   --no-random --no-loop --no-repeat  le moteur de sync raisonne sur un média
+//                        unique joué une fois ; un vlcrc en lecture aléatoire
+//                        ou en boucle le ferait mentir.
+//   --no-play-and-exit   VLC ne doit pas disparaître en fin de média : la
+//                        salle continue d'exister.
+//   --no-video-title-show  confort, déjà là avant VS-029.
+//
+// Volontairement ABSENT : `--intf=<module>`. Forcer l'interface principale
+// obligerait à parier sur son nom (qt/qt4 selon la version) et un nom inconnu
+// empêche VLC de démarrer — le remède serait pire que le mal. Tous les
+// drapeaux ci-dessus sont des options du cœur de VLC (libvlc-module.c),
+// présentes depuis VLC 2.x, dont le bloc Windows pour one-instance*.
+Str8 vlc_build_command(Arena *a, Str8 binary, Str8 file_path, int port, Str8 password) {
+    Builder cmd;
+    builder_init(&cmd, a, 1024);
+    builder_cstr(&cmd, "\"");
+    builder_str(&cmd, binary);
+    builder_cstr(&cmd, "\" --extraintf=http --lua-intf=http --http-host=" VLC_HOST " --http-port=");
+    builder_i64(&cmd, port);
+    builder_cstr(&cmd, " --http-password=");
+    builder_str(&cmd, password);
+    builder_cstr(&cmd, " --no-one-instance --no-one-instance-when-started-from-file"
+                       " --no-playlist-enqueue --playlist-autostart --start-paused"
+                       " --no-random --no-loop --no-repeat --no-play-and-exit"
+                       " --no-video-title-show \"");
+    builder_str(&cmd, file_path);
+    builder_cstr(&cmd, "\"");
+    return builder_result(&cmd);
+}
+
 VlcError vlc_launch(Arena *scratch, VlcClient *c, Str8 binary, Str8 file_path, i64 timeout_ms) {
     if (binary.len == 0 || file_path.len == 0) return VLC_ERR_NOT_FOUND;
     int port = free_port();
@@ -437,19 +519,8 @@ VlcError vlc_launch(Arena *scratch, VlcClient *c, Str8 binary, Str8 file_path, i
     vlc_client_init(c, port, str8_from_cstr(password));
 
     TempArena t = temp_begin(scratch);
-    Builder cmd;
-    builder_init(&cmd, scratch, 1024);
-    builder_cstr(&cmd, "\"");
-    builder_str(&cmd, binary);
-    builder_cstr(&cmd, "\" --extraintf=http --http-host=" VLC_HOST " --http-port=");
-    builder_i64(&cmd, port);
-    builder_cstr(&cmd, " --http-password=");
-    builder_cstr(&cmd, password);
-    builder_cstr(&cmd, " --no-video-title-show --no-one-instance \"");
-    builder_str(&cmd, file_path);
-    builder_cstr(&cmd, "\"");
-
-    u16 *wcmd = utf8_to_utf16(scratch, builder_result(&cmd), NULL);
+    Str8 cmdline = vlc_build_command(scratch, binary, file_path, port, str8_from_cstr(password));
+    u16 *wcmd = utf8_to_utf16(scratch, cmdline, NULL);
     STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     memset(&si, 0, sizeof(si));
@@ -480,12 +551,27 @@ VlcError vlc_launch(Arena *scratch, VlcClient *c, Str8 binary, Str8 file_path, i
     }
     if (err == VLC_OK) err = vlc_prepare_paused(c, scratch, timeout_ms);
     if (err != VLC_OK) {
+        // Trace : un échec d'attache chez un ami est indébogable sans elle. Le
+        // mot de passe de l'interface n'y figure JAMAIS.
+        vs_log("vlc: attache en échec (%s) — exe=\"%.*s\" port=%d fichier=\"%.*s\"", vlc_error_text(err),
+               (int)binary.len, (const char *)binary.data, port, (int)file_path.len,
+               (const char *)file_path.data);
+        vs_log("vlc: drapeaux forcés — extraintf=http, lua-intf=http, no-one-instance, "
+               "no-one-instance-when-started-from-file, no-playlist-enqueue, playlist-autostart, "
+               "start-paused, no-random, no-loop, no-repeat, no-play-and-exit");
+        vs_log("vlc: marche à suivre — si l'attache échoue malgré ces drapeaux, la configuration de VLC "
+               "impose autre chose : fermez VLC, renommez le fichier vlcrc du dossier de configuration de "
+               "VLC (sous-dossier vlc du dossier Roaming de votre profil), puis réessayez. Un VLC préparé "
+               "par Syncplay est le cas connu.");
         // Ni orphelin ni handle qui fuit : le VLC qu'on vient de lancer est
-        // arrêté avant de rendre l'erreur.
+        // arrêté avant de rendre l'erreur — pas de fenêtre qui joue toute seule.
         b32 keep = c->keep_alive;
         c->keep_alive = 0;
         vlc_close(c);
         c->keep_alive = keep;
+    } else {
+        vs_log("vlc: attaché sur le port %d — fichier \"%.*s\"", port, (int)file_path.len,
+               (const char *)file_path.data);
     }
     return err;
 }

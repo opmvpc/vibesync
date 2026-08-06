@@ -25,6 +25,11 @@ typedef enum {
 } VlcError;
 
 const char *vlc_error_text(VlcError e);
+// vlc_error_hint donne la PISTE à afficher à l'utilisateur (chaîne vide s'il
+// n'y en a pas d'utile). « interface HTTP muette » sans piste, c'est un mur :
+// la cause la plus fréquente est une configuration VLC personnalisée
+// (VS-029), et l'utilisateur ne peut pas la deviner.
+const char *vlc_error_hint(VlcError e);
 
 #define VLC_HOST "127.0.0.1"
 // Préparation du média (pause + position 0), cf. internal/vlc.Prepare.
@@ -59,6 +64,12 @@ isize base64_encode(const u8 *in, isize n, char *out, isize cap);
 
 // vlc_build_request fabrique la requête GET (chemin + query déjà formés).
 Str8 vlc_build_request(Arena *a, Str8 path, Str8 auth_b64, int port);
+
+// vlc_build_command fabrique la ligne de commande de lancement. Séparée du
+// lancement pour être vérifiable sans process : ces drapeaux sont la partie
+// fragile de VS-029 (blindage contre le vlcrc de l'utilisateur), et une
+// régression y est invisible autrement.
+Str8 vlc_build_command(Arena *a, Str8 binary, Str8 file_path, int port, Str8 password);
 
 // --- pilotage réel ---
 

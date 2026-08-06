@@ -181,4 +181,20 @@ void vs_hex_encode(const u8 *bytes, isize n, char *out);
 
 void vs_write_stderr(Str8 s);
 
+// ----------------------------------------------------------------- journal ---
+
+// VS_LOG_MAX plafonne %APPDATA%\vibesync.log : au-delà, le fichier repart de
+// zéro. Un journal qui grossit sans fin chez l'utilisateur est un bug, pas une
+// fonctionnalité.
+#define VS_LOG_MAX VS_MB(1)
+
+// vs_log ajoute une ligne horodatée (UTC) à %APPDATA%\vibesync.log, et la
+// recopie sur stderr et dans le débogueur. Sans journal, un échec de lancement
+// de VLC chez un ami se résume à « ça marche pas » : c'est le seul témoin
+// exploitable à distance (VS-029). Appelable depuis n'importe quel thread : les
+// écritures sont sérialisées par un verrou interne, et la rotation décide sur
+// une taille lue sous ce même verrou. Aucun secret n'y est jamais écrit — ni
+// mot de passe de salle, ni mot de passe d'interface VLC.
+void vs_log(const char *fmt, ...);
+
 #endif // VS_BASE_H

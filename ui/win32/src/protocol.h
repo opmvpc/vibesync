@@ -12,6 +12,11 @@
 // Jeton de reprise de session : 16 octets aléatoires en hexadécimal.
 #define VS_SESSION_TOKEN_BYTES 16
 #define VS_SESSION_TOKEN_LEN (VS_SESSION_TOKEN_BYTES * 2)
+// VS_SESSION_TOKEN_MAX borne un jeton RELU des réglages (le nôtre en fait 32,
+// mais le fichier est éditable à la main et peut venir d'une autre version).
+// Même valeur que maxSessionTokenLen du client Go de référence : au-delà, le
+// serveur refuserait le hello.
+#define VS_SESSION_TOKEN_MAX 128
 
 // --- client → serveur ---
 
@@ -25,6 +30,13 @@ Str8 proto_encode_msg(Arena *a, const VsMsg *m);
 // proto_session_token remplit `out` (VS_SESSION_TOKEN_LEN+1 octets) avec un
 // jeton hexadécimal tiré du générateur du système (BCryptGenRandom).
 b32 proto_session_token(char *out, isize cap);
+// proto_session_token_valid dit si un jeton relu des réglages est réutilisable
+// tel quel : hexadécimal (casse indifférente), longueur paire, au moins
+// VS_SESSION_TOKEN_BYTES octets et au plus VS_SESSION_TOKEN_MAX caractères —
+// les mêmes règles que validSessionToken() du client Go. Un jeton tronqué ou
+// bricolé à la main est refusé et remplacé : mieux vaut un jeton neuf qu'un
+// jeton que le serveur rejettera.
+b32 proto_session_token_valid(Str8 token);
 // proto_hex encode `n` octets en hexadécimal minuscule dans `out`.
 void proto_hex(const u8 *bytes, isize n, char *out);
 

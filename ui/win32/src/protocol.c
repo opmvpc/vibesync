@@ -79,6 +79,17 @@ b32 proto_session_token(char *out, isize cap) {
     return 1;
 }
 
+b32 proto_session_token_valid(Str8 token) {
+    if (token.len < VS_SESSION_TOKEN_LEN || token.len > VS_SESSION_TOKEN_MAX) return 0;
+    if (token.len % 2 != 0) return 0;
+    for (isize i = 0; i < token.len; i++) {
+        u8 c = token.data[i];
+        b32 hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+        if (!hex) return 0;
+    }
+    return 1;
+}
+
 // --------------------------------------------------------------- décodage ---
 
 // --- lecture stricte : présence ET type sont exigés ---

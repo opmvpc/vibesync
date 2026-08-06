@@ -62,13 +62,37 @@ b32 ini_set(Arena *a, Ini *ini, const char *key, Str8 value) {
     return put(a, ini, str8_from_cstr(key), value);
 }
 
+b32 ini_remove_at(Ini *ini, isize i) {
+    if (i < 0 || i >= ini->count) return 0;
+    for (isize j = i; j + 1 < ini->count; j++) ini->entries[j] = ini->entries[j + 1];
+    ini->count--;
+    return 1;
+}
+
 b32 ini_remove(Ini *ini, const char *key) {
     Str8 k = str8_from_cstr(key);
     for (isize i = 0; i < ini->count; i++) {
-        if (!str8_eq(ini->entries[i].key, k)) continue;
-        for (isize j = i; j + 1 < ini->count; j++) ini->entries[j] = ini->entries[j + 1];
-        ini->count--;
-        return 1;
+        if (str8_eq(ini->entries[i].key, k)) return ini_remove_at(ini, i);
+    }
+    return 0;
+}
+
+b32 ini_make_room(Ini *ini, const char *const *keep, isize keep_count, Str8 *out_key) {
+    // De la fin vers le début : la dernière entrée inconnue est la plus
+    // récemment ajoutée à la main, donc la moins précieuse.
+    for (isize i = ini->count - 1; i >= 0; i--) {
+        b32 keep_it = 0;
+        for (isize k = 0; k < keep_count; k++) {
+            if (str8_eq_cstr(ini->entries[i].key, keep[k])) {
+                keep_it = 1;
+                break;
+            }
+        }
+        if (keep_it) continue;
+        // La Str8 est copiée AVANT le décalage ; ses octets vivent dans l'arène
+        // et ne bougent pas, seule la table d'entrées est réarrangée.
+        if (out_key) *out_key = ini->entries[i].key;
+        return ini_remove_at(ini, i);
     }
     return 0;
 }
