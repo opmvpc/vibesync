@@ -34,3 +34,4 @@ noms de fichiers circulent déjà via `setFile`/`users`.
 ## Journal du ticket
 
 - 2026-08-06 : créé.
+- 2026-08-06 : assigné à l'agent C (après son port VS-017/024), en cours.

@@ -1,55 +1,54 @@
 # STATUS — vibesync
 
-*Dernière mise à jour : 2026-08-05*
+*Dernière mise à jour : 2026-08-06 (après-midi)*
 
 ## Où on en est
 
-Projet démarré ce jour. Recherche Syncplay terminée (2 rapports dans `docs/research/`),
-décisions d'architecture actées (ADR-001 à 004), spec protocole rédigée
-(`docs/protocol.md`). Phase de développement : serveur et client délégués à des agents
-Opus en parallèle.
+v0.1 sortie (release GitHub avec exe Windows), serveur **en prod** sur Coolify
+(https://vibesync.choboai.com, mdp `onlyvibes`, auto-deploy sur push main, ~30 s
+d'indispo par deploy). Repo public `github.com/opmvpc/vibesync`. Sprint **v0.2.0**
+en cours : tous les retours terrain de Thibault traités côté Go et portés côté C ;
+reste la convergence finale (vecteur 13, CI, sandbox, tag).
 
-## Chantiers ouverts
+## Agents en vol
+
+- **Agent Go** : 5 findings review terra (file de chat liée à la salle, reprise
+  vierge stricte, anti-masquage buffering, régénération vecteur 13 avec
+  `keepOutput` + état initial complet, injection version cmd/vibesync) + diagnostic
+  du flake `TestIntegrationDebitNormalNonAffecte` (repro 1/30, vérif -count=50).
+- **Agent C** : VS-026 dossiers médias + alignement sur les règles resserrées.
+
+## Chantiers
 
 | Ticket | Titre | Statut |
 |---|---|---|
-| VS-001 | Bureaucratie + recherche + spec protocole | terminé |
-| VS-002 | Package `internal/protocol` | terminé |
-| VS-003 | Serveur (salles, WS, état autoritatif) | terminé (review terra) |
-| VS-004 | Client réf. : driver VLC + moteur de sync | terminé (review sol, 12 vecteurs) |
-| VS-005 | Client réf. : web UI (debug) | terminé |
-| VS-006 | Intégration + e2e + test réel double-VLC | **terminé** (7/7 en sandbox, drift 0,25 s) |
-| VS-014 | Client Windows C complet (cœur + UI GDI) | **terminé** — 172 Ko, 47 ms, 1 010 checks |
-| VS-015 | Client macOS Swift (code complet livré) | en attente du Mac pour build/test |
-| VS-007 | Docker + Coolify + CI (lint, tests, releases win/mac) | ouvert |
-| VS-008 | Doc utilisateur (README pour les amis) | ouvert |
-| VS-009 | Coquille native Wails | abandonné (ADR-006) |
-| VS-010 | Cœur headless + canal /ui | abandonné (ADR-008) |
-| VS-011 | App Windows WPF net48 | abandonné (ADR-008) |
-| VS-012 | App macOS SwiftUI (façade) | abandonné (ADR-008) |
-| VS-013 | WebSocket handmade Go stdlib (vire gorilla) | terminé (review sol) — **go.mod : 0 require** |
-| VS-014 | Client Windows C pur + Win32 (un exe) | ouvert |
-| VS-015 | Client macOS Swift autonome | ouvert (Mac dispo 06-08) |
+| VS-001..008, 013, 014, 016 | Socle, serveur, clients, CI, doc, release v0.1 | terminés |
+| VS-009..012 | Pistes Wails/WPF/SwiftUI-façade | abandonnés (ADR-006/008) |
+| VS-015 | Client macOS Swift | code livré, **build/test sur le Mac (dispo aujourd'hui)** |
+| VS-017 | Faux buffering → pauses auto | **terminé** (Go+serveur déployés, port C 1d5a4ad) |
+| VS-018 | UX texte + settings in-app | terminé |
+| VS-019 | Icône | terminé |
+| VS-020 | OSD dans VLC | ADR-009 (overlay maison) — implémentation à faire |
+| VS-021 | Reprise de position (room linger) | terminé côté Go/serveur, toast C livré |
+| VS-022 | UX connexion (testeur, messages, mdp) | terminé (Go + C) |
+| VS-023 | Versions + invite de mise à jour | quasi — fix injection version en cours (agent Go) |
+| VS-024 | Robustesse déconnexions | Go resserré en cours ; port C livré, attend vecteur 13 régénéré |
+| VS-025 | Mémoriser le mdp (DPAPI) | terminé côté Windows, Keychain au polissage mac |
+| VS-026 | Dossiers médias + sélection auto | **en cours (agent C)** |
 
-## Recherches
+## CI
 
-- `research/2026-08-05-syncplay-architecture.md` — archi/protocole/Docker Syncplay
-- `research/2026-08-05-alternatives-et-sync.md` — contrôle VLC, algo anti-drift, alternatives
+Rouge attendue sur un seul point : vecteur `13-reprise-salle-vierge` côté C, en
+attente de la régénération Go (champ `keepOutput` — le format golden n'encodait
+pas la convention event/eventKeep du générateur). Flake Go
+`TestIntegrationDebitNormalNonAffecte` en diagnostic (agent Go).
 
 ## Prochaine action
 
-1. **Sur le Mac de Thibault** : `swift test` puis `scripts/build-macos.sh` dans
-   ui/macos (suivre docs/build-macos.md ; erreurs de build attendues et localisées,
-   voir §6) — dernier livrable manquant.
-2. Thibault : déployer le serveur sur Coolify (docs/deploy-coolify.md) et faire une
-   vraie soirée test avec un ami.
-3. Reliquats : captures macOS dans le guide amis, releases GitHub taguées (la CI
-   uploade déjà l'artifact Windows), renommage du module Go thibsix→opmvpc quand
-   aucun agent n'écrit.
-
-Pivots du jour (dans l'ordre) : client graphique natif Win+mac ; QA renforcée ;
-pas de webview (ADR-006) ; budget < 10 Mo (ADR-007) ; **philosophie handmade
-0 dépendance (ADR-008, l'état final)** : clients mono-exe autonomes (C+Win32 /
-Swift), serveur Go stdlib pur, moteur de sync porté avec vecteurs de test partagés.
-Le client Go devient référence + harnais de test. Installés sur la machine : Go,
-staticcheck, SDK .NET 8 (devenu inutile), WinLibs GCC.
+1. Intégrer le rendu de l'agent Go (QA complète, commit, push → auto-deploy).
+2. Retouche C contre le vecteur 13 régénéré + règles resserrées, intégrer VS-026.
+3. CI verte → `scripts/run-real-sandbox.ps1` → tag **v0.2.0** (VERSION déjà à 0.2.0).
+4. Sur le Mac de Thibault : build Swift (docs/build-macos.md) + port des règles
+   récentes au moteur Swift + Keychain + captures mac.
+5. Ensuite : VS-020 (overlay OSD, ADR-009). Reliquat : renommage module Go
+   thibsix→opmvpc quand aucun agent n'écrit.

@@ -19,19 +19,28 @@ le cas « salle vierge » est fréquent en pratique.
 
 ## Critères d'acceptation
 
-- [ ] Client Go de référence : file de chat bornée (20) vidée après re-hello ;
+- [x] Client Go de référence : file de chat bornée (20) vidée après re-hello ;
       re-déclaration ready/fichier post-welcome ; aucun control émis pendant
       l'alignement (test dédié) ; reprise « salle vierge » (une fois par
       connexion, toast)
-- [ ] Tests e2e : coupure serveur (restart du httptest) pendant lecture → les 2
+- [x] Tests e2e : coupure serveur (restart du httptest) pendant lecture → les 2
       clients continuent localement, se reconnectent, la position est reprise
       (salle vierge) sans retour à 0 ; chat composé hors ligne livré au retour
-- [ ] Vecteurs : nouveaux scénarios si le moteur pur est concerné (alignement
-      sans control, reprise vierge)
-- [ ] Port C (engine.c + ui) puis Swift des mêmes règles
-- [ ] UI : indicateur clair « hors ligne, reconnexion... » + chat marqué
-      « en attente » pour les messages en file
+- [x] Vecteurs : nouveaux scénarios si le moteur pur est concerné (alignement
+      sans control, reprise vierge) — vecteurs 12 et 13 ; le 13 en cours de
+      régénération (champ `keepOutput`, état initial complet, écho exact)
+- [ ] Port C (engine.c + ui) **livré** (1d5a4ad) — reste la validation contre le
+      vecteur 13 régénéré + règles resserrées terra ; Swift au polissage Mac
+- [x] UI : indicateur clair « hors ligne, reconnexion... » + chat marqué
+      « en attente » pour les messages en file (C : file rendue en gris sous
+      l'historique, jamais dedans — évite les doublons à l'écho serveur)
 
 ## Journal du ticket
 
 - 2026-08-06 : créé (retours terrain), spec amendée.
+- 2026-08-06 : Go livré (ef13ee7) puis resserré post-review terra (file liée à la
+  salle, reprise vierge « précédemment connecté », en cours agent Go). Port C
+  livré (1d5a4ad) : file 20 « en attente », re-déclaration post-welcome, reprise
+  via emit_user_control, + fix d'un bug miroir du Go (ready effacé à chaque
+  reconnexion). Bloquant vecteur 13 identifié : le format golden n'encodait pas
+  la convention event/eventKeep → champ `keepOutput` demandé au générateur.
