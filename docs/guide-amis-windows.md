@@ -15,8 +15,8 @@ qui reste calé sur la même image chez tout le monde.
 ## Installation
 
 1. Télécharge `vibesync.exe` depuis les releases GitHub :
-   `https://github.com/opmvpc/vibesync/releases/latest` *(lien à confirmer par
-   la personne qui t'a envoyé ce guide)*.
+   `https://github.com/opmvpc/vibesync/releases/latest` — prends le fichier
+   `vibesync.exe` de la dernière version.
 2. Pas d'installateur : c'est un seul fichier `.exe` (moins de 500 Ko). Mets-le
    où tu veux (Bureau, Documents...) et double-clique dessus.
 
