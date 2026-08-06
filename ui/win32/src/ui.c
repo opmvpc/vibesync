@@ -112,6 +112,8 @@ void ui_text_set(UiText *t, Str8 s) {
     t->data[n] = 0;
     t->len = n;
     t->caret = n;
+    t->anchor = n;
+    t->scroll = 0;
 }
 
 Str8 ui_text_str(const UiText *t) {
@@ -119,65 +121,238 @@ Str8 ui_text_str(const UiText *t) {
     return s;
 }
 
-static isize cp_prev(const UiText *t, isize i) {
+static isize clampi(isize v, isize lo, isize hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+isize ui_text_prev_cp(const UiText *t, isize i) {
+    i = clampi(i, 0, t->len);
     if (i <= 0) return 0;
     i--;
     while (i > 0 && (t->data[i] & 0xc0) == 0x80) i--;
     return i;
 }
 
-static isize cp_next(const UiText *t, isize i) {
+isize ui_text_next_cp(const UiText *t, isize i) {
+    i = clampi(i, 0, t->len);
     if (i >= t->len) return t->len;
     i++;
     while (i < t->len && (t->data[i] & 0xc0) == 0x80) i++;
     return i;
 }
 
-static void text_insert(UiText *t, u32 cp) {
-    u8 buf[4];
-    isize n = utf8_encode(cp, buf);
-    if (t->len + n >= UI_TEXT_CAP) return;
+// align ramène un offset arbitraire sur la frontière de caractère précédente :
+// aucune opération ne peut couper un caractère en deux, même sur un clic.
+static isize align_cp(const UiText *t, isize i) {
+    i = clampi(i, 0, t->len);
+    while (i > 0 && i < t->len && (t->data[i] & 0xc0) == 0x80) i--;
+    return i;
+}
+
+isize ui_text_sel_lo(const UiText *t) { return t->caret < t->anchor ? t->caret : t->anchor; }
+isize ui_text_sel_hi(const UiText *t) { return t->caret > t->anchor ? t->caret : t->anchor; }
+b32 ui_text_has_sel(const UiText *t) { return t->caret != t->anchor; }
+
+Str8 ui_text_selection(const UiText *t) {
+    isize lo = ui_text_sel_lo(t), hi = ui_text_sel_hi(t);
+    Str8 s = {(u8 *)t->data + lo, hi - lo};
+    return s;
+}
+
+void ui_text_move(UiText *t, isize pos, b32 extend) {
+    t->caret = align_cp(t, pos);
+    if (!extend) t->anchor = t->caret;
+}
+
+void ui_text_select_range(UiText *t, isize lo, isize hi) {
+    t->anchor = align_cp(t, lo);
+    t->caret = align_cp(t, hi);
+}
+
+void ui_text_select_all(UiText *t) {
+    t->anchor = 0;
+    t->caret = t->len;
+}
+
+void ui_text_clear_sel(UiText *t) { t->anchor = t->caret; }
+
+b32 ui_text_delete_sel(UiText *t) {
+    isize lo = ui_text_sel_lo(t), hi = ui_text_sel_hi(t);
+    if (hi <= lo) return 0;
+    memmove(t->data + lo, t->data + hi, (size_t)(t->len - hi));
+    t->len -= hi - lo;
+    t->caret = t->anchor = lo;
+    t->data[t->len] = 0;
+    return 1;
+}
+
+// text_put_bytes insère des octets déjà validés à la position du caret.
+static b32 text_put_bytes(UiText *t, const u8 *bytes, isize n) {
+    if (n <= 0 || t->len + n >= UI_TEXT_CAP) return 0;
     memmove(t->data + t->caret + n, t->data + t->caret, (size_t)(t->len - t->caret));
-    memcpy(t->data + t->caret, buf, (size_t)n);
+    memcpy(t->data + t->caret, bytes, (size_t)n);
     t->len += n;
     t->caret += n;
+    t->anchor = t->caret;
     t->data[t->len] = 0;
+    return 1;
 }
 
-static void text_erase(UiText *t, isize from, isize to) {
-    if (to <= from) return;
-    memmove(t->data + from, t->data + to, (size_t)(t->len - to));
-    t->len -= to - from;
-    t->caret = from;
-    t->data[t->len] = 0;
+void ui_text_insert_cp(UiText *t, u32 cp) {
+    ui_text_delete_sel(t);
+    u8 buf[4];
+    isize n = utf8_encode(cp, buf);
+    text_put_bytes(t, buf, n);
 }
 
-static void text_paste(UiApp *a, UiText *t) {
+void ui_text_insert_str(UiText *t, Str8 s) {
+    ui_text_delete_sel(t);
+    for (isize i = 0; i < s.len;) {
+        u8 c = s.data[i];
+        if (c == '\r' || c == '\n' || c == '\t') {  // mono-ligne
+            i++;
+            continue;
+        }
+        isize n = 1;
+        if ((c & 0xe0) == 0xc0) n = 2;
+        else if ((c & 0xf0) == 0xe0) n = 3;
+        else if ((c & 0xf8) == 0xf0) n = 4;
+        if (i + n > s.len) break;
+        if (!text_put_bytes(t, s.data + i, n)) break;  // champ plein : on s'arrête net
+        i += n;
+    }
+}
+
+// --- mots : trois classes, comme les champs de saisie de Windows ---
+
+static int word_class(u8 c) {
+    if (c == ' ' || c == '\t') return 0;
+    if (c >= 0x80) return 1;  // lettres accentuées et autres caractères non ASCII
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') return 1;
+    return 2;
+}
+
+void ui_text_word_bounds(const UiText *t, isize pos, isize *lo, isize *hi) {
+    isize p = align_cp(t, pos);
+    if (t->len == 0) {
+        *lo = *hi = 0;
+        return;
+    }
+    // Un double-clic après le dernier caractère sélectionne le dernier mot.
+    if (p >= t->len) p = ui_text_prev_cp(t, t->len);
+    int cls = word_class(t->data[p]);
+    isize a = p;
+    while (a > 0) {
+        isize prev = ui_text_prev_cp(t, a);
+        if (word_class(t->data[prev]) != cls) break;
+        a = prev;
+    }
+    isize b = ui_text_next_cp(t, p);
+    while (b < t->len && word_class(t->data[b]) == cls) b = ui_text_next_cp(t, b);
+    *lo = a;
+    *hi = b;
+}
+
+isize ui_text_word_left(const UiText *t, isize pos) {
+    isize i = align_cp(t, pos);
+    while (i > 0 && word_class(t->data[ui_text_prev_cp(t, i)]) == 0) i = ui_text_prev_cp(t, i);
+    if (i == 0) return 0;
+    int cls = word_class(t->data[ui_text_prev_cp(t, i)]);
+    while (i > 0 && word_class(t->data[ui_text_prev_cp(t, i)]) == cls) i = ui_text_prev_cp(t, i);
+    return i;
+}
+
+isize ui_text_word_right(const UiText *t, isize pos) {
+    isize i = align_cp(t, pos);
+    if (i >= t->len) return t->len;
+    int cls = word_class(t->data[i]);
+    while (i < t->len && word_class(t->data[i]) == cls) i = ui_text_next_cp(t, i);
+    while (i < t->len && word_class(t->data[i]) == 0) i = ui_text_next_cp(t, i);
+    return i;
+}
+
+void ui_text_backspace(UiText *t, b32 word) {
+    if (ui_text_delete_sel(t)) return;
+    isize from = word ? ui_text_word_left(t, t->caret) : ui_text_prev_cp(t, t->caret);
+    ui_text_select_range(t, from, t->caret);
+    ui_text_delete_sel(t);
+}
+
+void ui_text_delete_fwd(UiText *t, b32 word) {
+    if (ui_text_delete_sel(t)) return;
+    isize to = word ? ui_text_word_right(t, t->caret) : ui_text_next_cp(t, t->caret);
+    ui_text_select_range(t, t->caret, to);
+    ui_text_delete_sel(t);
+}
+
+// --- hit-test ---
+//
+// Les largeurs de préfixe croissent avec l'offset : une recherche dichotomique
+// suffit, ce qui limite à ~9 mesures GDI par clic au lieu d'une par caractère.
+
+static isize cp_offset(const UiText *t, isize index) {
+    isize i = 0;
+    while (index > 0 && i < t->len) {
+        i = ui_text_next_cp(t, i);
+        index--;
+    }
+    return i;
+}
+
+static isize cp_count(const UiText *t) {
+    isize n = 0;
+    for (isize i = 0; i < t->len; i++) {
+        if ((t->data[i] & 0xc0) != 0x80) n++;
+    }
+    return n;
+}
+
+isize ui_text_hit(const UiText *t, const UiTextMetrics *m, i32 x) {
+    if (t->len == 0 || x <= 0) return 0;
+    isize n = cp_count(t);
+    isize lo = 0, hi = n;  // plus grand k tel que width(k) <= x
+    while (lo < hi) {
+        isize mid = (lo + hi + 1) / 2;
+        if (m->prefix_width(m->ctx, t, cp_offset(t, mid)) <= x) lo = mid;
+        else hi = mid - 1;
+    }
+    if (lo >= n) return t->len;
+    isize off0 = cp_offset(t, lo), off1 = cp_offset(t, lo + 1);
+    i32 w0 = m->prefix_width(m->ctx, t, off0), w1 = m->prefix_width(m->ctx, t, off1);
+    // On bascule sur le caractère suivant passé la moitié de sa largeur.
+    return (x - w0 > w1 - x) ? off1 : off0;
+}
+
+// --- presse-papiers ---
+
+static void clip_copy(UiApp *a, Str8 s) {
+    if (s.len == 0 || !a->hwnd) return;
+    isize n = 0;
+    const u16 *w = (const u16 *)utf8_to_utf16(a->scratch, s, &n);
     if (!OpenClipboard(a->hwnd)) return;
+    EmptyClipboard();
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, (SIZE_T)(n + 1) * sizeof(u16));
+    if (h) {
+        u16 *dst = (u16 *)GlobalLock(h);
+        if (dst) {
+            memcpy(dst, w, (size_t)n * sizeof(u16));
+            dst[n] = 0;
+            GlobalUnlock(h);
+            if (!SetClipboardData(CF_UNICODETEXT, h)) GlobalFree(h);
+        } else {
+            GlobalFree(h);
+        }
+    }
+    CloseClipboard();
+}
+
+static void clip_paste(UiApp *a, UiText *t) {
+    if (!a->hwnd || !OpenClipboard(a->hwnd)) return;
     HANDLE h = GetClipboardData(CF_UNICODETEXT);
     if (h) {
         const u16 *w = (const u16 *)GlobalLock(h);
         if (w) {
-            Str8 s = utf16_to_utf8(a->scratch, w);
-            for (isize i = 0; i < s.len;) {
-                u8 c = s.data[i];
-                if (c == '\r' || c == '\n' || c == '\t') {  // mono-ligne
-                    i++;
-                    continue;
-                }
-                isize n = 1;
-                if ((c & 0xe0) == 0xc0) n = 2;
-                else if ((c & 0xf0) == 0xe0) n = 3;
-                else if ((c & 0xf8) == 0xf0) n = 4;
-                if (i + n > s.len) break;
-                if (t->len + n >= UI_TEXT_CAP) break;
-                memmove(t->data + t->caret + n, t->data + t->caret, (size_t)(t->len - t->caret));
-                memcpy(t->data + t->caret, s.data + i, (size_t)n);
-                t->len += n;
-                t->caret += n;
-                i += n;
-            }
-            t->data[t->len] = 0;
+            TempArena tmp = temp_begin(a->scratch);
+            ui_text_insert_str(t, utf16_to_utf8(a->scratch, w));
+            temp_end(tmp);
             GlobalUnlock(h);
         }
     }
@@ -198,6 +373,14 @@ void ui_on_mouse_down(UiApp *app, i32 x, i32 y) {
     app->mouse_pressed = 1;
 }
 
+void ui_on_mouse_double(UiApp *app, i32 x, i32 y) {
+    app->mouse_x = x;
+    app->mouse_y = y;
+    app->mouse_down = 1;
+    app->mouse_pressed = 1;
+    app->mouse_double = 1;
+}
+
 void ui_on_mouse_up(UiApp *app, i32 x, i32 y) {
     app->mouse_x = x;
     app->mouse_y = y;
@@ -212,14 +395,17 @@ void ui_on_char(UiApp *app, u32 cp) {
     if (app->char_count < VS_ARRAY_COUNT(app->chars)) app->chars[app->char_count++] = cp;
 }
 
-void ui_on_key(UiApp *app, u32 vk, b32 ctrl) {
-    app->ctrl_down = ctrl;
-    if (app->key_count < VS_ARRAY_COUNT(app->keys)) app->keys[app->key_count++] = vk;
+void ui_on_key(UiApp *app, u32 vk, u32 mods) {
+    if (app->key_count < VS_ARRAY_COUNT(app->keys)) {
+        app->keys[app->key_count].vk = vk;
+        app->keys[app->key_count].mods = mods;
+        app->key_count++;
+    }
 }
 
 static b32 key_pressed(UiApp *app, u32 vk) {
     for (isize i = 0; i < app->key_count; i++) {
-        if (app->keys[i] == vk) return 1;
+        if (app->keys[i].vk == vk) return 1;
     }
     return 0;
 }
@@ -235,7 +421,7 @@ typedef enum {
 } BtnStyle;
 
 static b32 button(UiApp *a, HDC dc, Rect r, const char *label, u64 id, BtnStyle style, b32 enabled) {
-    b32 hover = enabled && rect_hit(r, a->mouse_x, a->mouse_y);
+    b32 hover = enabled && !a->input_locked && rect_hit(r, a->mouse_x, a->mouse_y);
     b32 clicked = 0;
     if (hover) a->hot = id;
     if (hover && a->mouse_pressed) {
@@ -329,53 +515,183 @@ static void glyph_play(HDC dc, Rect r, u32 color, b32 show_play) {
     DeleteObject(pen);
 }
 
+// --- champ de saisie ---
+//
+// FieldMx branche le modèle d'édition sur les vraies métriques de la police.
+// Pour un champ masqué, tous les points « • » ont la même largeur : on la
+// mesure une fois et on multiplie, ce qui évite de reconstruire une chaîne de
+// points à chaque appel du hit-test.
+typedef struct {
+    UiApp *a;
+    HDC dc;
+    b32 password;
+    i32 bullet_w;
+} FieldMx;
+
+static i32 field_prefix_width(void *ctx, const UiText *t, isize byte_off) {
+    FieldMx *m = (FieldMx *)ctx;
+    if (byte_off <= 0) return 0;
+    if (m->password) {
+        isize dots = 0;
+        for (isize i = 0; i < byte_off && i < t->len; i++) {
+            if ((t->data[i] & 0xc0) != 0x80) dots++;
+        }
+        return (i32)dots * m->bullet_w;
+    }
+    TempArena tmp = temp_begin(m->a->scratch);
+    Str8 s = {(u8 *)t->data, VS_MIN(byte_off, t->len)};
+    i32 w = text_width(m->a, m->dc, s, m->a->f_body);
+    temp_end(tmp);
+    return w;
+}
+
+// bullets construit la chaîne de « • » affichée à la place d'un mot de passe.
+static Str8 bullets(UiApp *a, isize count) {
+    u8 *buf = arena_push_array(a->scratch, u8, count * 3 + 1);
+    isize n = 0;
+    for (isize i = 0; i < count; i++) n += utf8_encode(0x2022, buf + n);
+    return str8(buf, n);
+}
+
+// glyph_gear dessine un engrenage à 8 dents en primitives : un polygone dont le
+// rayon alterne toutes les 22,5°, plus un moyeu. Table de cosinus en millièmes
+// pour rester en entiers — net à tous les DPI, sans police d'icônes.
+static void glyph_gear(HDC dc, Rect r, u32 color, u32 hub_color) {
+    static const i32 COS[16] = {1000, 924,  707,  383,  0,    -383, -707, -924,
+                                -1000, -924, -707, -383, 0,    383,  707,  924};
+    i32 ro = VS_MIN(r.w, r.h) / 2;
+    if (ro < 4) return;
+    i32 ri = ro * 66 / 100;
+    i32 cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+    POINT p[16];
+    for (int k = 0; k < 16; k++) {
+        i32 rad = (k % 2 == 0) ? ro : ri;
+        p[k].x = cx + COS[k] * rad / 1000;
+        p[k].y = cy + COS[(k + 12) % 16] * rad / 1000;  // sin(x) = cos(x − 90°)
+    }
+    HBRUSH br = CreateSolidBrush(cr(color));
+    HPEN pen = CreatePen(PS_SOLID, 1, cr(color));
+    HGDIOBJ ob = SelectObject(dc, br);
+    HGDIOBJ op = SelectObject(dc, pen);
+    Polygon(dc, p, 16);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(br);
+    DeleteObject(pen);
+
+    i32 hub = ro * 34 / 100;
+    HBRUSH hb = CreateSolidBrush(cr(hub_color));
+    HPEN hp = CreatePen(PS_SOLID, 1, cr(hub_color));
+    ob = SelectObject(dc, hb);
+    op = SelectObject(dc, hp);
+    Ellipse(dc, cx - hub, cy - hub, cx + hub, cy + hub);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(hb);
+    DeleteObject(hp);
+}
+
 // field dessine un champ de saisie. Renvoie 1 si Entrée a été pressée dedans.
 static b32 field(UiApp *a, HDC dc, Rect r, UiText *t, const char *placeholder, u64 id, b32 password,
                  i64 now_ms) {
-    if (a->take_next_focus) {
+    if (a->take_next_focus && !a->input_locked) {
         a->focus = id;
         a->take_next_focus = 0;
         a->caret_blink_ms = now_ms;
+        ui_text_select_all(t);
     }
-    b32 hover = rect_hit(r, a->mouse_x, a->mouse_y);
-    if (hover) a->hot = id;
-    if (a->mouse_pressed) {
+    i32 pad = S(a, 10);
+    Rect inner = rect(r.x + pad, r.y, r.w - 2 * pad, r.h);
+    if (++a->field_seq == a->probe_index) {
+        a->probe_x = r.x;
+        a->probe_y = r.y;
+        a->probe_w = r.w;
+        a->probe_h = r.h;
+    }
+
+    FieldMx mx = {a, dc, password, 0};
+    if (password) mx.bullet_w = text_width(a, dc, bullets(a, 1), a->f_body);
+    UiTextMetrics metrics = {field_prefix_width, &mx};
+
+    b32 hover = !a->input_locked && rect_hit(r, a->mouse_x, a->mouse_y);
+    if (hover) {
+        a->hot = id;
+        a->hot_is_text = 1;
+    }
+
+    // --- souris : clic pour placer le caret, drag pour sélectionner ---
+    if (!a->input_locked && a->mouse_pressed) {
         if (hover) {
             a->focus = id;
             a->caret_blink_ms = now_ms;
+            isize pos = ui_text_hit(t, &metrics, a->mouse_x - inner.x + t->scroll);
+            if (a->mouse_double) {
+                isize lo, hi;
+                ui_text_word_bounds(t, pos, &lo, &hi);
+                ui_text_select_range(t, lo, hi);
+            } else {
+                ui_text_move(t, pos, 0);
+                a->active = id;
+                a->dragging_text = 1;
+            }
         } else if (a->focus == id) {
             a->focus = 0;
+        }
+    }
+    if (a->active == id && a->dragging_text) {
+        if (a->mouse_down) {
+            ui_text_move(t, ui_text_hit(t, &metrics, a->mouse_x - inner.x + t->scroll), 1);
+            a->caret_blink_ms = now_ms;
+        }
+        if (a->mouse_released) {
+            a->active = 0;
+            a->dragging_text = 0;
         }
     }
 
     b32 focused = a->focus == id;
     b32 submitted = 0;
-    if (focused) {
-        for (isize i = 0; i < a->char_count; i++) text_insert(t, a->chars[i]);
+    if (focused && !a->input_locked) {
+        for (isize i = 0; i < a->char_count; i++) ui_text_insert_cp(t, a->chars[i]);
         if (a->char_count > 0) a->caret_blink_ms = now_ms;
         a->char_count = 0;
         for (isize i = 0; i < a->key_count; i++) {
-            u32 vk = a->keys[i];
+            u32 vk = a->keys[i].vk;
+            b32 ctrl = (a->keys[i].mods & UI_MOD_CTRL) != 0;
+            b32 shift = (a->keys[i].mods & UI_MOD_SHIFT) != 0;
             switch (vk) {
-                case VK_BACK:
-                    if (a->ctrl_down) text_erase(t, 0, t->caret);
-                    else text_erase(t, cp_prev(t, t->caret), t->caret);
+                case VK_BACK: ui_text_backspace(t, ctrl); break;
+                case VK_DELETE: ui_text_delete_fwd(t, ctrl); break;
+                case VK_LEFT:
+                    if (!shift && ui_text_has_sel(t) && !ctrl) ui_text_move(t, ui_text_sel_lo(t), 0);
+                    else ui_text_move(t, ctrl ? ui_text_word_left(t, t->caret) : ui_text_prev_cp(t, t->caret), shift);
                     break;
-                case VK_DELETE: text_erase(t, t->caret, cp_next(t, t->caret)); break;
-                case VK_LEFT: t->caret = cp_prev(t, t->caret); break;
-                case VK_RIGHT: t->caret = cp_next(t, t->caret); break;
-                case VK_HOME: t->caret = 0; break;
-                case VK_END: t->caret = t->len; break;
+                case VK_RIGHT:
+                    if (!shift && ui_text_has_sel(t) && !ctrl) ui_text_move(t, ui_text_sel_hi(t), 0);
+                    else ui_text_move(t, ctrl ? ui_text_word_right(t, t->caret) : ui_text_next_cp(t, t->caret), shift);
+                    break;
+                case VK_HOME: ui_text_move(t, 0, shift); break;
+                case VK_END: ui_text_move(t, t->len, shift); break;
                 case VK_RETURN: submitted = 1; break;
                 case VK_TAB:
                     a->focus = 0;
                     a->take_next_focus = 1;
                     break;
-                case 'V':
-                    if (a->ctrl_down) text_paste(a, t);
-                    break;
                 case 'A':
-                    if (a->ctrl_down) t->caret = t->len;
+                    if (ctrl) ui_text_select_all(t);
+                    break;
+                case 'C':
+                    // Un mot de passe se sélectionne (pour l'effacer), jamais ne se copie.
+                    if (ctrl && !password) clip_copy(a, ui_text_selection(t));
+                    break;
+                case 'X':
+                    if (ctrl && !password) {
+                        clip_copy(a, ui_text_selection(t));
+                        ui_text_delete_sel(t);
+                    }
+                    break;
+                case 'V':
+                    if (ctrl) clip_paste(a, t);
                     break;
                 default: break;
             }
@@ -388,45 +704,47 @@ static b32 field(UiApp *a, HDC dc, Rect r, UiText *t, const char *placeholder, u
     fill_round(dc, r, radius, focused ? UI_PANEL_HI : mix(UI_PANEL, UI_BG, 90));
     stroke_round(dc, r, radius, focused ? UI_ACCENT : UI_LINE, 1);
 
-    i32 pad = S(a, 10);
-    Rect inner = rect(r.x + pad, r.y, r.w - 2 * pad, r.h);
-
     // Contenu affiché : les mots de passe sont masqués par des points.
-    Str8 shown;
-    if (password && t->len > 0) {
-        isize dots = 0;
-        for (isize i = 0; i < t->len; i++) {
-            if ((t->data[i] & 0xc0) != 0x80) dots++;
-        }
-        u8 *buf = arena_push_array(a->scratch, u8, dots * 3 + 1);
-        isize n = 0;
-        for (isize i = 0; i < dots; i++) n += utf8_encode(0x2022, buf + n);
-        shown = str8(buf, n);
-    } else {
-        shown = ui_text_str(t);
-    }
+    Str8 shown = password && t->len > 0 ? bullets(a, cp_count(t)) : ui_text_str(t);
 
     if (shown.len == 0 && !focused) {
         draw_text(a, dc, inner, placeholder, UI_FAINT, a->f_body, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    } else {
-        // Défilement : garder le caret visible dans le champ.
-        Str8 before = password ? shown : str8_sub(shown, 0, t->caret);
-        i32 caret_x = text_width(a, dc, before, a->f_body);
-        i32 total = text_width(a, dc, shown, a->f_body);
-        i32 off = 0;
-        if (total > inner.w && caret_x > inner.w - S(a, 8)) off = caret_x - (inner.w - S(a, 8));
-        HRGN clip = CreateRectRgn(inner.x, inner.y, inner.x + inner.w, inner.y + inner.h);
-        SelectClipRgn(dc, clip);
-        Rect tr = rect(inner.x - off, inner.y, inner.w + off + S(a, 200), inner.h);
-        draw_text_rect(a, dc, tr, shown, UI_TEXT, a->f_body, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
-        if (focused && ((now_ms - a->caret_blink_ms) / 500) % 2 == 0) {
-            i32 cx = inner.x - off + caret_x;
-            i32 ch = text_height(a, dc, a->f_body);
-            fill_rect(dc, rect(cx, r.y + (r.h - ch) / 2, VS_MAX(1, S(a, 1)), ch), UI_ACCENT_HI);
-        }
-        SelectClipRgn(dc, NULL);
-        DeleteObject(clip);
+        t->scroll = 0;
+        return submitted;
     }
+
+    // Défilement horizontal : le caret reste visible, y compris pendant un drag
+    // qui sort du champ.
+    i32 caret_x = field_prefix_width(&mx, t, t->caret);
+    i32 total = field_prefix_width(&mx, t, t->len);
+    i32 slack = S(a, 2);
+    if (total <= inner.w) {
+        t->scroll = 0;
+    } else {
+        if (caret_x - t->scroll < 0) t->scroll = caret_x;
+        if (caret_x - t->scroll > inner.w - slack) t->scroll = caret_x - (inner.w - slack);
+        i32 max_scroll = total - inner.w + slack;
+        if (t->scroll > max_scroll) t->scroll = max_scroll;
+        if (t->scroll < 0) t->scroll = 0;
+    }
+
+    HRGN clip = CreateRectRgn(inner.x, inner.y, inner.x + inner.w, inner.y + inner.h);
+    SelectClipRgn(dc, clip);
+    i32 ch = text_height(a, dc, a->f_body);
+    i32 cy = r.y + (r.h - ch) / 2;
+    if (ui_text_has_sel(t)) {
+        i32 x0 = field_prefix_width(&mx, t, ui_text_sel_lo(t)) - t->scroll;
+        i32 x1 = field_prefix_width(&mx, t, ui_text_sel_hi(t)) - t->scroll;
+        fill_rect(dc, rect(inner.x + x0, cy, VS_MAX(1, x1 - x0), ch), focused ? UI_ACCENT_DIM : UI_LINE);
+    }
+    Rect tr = rect(inner.x - t->scroll, inner.y, inner.w + t->scroll + S(a, 400), inner.h);
+    draw_text_rect(a, dc, tr, shown, UI_TEXT, a->f_body, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    // Caret : masqué tant qu'une sélection est en cours (le bloc parle déjà).
+    if (focused && !ui_text_has_sel(t) && ((now_ms - a->caret_blink_ms) / 500) % 2 == 0) {
+        fill_rect(dc, rect(inner.x + caret_x - t->scroll, cy, VS_MAX(1, S(a, 1)), ch), UI_ACCENT_HI);
+    }
+    SelectClipRgn(dc, NULL);
+    DeleteObject(clip);
     return submitted;
 }
 
@@ -460,7 +778,7 @@ void ui_format_time(f64 sec, char *buf, isize cap) {
 static b32 seekbar(UiApp *a, HDC dc, Rect r, f64 pos, f64 dur, u64 id, f64 *out_pos) {
     i32 track_h = S(a, 6);
     Rect track = rect(r.x, r.y + (r.h - track_h) / 2, r.w, track_h);
-    b32 hover = rect_hit(rect(r.x, r.y, r.w, r.h), a->mouse_x, a->mouse_y);
+    b32 hover = !a->input_locked && rect_hit(rect(r.x, r.y, r.w, r.h), a->mouse_x, a->mouse_y);
     b32 enabled = dur > 0;
     if (hover && enabled) a->hot = id;
     if (hover && enabled && a->mouse_pressed) {
@@ -592,7 +910,25 @@ enum {
     ID_CHAT,
     ID_SEND,
     ID_LEAVE,
+    ID_GEAR,
+    ID_SET_SERVER,
+    ID_SET_NAME,
+    ID_SET_ROOM,
+    ID_SET_VLC,
+    ID_SET_DETECT,
+    ID_SET_SAVE,
+    ID_SET_CANCEL,
 };
+
+// gear_button dessine le bouton engrenage (discret, même rendu partout).
+static b32 gear_button(UiApp *a, HDC dc, Rect r) {
+    b32 hover = !a->input_locked && rect_hit(r, a->mouse_x, a->mouse_y);
+    b32 clicked = button(a, dc, r, "", ID_GEAR, BTN_GHOST, 1);
+    i32 g = VS_MIN(r.w, r.h) - S(a, 14);
+    glyph_gear(dc, rect(r.x + (r.w - g) / 2, r.y + (r.h - g) / 2, g, g), hover ? UI_TEXT : UI_MUTED,
+               hover ? UI_PANEL_HI : UI_PANEL);
+    return clicked;
+}
 
 static void screen_connect(UiApp *a, HDC dc, i64 now_ms) {
     i32 card_w = VS_MIN(S(a, 420), a->width - S(a, 48));
@@ -611,6 +947,8 @@ static void screen_connect(UiApp *a, HDC dc, i64 now_ms) {
     fill_round(dc, rect(x, y + S(a, 14), dot, dot), dot / 2, UI_ACCENT);
     draw_text(a, dc, rect(x + dot + S(a, 10), y, w, S(a, 40)), "vibesync", UI_TEXT, a->f_huge,
               DT_LEFT | DT_TOP | DT_SINGLELINE);
+    i32 gs = S(a, 34);
+    if (gear_button(a, dc, rect(x + w - gs, y + S(a, 4), gs, gs))) a->act_settings_open = 1;
     y += S(a, 46);
     draw_text(a, dc, rect(x, y, w, S(a, 20)), "Regarder ensemble, chacun chez soi.", UI_MUTED, a->f_small,
               DT_LEFT | DT_TOP | DT_SINGLELINE);
@@ -711,7 +1049,7 @@ static void draw_chat(UiApp *a, HDC dc, Rect r, i64 now_ms) {
     Rect hist = rect(x, r.y + pad + S(a, 26), w, r.h - pad * 2 - S(a, 26) - input_h - S(a, 10));
 
     // Molette : défilement de l'historique.
-    if (rect_hit(hist, a->mouse_x, a->mouse_y) && a->wheel != 0) {
+    if (!a->input_locked && rect_hit(hist, a->mouse_x, a->mouse_y) && a->wheel != 0) {
         a->chat_scroll += a->wheel / 120;
         if (a->chat_scroll < 0) a->chat_scroll = 0;
         if (a->chat_scroll > a->chat_count) a->chat_scroll = a->chat_count;
@@ -837,7 +1175,10 @@ static void draw_header(UiApp *a, HDC dc, Rect r) {
     Rect leave = rect(r.x + r.w - pad - bw, y + (r.h - bh) / 2, bw, bh);
     if (button(a, dc, leave, "Quitter", ID_LEAVE, BTN_DANGER, 1)) a->act_disconnect = 1;
 
-    i32 rx = leave.x - S(a, 12);
+    Rect gear = rect(leave.x - S(a, 8) - bh, y + (r.h - bh) / 2, bh, bh);
+    if (gear_button(a, dc, gear)) a->act_settings_open = 1;
+
+    i32 rx = gear.x - S(a, 12);
     if (a->drift_sec != 0 || a->phase == VS_PHASE_CONNECTED) {
         char drift[40];
         f64 d = a->drift_sec;
@@ -901,6 +1242,173 @@ static void screen_room(UiApp *a, HDC dc, i64 now_ms) {
     draw_chat(a, dc, rect(rx, top + transport_h + pad, rw, bottom - top - transport_h - pad), now_ms);
 }
 
+// -------------------------------------------------------------- réglages ---
+//
+// Panneau modal superposé à l'écran courant : l'écran du dessous est dessiné
+// normalement mais son entrée est verrouillée (a->input_locked), ce qui évite
+// de dupliquer une machine à états d'écran juste pour des réglages.
+
+// dim_screen assombrit tout l'écran sous le panneau modal.
+//
+// AlphaBlend vit dans msimg32.dll : on la charge à la demande plutôt que de
+// l'ajouter à l'édition de liens (même geste que DwmSetWindowAttribute). La
+// source est un unique pixel noir prémultiplié, étiré sur toute la fenêtre.
+// À défaut (DLL absente), repli sur un damier : le voile reste visible.
+typedef BOOL(WINAPI *AlphaBlendFn)(HDC, int, int, int, int, HDC, int, int, int, int, BLENDFUNCTION);
+
+static void dim_checker(HDC dc, Rect r) {
+    static const u16 bits[8] = {0x5555, 0xaaaa, 0x5555, 0xaaaa, 0x5555, 0xaaaa, 0x5555, 0xaaaa};
+    HBITMAP bm = CreateBitmap(8, 8, 1, 1, bits);
+    if (!bm) return;
+    HBRUSH br = CreatePatternBrush(bm);
+    HGDIOBJ ob = SelectObject(dc, br);
+    COLORREF otc = SetTextColor(dc, RGB(0, 0, 0));
+    COLORREF obc = SetBkColor(dc, RGB(255, 255, 255));
+    PatBlt(dc, r.x, r.y, r.w, r.h, 0x00A000C9);  // DPa : dest ET trame
+    SetTextColor(dc, otc);
+    SetBkColor(dc, obc);
+    SelectObject(dc, ob);
+    DeleteObject(br);
+    DeleteObject(bm);
+}
+
+static void dim_screen(HDC dc, Rect r) {
+    static AlphaBlendFn alpha_blend = NULL;
+    static b32 tried = 0;
+    if (!tried) {
+        tried = 1;
+        HMODULE m = LoadLibraryW(L"msimg32.dll");
+        if (m) alpha_blend = (AlphaBlendFn)(void *)GetProcAddress(m, "AlphaBlend");
+    }
+    if (!alpha_blend) {
+        dim_checker(dc, r);
+        return;
+    }
+    BITMAPINFO bi;
+    memset(&bi, 0, sizeof(bi));
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = 1;
+    bi.bmiHeader.biHeight = 1;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void *bits = NULL;
+    HDC src = CreateCompatibleDC(dc);
+    if (!src) return;
+    HBITMAP bm = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (bm && bits) {
+        ((u32 *)bits)[0] = 0xa8000000u;  // noir prémultiplié, alpha 168/255
+        HGDIOBJ ob = SelectObject(src, bm);
+        BLENDFUNCTION bf = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        alpha_blend(dc, r.x, r.y, r.w, r.h, src, 0, 0, 1, 1, bf);
+        SelectObject(src, ob);
+    }
+    if (bm) DeleteObject(bm);
+    DeleteDC(src);
+}
+
+static void screen_settings(UiApp *a, HDC dc, i64 now_ms) {
+    dim_screen(dc, rect(0, 0, a->width, a->height));
+
+    i32 card_w = VS_MIN(S(a, 520), a->width - S(a, 48));
+    i32 pad = S(a, 24);
+    i32 fh = S(a, 36);
+    i32 gap = S(a, 12);
+    // Hauteur exacte : marges + en-tête + 3 champs + le bloc VLC + le message
+    // de validation + la rangée de boutons. Rien ne dépasse de la carte.
+    i32 head_h = S(a, 62), msg_h = S(a, 40), btn_h = S(a, 40);
+    i32 card_h = 2 * pad + head_h + 3 * (S(a, 18) + fh + gap) + (S(a, 18) + fh + S(a, 6)) + msg_h +
+                 S(a, 8) + btn_h;
+    Rect card = rect((a->width - card_w) / 2, VS_MAX(S(a, 16), (a->height - card_h) / 2), card_w, card_h);
+    // Ombre portée : le panneau flotte franchement au-dessus de l'écran.
+    fill_round(dc, rect(card.x + S(a, 3), card.y + S(a, 5), card.w, card.h), S(a, 14),
+               mix(UI_BG, 0x000000u, 140));
+    fill_round(dc, card, S(a, 14), UI_PANEL);
+    stroke_round(dc, card, S(a, 14), UI_ACCENT_DIM, 1);
+
+    i32 x = card.x + pad, w = card.w - 2 * pad;
+    i32 y = card.y + pad;
+    draw_text(a, dc, rect(x, y, w, S(a, 28)), "Réglages", UI_TEXT, a->f_title,
+              DT_LEFT | DT_TOP | DT_SINGLELINE);
+    draw_text(a, dc, rect(x, y + S(a, 26), w, S(a, 18)), "Valeurs par défaut, mémorisées dans %APPDATA%\\vibesync.ini",
+              UI_FAINT, a->f_small, DT_LEFT | DT_TOP | DT_SINGLELINE);
+    y += head_h;
+
+    b32 submit = 0;
+    struct {
+        const char *lab;
+        UiText *t;
+        u64 id;
+        const char *ph;
+    } fields[] = {
+        {"Serveur par défaut", &a->f_set_server, ID_SET_SERVER, "wss://vibesync.exemple.fr/ws"},
+        {"Pseudo par défaut", &a->f_set_name, ID_SET_NAME, "votre pseudo"},
+        {"Salle par défaut", &a->f_set_room, ID_SET_ROOM, "salon"},
+    };
+    for (isize i = 0; i < VS_ARRAY_COUNT(fields); i++) {
+        label(a, dc, rect(x, y, w, S(a, 18)), fields[i].lab);
+        y += S(a, 18);
+        if (field(a, dc, rect(x, y, w, fh), fields[i].t, fields[i].ph, fields[i].id, 0, now_ms)) submit = 1;
+        y += fh + gap;
+    }
+
+    // Chemin de VLC : champ + bouton « Détecter » + état de la détection.
+    label(a, dc, rect(x, y, w, S(a, 18)), "Chemin de VLC (vide = détection automatique)");
+    y += S(a, 18);
+    i32 det_w = S(a, 96);
+    if (field(a, dc, rect(x, y, w - det_w - S(a, 8), fh), &a->f_set_vlc, a->settings_auto_vlc[0] ? a->settings_auto_vlc : "C:\\Program Files\\VideoLAN\\VLC\\vlc.exe",
+              ID_SET_VLC, 0, now_ms)) {
+        submit = 1;
+    }
+    if (button(a, dc, rect(x + w - det_w, y, det_w, fh), "Détecter", ID_SET_DETECT, BTN_GHOST,
+               a->settings_auto_vlc[0] != 0)) {
+        a->act_settings_detect = 1;
+    }
+    y += fh + S(a, 6);
+
+    {
+        const char *msg;
+        u32 col;
+        if (a->settings_vlc_state == 2) {
+            msg = "Ce fichier n'existe pas : corrigez le chemin ou videz le champ.";
+            col = UI_DANGER;
+        } else if (a->settings_vlc_state == 1) {
+            msg = "vlc.exe trouvé à ce chemin.";
+            col = UI_OK;
+        } else if (a->settings_auto_vlc[0]) {
+            msg = a->settings_auto_vlc;
+            col = UI_MUTED;
+        } else {
+            msg = "Aucun VLC détecté sur cette machine : indiquez le chemin de vlc.exe.";
+            col = UI_WARN;
+        }
+        Builder b;
+        builder_init(&b, a->scratch, 320);
+        if (a->settings_vlc_state == 0 && a->settings_auto_vlc[0]) builder_cstr(&b, "Détection automatique : ");
+        builder_cstr(&b, msg);
+        draw_text_rect(a, dc, rect(x, y, w, S(a, 34)), builder_result(&b), col, a->f_small,
+                       DT_LEFT | DT_TOP | DT_WORDBREAK | DT_NOPREFIX);
+    }
+    y += msg_h;
+
+    i32 bw = S(a, 130);
+    if (a->settings_msg[0]) {
+        // Aligné sur la rangée de boutons, borné à la place qui reste à gauche.
+        draw_text(a, dc, rect(x, y + S(a, 8), w - 2 * bw - S(a, 20), btn_h), a->settings_msg,
+                  a->settings_msg_error ? UI_DANGER : UI_OK, a->f_small,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+
+    if (button(a, dc, rect(x + w - bw, y + S(a, 8), bw, btn_h), "Enregistrer", ID_SET_SAVE, BTN_PRIMARY, 1)) {
+        submit = 1;
+    }
+    if (button(a, dc, rect(x + w - 2 * bw - S(a, 10), y + S(a, 8), bw, btn_h), "Annuler", ID_SET_CANCEL,
+               BTN_GHOST, 1)) {
+        a->act_settings_cancel = 1;
+    }
+    if (submit) a->act_settings_save = 1;
+}
+
 // ------------------------------------------------------------------- frame ---
 
 static void draw_toast(UiApp *a, HDC dc, i64 now_ms) {
@@ -940,24 +1448,38 @@ void ui_frame(UiApp *app, HDC dc, i32 w, i32 h, i64 now_ms) {
     app->width = w;
     app->height = h;
     app->hot = 0;
+    app->hot_is_text = 0;
+    app->field_seq = 0;
     if (!app->f_body) ui_set_dpi(app, app->dpi);
 
     fill_rect(dc, rect(0, 0, w, h), UI_BG);
 
-    // Échap : on lâche le champ courant et on efface le bandeau.
+    // Échap : ferme les réglages, sinon lâche le champ courant et le bandeau.
     if (key_pressed(app, VK_ESCAPE)) {
-        app->focus = 0;
-        app->toast_until_ms = 0;
+        if (app->settings_open) app->act_settings_cancel = 1;
+        else {
+            app->focus = 0;
+            app->toast_until_ms = 0;
+        }
         app->key_count = 0;
     }
 
+    // L'écran du dessous est dessiné mais sourd tant que les réglages sont
+    // ouverts : un seul chemin de rendu, aucune entrée qui fuit sous le modal.
+    app->input_locked = app->settings_open;
     if (app->screen == UI_SCREEN_CONNECT) screen_connect(app, dc, now_ms);
     else screen_room(app, dc, now_ms);
+    app->input_locked = 0;
+    if (app->settings_open) screen_settings(app, dc, now_ms);
 
     draw_toast(app, dc, now_ms);
 
-    // Le curseur main sur les zones cliquables : petit détail, grand effet.
-    SetCursor(LoadCursorW(NULL, app->hot ? (LPCWSTR)IDC_HAND : (LPCWSTR)IDC_ARROW));
+    // Curseur : barre en I sur les champs, main sur le reste des zones
+    // cliquables. Petit détail, grand effet — et un vrai repère d'édition.
+    LPCWSTR cursor = (LPCWSTR)IDC_ARROW;
+    if (app->hot_is_text || app->dragging_text) cursor = (LPCWSTR)IDC_IBEAM;
+    else if (app->hot) cursor = (LPCWSTR)IDC_HAND;
+    SetCursor(LoadCursorW(NULL, cursor));
 
     // Rafraîchissement périodique seulement si quelque chose bouge.
     app->need_timer = (app->screen == UI_SCREEN_ROOM && !app->paused && app->vlc_running) || app->focus != 0 ||
@@ -966,6 +1488,7 @@ void ui_frame(UiApp *app, HDC dc, i32 w, i32 h, i64 now_ms) {
     // Fin de frame : les entrées non consommées sont oubliées.
     app->mouse_pressed = 0;
     app->mouse_released = 0;
+    app->mouse_double = 0;
     app->wheel = 0;
     app->char_count = 0;
     app->key_count = 0;

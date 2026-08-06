@@ -1229,6 +1229,177 @@ static void test_ini(Arena *a) {
     temp_end(top);
 }
 
+// ------------------------------------------- édition de texte (VS-018) ---
+//
+// Le modèle caret/sélection est découplé du rendu : ces tests l'exercent sans
+// fenêtre ni GDI, en branchant une police fictive sur UiTextMetrics.
+
+// fake_width : 10 px par caractère, 4 px pour les caractères fins. Largeurs
+// inégales exprès, pour que le hit-test ne puisse pas tricher avec une division.
+static i32 fake_width(void *ctx, const UiText *t, isize byte_off) {
+    VS_UNUSED(ctx);
+    i32 w = 0;
+    for (isize i = 0; i < byte_off && i < t->len; i++) {
+        u8 c = t->data[i];
+        if ((c & 0xc0) == 0x80) continue;  // octet de continuation : même glyphe
+        w += (c == 'i' || c == 'l') ? 4 : 10;
+    }
+    return w;
+}
+
+static void test_text_edit(void) {
+    section("édition de texte");
+    UiTextMetrics mx = {fake_width, NULL};
+    UiText t;
+    memset(&t, 0, sizeof(t));
+
+    // --- hit-test : « salon », frontières à 0, 10, 20, 24, 34, 44 px ---
+    ui_text_set(&t, S("salon"));
+    struct {
+        i32 x;
+        isize want;
+    } hits[] = {
+        {-20, 0}, {0, 0}, {4, 0},  {6, 1},  {15, 1},
+        {16, 2},  {23, 3}, {40, 5}, {1000, 5},
+    };
+    for (isize i = 0; i < VS_ARRAY_COUNT(hits); i++) {
+        isize got = ui_text_hit(&t, &mx, hits[i].x);
+        CHECK(got == hits[i].want, "hit(%d) = %lld, attendu %lld", (int)hits[i].x, (long long)got,
+              (long long)hits[i].want);
+    }
+    {
+        UiText empty;
+        memset(&empty, 0, sizeof(empty));
+        CHECK(ui_text_hit(&empty, &mx, 50) == 0, "hit sur champ vide");
+    }
+
+    // --- hit-test : jamais au milieu d'un caractère multi-octets ---
+    ui_text_set(&t, S("café"));  // « é » = 2 octets, len 5
+    CHECK(t.len == 5, "longueur de « café » = %lld", (long long)t.len);
+    CHECK(ui_text_hit(&t, &mx, 33) == 3, "hit avant « é »");
+    CHECK(ui_text_hit(&t, &mx, 36) == 5, "hit après « é » (pas 4)");
+    ui_text_move(&t, 4, 0);  // offset interdit : ramené sur la frontière
+    CHECK(t.caret == 3, "caret recalé sur frontière UTF-8 (%lld)", (long long)t.caret);
+
+    // --- clic puis glissé : sélection continue ---
+    ui_text_set(&t, S("salon"));
+    ui_text_move(&t, ui_text_hit(&t, &mx, 16), 0);  // appui à 16 px → offset 2
+    CHECK(t.caret == 2 && !ui_text_has_sel(&t), "appui : caret posé, pas de sélection");
+    ui_text_move(&t, ui_text_hit(&t, &mx, 30), 1);  // glissé
+    CHECK(ui_text_sel_lo(&t) == 2 && ui_text_sel_hi(&t) == 4, "glissé : sélection [2,4)");
+    ui_text_move(&t, ui_text_hit(&t, &mx, 1000), 1);
+    CHECK(str8_eq(ui_text_selection(&t), S("lon")), "glissé jusqu'au bout");
+    // Retour en arrière : l'ancre ne bouge pas, la sélection s'inverse.
+    ui_text_move(&t, ui_text_hit(&t, &mx, 0), 1);
+    CHECK(ui_text_sel_lo(&t) == 0 && ui_text_sel_hi(&t) == 2 && str8_eq(ui_text_selection(&t), S("sa")),
+          "sélection inversée");
+
+    // --- double-clic : mot sous le curseur ---
+    struct {
+        const char *text;
+        isize pos;
+        const char *want;
+    } words[] = {
+        {"salut le monde", 6, "le"},
+        {"salut le monde", 0, "salut"},
+        {"salut le monde", 14, "monde"},   // clic après le dernier caractère
+        {"salut le monde", 5, " "},        // sur un espace : la suite d'espaces
+        {"ws://127.0.0.1:8080/ws", 5, "127"},
+        {"ws://127.0.0.1:8080/ws", 2, "://"},  // ponctuation : le groupe entier
+        {"Thibault Éloïse", 9, "Éloïse"},      // accents = lettres
+    };
+    for (isize i = 0; i < VS_ARRAY_COUNT(words); i++) {
+        ui_text_set(&t, S(words[i].text));
+        isize lo, hi;
+        ui_text_word_bounds(&t, words[i].pos, &lo, &hi);
+        ui_text_select_range(&t, lo, hi);
+        CHECK(str8_eq(ui_text_selection(&t), S(words[i].want)), "mot en %lld de « %s » = « %.*s »",
+              (long long)words[i].pos, words[i].text, (int)ui_text_selection(&t).len,
+              ui_text_selection(&t).data);
+    }
+    {
+        UiText empty;
+        memset(&empty, 0, sizeof(empty));
+        isize lo = 9, hi = 9;
+        ui_text_word_bounds(&empty, 0, &lo, &hi);
+        CHECK(lo == 0 && hi == 0, "mot dans un champ vide");
+    }
+
+    // --- sauts de mot (Ctrl+flèches) ---
+    ui_text_set(&t, S("salut le monde"));
+    CHECK(ui_text_word_right(&t, 0) == 6, "mot à droite depuis 0");
+    CHECK(ui_text_word_right(&t, 6) == 9, "mot à droite depuis 6");
+    CHECK(ui_text_word_right(&t, 14) == 14, "mot à droite en fin de champ");
+    CHECK(ui_text_word_left(&t, 14) == 9, "mot à gauche depuis la fin");
+    CHECK(ui_text_word_left(&t, 9) == 6, "mot à gauche depuis 9");
+    CHECK(ui_text_word_left(&t, 0) == 0, "mot à gauche en début de champ");
+
+    // --- Ctrl+A puis frappe : la sélection est remplacée ---
+    ui_text_set(&t, S("ancien"));
+    ui_text_select_all(&t);
+    CHECK(ui_text_has_sel(&t) && ui_text_sel_lo(&t) == 0 && ui_text_sel_hi(&t) == 6, "Ctrl+A");
+    ui_text_insert_cp(&t, 'X');
+    CHECK(str8_eq(ui_text_str(&t), S("X")) && t.caret == 1 && !ui_text_has_sel(&t),
+          "frappe sur sélection : remplacement");
+
+    // --- suppressions ---
+    ui_text_set(&t, S("salon"));
+    ui_text_select_range(&t, 1, 3);
+    ui_text_backspace(&t, 0);
+    CHECK(str8_eq(ui_text_str(&t), S("son")) && t.caret == 1, "Retour arrière sur sélection");
+    ui_text_set(&t, S("salon"));
+    ui_text_select_range(&t, 1, 3);
+    ui_text_delete_fwd(&t, 0);
+    CHECK(str8_eq(ui_text_str(&t), S("son")), "Suppr sur sélection");
+    ui_text_set(&t, S("café"));
+    ui_text_backspace(&t, 0);
+    CHECK(str8_eq(ui_text_str(&t), S("caf")) && utf8_validate(ui_text_str(&t)),
+          "Retour arrière supprime le caractère entier");
+    ui_text_set(&t, S("salut le monde"));
+    ui_text_backspace(&t, 1);
+    CHECK(str8_eq(ui_text_str(&t), S("salut le ")), "Ctrl+Retour arrière : un mot");
+    ui_text_set(&t, S("salut le monde"));
+    ui_text_move(&t, 0, 0);
+    ui_text_delete_fwd(&t, 1);
+    CHECK(str8_eq(ui_text_str(&t), S("le monde")), "Ctrl+Suppr : un mot");
+
+    // --- collage : mono-ligne, sélection remplacée ---
+    ui_text_set(&t, S("abc"));
+    ui_text_select_all(&t);
+    ui_text_insert_str(&t, S("un\r\ndeux\ttrois"));
+    CHECK(str8_eq(ui_text_str(&t), S("undeuxtrois")), "collage filtré : « %.*s »", (int)t.len, t.data);
+    CHECK(t.caret == t.len && !ui_text_has_sel(&t), "caret après collage");
+
+    // --- Maj+Origine / Maj+Fin ---
+    ui_text_set(&t, S("salon"));
+    ui_text_move(&t, 2, 0);
+    ui_text_move(&t, t.len, 1);
+    CHECK(str8_eq(ui_text_selection(&t), S("lon")), "Maj+Fin");
+    ui_text_move(&t, 0, 1);
+    CHECK(str8_eq(ui_text_selection(&t), S("sa")), "Maj+Origine depuis l'ancre");
+
+    // --- limites : capacité et frontières UTF-8 ---
+    {
+        u8 big[UI_TEXT_CAP * 2];
+        for (isize i = 0; i < (isize)sizeof(big); i += 2) {
+            big[i] = 0xc3;  // « é »
+            big[i + 1] = 0xa9;
+        }
+        ui_text_set(&t, str8(big, (isize)sizeof(big)));
+        CHECK(t.len == UI_TEXT_CAP - 2 && utf8_validate(ui_text_str(&t)), "troncature (%lld octets)",
+              (long long)t.len);
+        isize before = t.len;
+        ui_text_insert_cp(&t, 0xe9);  // « é » : 2 octets, il n'en reste qu'un
+        CHECK(t.len == before, "insertion refusée quand le champ est plein");
+        ui_text_insert_cp(&t, 'x');  // 1 octet : passe tout juste
+        CHECK(t.len == before + 1 && t.data[t.len] == 0, "dernier octet utilisable");
+        CHECK(utf8_validate(ui_text_str(&t)), "champ plein toujours valide en UTF-8");
+        ui_text_select_all(&t);
+        ui_text_insert_str(&t, S("court"));
+        CHECK(str8_eq(ui_text_str(&t), S("court")), "remplacement total d'un champ plein");
+    }
+}
+
 // --------------------------------------------- faux VLC HTTP (sur socket) ---
 //
 // Sert /requests/status.json comme le vrai VLC, pour exercer le chemin réseau
@@ -2099,6 +2270,7 @@ int main(int argc, char **argv) {
     test_vlc(a);
     test_engine_units();
     test_ini(a);
+    test_text_edit();
     test_vlc_live(a);
     test_net_live(a);
     test_net_queue_saturation(a);

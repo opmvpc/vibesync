@@ -40,15 +40,68 @@ typedef enum {
     UI_SCREEN_ROOM,
 } UiScreen;
 
-// UiText est un champ de saisie mono-ligne : contenu UTF-8 + caret en octets.
+// --- modèle d'édition (découplé du rendu, donc testable sans fenêtre) ---
+//
+// UiText est un champ de saisie mono-ligne : contenu UTF-8, plus deux bornes en
+// octets. `caret` est l'extrémité mobile de la sélection, `anchor` l'extrémité
+// fixe ; les deux confondues signifient « pas de sélection ». Toutes les
+// fonctions ci-dessous sont de purs calculs sur ces trois champs : aucune
+// dépendance à GDI, à une fenêtre ou à une arène.
 typedef struct {
     u8 data[UI_TEXT_CAP];
     isize len;
     isize caret;
+    isize anchor;
+    i32 scroll;  // défilement horizontal en pixels (mémorisé par le rendu)
 } UiText;
 
 void ui_text_set(UiText *t, Str8 s);
 Str8 ui_text_str(const UiText *t);
+
+// Frontières de points de code (jamais au milieu d'un caractère UTF-8).
+isize ui_text_prev_cp(const UiText *t, isize i);
+isize ui_text_next_cp(const UiText *t, isize i);
+
+isize ui_text_sel_lo(const UiText *t);
+isize ui_text_sel_hi(const UiText *t);
+b32 ui_text_has_sel(const UiText *t);
+Str8 ui_text_selection(const UiText *t);
+
+// ui_text_move place le caret ; `extend` conserve l'ancre (Maj+flèches, drag).
+void ui_text_move(UiText *t, isize pos, b32 extend);
+void ui_text_select_range(UiText *t, isize lo, isize hi);
+void ui_text_select_all(UiText *t);
+void ui_text_clear_sel(UiText *t);
+
+// ui_text_delete_sel supprime la sélection ; renvoie 1 si quelque chose a été
+// supprimé. Toutes les insertions et suppressions passent par elle : une frappe
+// remplace naturellement la sélection.
+b32 ui_text_delete_sel(UiText *t);
+void ui_text_insert_cp(UiText *t, u32 cp);
+// ui_text_insert_str insère une chaîne UTF-8 en filtrant les sauts de ligne et
+// tabulations (le champ est mono-ligne). Tronque proprement si la place manque.
+void ui_text_insert_str(UiText *t, Str8 s);
+void ui_text_backspace(UiText *t, b32 word);
+void ui_text_delete_fwd(UiText *t, b32 word);
+
+// Découpage en mots : classes espace / mot / ponctuation, comme les éditeurs
+// Windows. Les octets ≥ 0x80 (lettres accentuées) comptent comme du mot.
+void ui_text_word_bounds(const UiText *t, isize pos, isize *lo, isize *hi);
+isize ui_text_word_left(const UiText *t, isize pos);
+isize ui_text_word_right(const UiText *t, isize pos);
+
+// UiTextMetrics donne la largeur en pixels du préfixe [0, byte_off) tel qu'il
+// est affiché. Le rendu la branche sur GetTextExtentPoint32W ; les tests la
+// branchent sur une police fictive. C'est le seul point de contact entre le
+// modèle d'édition et le dessin.
+typedef struct {
+    i32 (*prefix_width)(void *ctx, const UiText *t, isize byte_off);
+    void *ctx;
+} UiTextMetrics;
+
+// ui_text_hit renvoie l'offset en octets de la frontière la plus proche de `x`
+// (x = pixels depuis le début du texte, défilement déjà déduit).
+isize ui_text_hit(const UiText *t, const UiTextMetrics *m, i32 x);
 
 typedef struct {
     char name[64];
@@ -64,6 +117,16 @@ typedef struct {
     char text[UI_CHAT_LINE_CAP];
     b32 system;
 } UiChatLine;
+
+// Modificateurs d'une frappe : le champ de saisie a besoin de Maj (extension de
+// sélection) autant que de Ctrl (raccourcis).
+#define UI_MOD_CTRL 1u
+#define UI_MOD_SHIFT 2u
+
+typedef struct {
+    u32 vk;
+    u32 mods;
+} UiKeyEvent;
 
 typedef struct {
     // ---- vue (remplie par main.c avant chaque frame) ----
@@ -99,6 +162,14 @@ typedef struct {
     // ---- saisie ----
     UiText f_server, f_name, f_room, f_password, f_chat;
 
+    // ---- panneau Réglages (superposé à l'écran courant) ----
+    b32 settings_open;
+    UiText f_set_server, f_set_name, f_set_room, f_set_vlc;
+    char settings_auto_vlc[300];  // chemin détecté automatiquement (vue)
+    i32 settings_vlc_state;       // 0 vide (auto), 1 trouvé, 2 introuvable
+    char settings_msg[224];
+    b32 settings_msg_error;
+
     // ---- actions produites par la frame ----
     b32 act_connect;
     b32 act_disconnect;
@@ -109,21 +180,35 @@ typedef struct {
     f64 act_seek_pos;
     b32 act_open_file;
     b32 act_chat_send;
+    b32 act_settings_open;
+    b32 act_settings_save;
+    b32 act_settings_cancel;
+    b32 act_settings_detect;
 
     // ---- interne ----
     u64 hot, active, focus;
     i32 mouse_x, mouse_y;
-    b32 mouse_down, mouse_pressed, mouse_released;
+    b32 mouse_down, mouse_pressed, mouse_released, mouse_double;
     i32 wheel;
     u32 chars[32];
     isize char_count;
-    u32 keys[32];
+    UiKeyEvent keys[32];
     isize key_count;
-    b32 ctrl_down;
     b32 dragging_seek;
+    b32 dragging_text;   // un champ suit la souris (sélection au drag)
+    b32 hot_is_text;     // le survol courant est un champ (curseur en I)
+    b32 input_locked;    // vrai pendant le dessin de l'écran couvert par un modal
     i64 caret_blink_ms;
 
     b32 take_next_focus;  // Tab : le prochain champ dessiné prend le focus
+
+    // Sonde de diagnostic : si probe_index vaut n > 0, le rectangle du n-ième
+    // champ dessiné dans la frame est publié ci-dessous. Le mode --capture s'en
+    // sert pour piloter une vraie sélection à la souris sans deviner la mise en
+    // page ; sans elle, la capture ne prouverait rien.
+    i32 probe_index;
+    i32 probe_x, probe_y, probe_w, probe_h;
+    i32 field_seq;  // compteur de champs de la frame courante
 
     i32 dpi;
     i32 width, height;
@@ -143,10 +228,11 @@ void ui_frame(UiApp *app, HDC dc, i32 w, i32 h, i64 now_ms);
 // --- entrées, appelées depuis la procédure de fenêtre ---
 void ui_on_mouse_move(UiApp *app, i32 x, i32 y);
 void ui_on_mouse_down(UiApp *app, i32 x, i32 y);
+void ui_on_mouse_double(UiApp *app, i32 x, i32 y);
 void ui_on_mouse_up(UiApp *app, i32 x, i32 y);
 void ui_on_wheel(UiApp *app, i32 delta);
 void ui_on_char(UiApp *app, u32 cp);
-void ui_on_key(UiApp *app, u32 vk, b32 ctrl);
+void ui_on_key(UiApp *app, u32 vk, u32 mods);
 
 // --- alimentation par main.c ---
 void ui_toast(UiApp *app, const char *text, int level, i64 now_ms);

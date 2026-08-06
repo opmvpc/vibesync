@@ -3,3 +3,7 @@
 #define RT_MANIFEST 24
 
 CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "vibesync.manifest"
+
+/* Icône de l'application (7 tailles dans le .ico). L'identifiant numérique le
+   plus faible est celui que l'explorateur et la barre des tâches affichent. */
+1 ICON "../../assets/vibesync.ico"

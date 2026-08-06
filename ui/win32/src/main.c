@@ -224,6 +224,12 @@ typedef struct {
     // Mode « smoke » : capture de l'écran réel après connexion, puis sortie.
     Str8 shot_path;
     Str8 auto_chat;  // message envoyé dès le welcome (diagnostic)
+
+    // Réglages : chemin VLC détecté au démarrage, AVANT que %VIBESYNC_VLC% ne
+    // soit forcé par le réglage — sinon la « détection automatique » affichée
+    // ne ferait que renvoyer le réglage à l'utilisateur.
+    Str8 vlc_auto;
+    StrBuf vlc_checked;  // dernier chemin validé (évite un accès disque par frame)
 } App;
 
 static App *g_app;
@@ -231,6 +237,29 @@ static App *g_app;
 static i64 now_ms(void) { return (i64)GetTickCount64(); }
 
 // --- réglages ---
+
+// file_exists : un chemin doit désigner un fichier, pas un dossier.
+static b32 file_exists(Arena *scratch, Str8 path) {
+    if (path.len == 0) return 0;
+    TempArena t = temp_begin(scratch);
+    u16 *w = utf8_to_utf16(scratch, path, NULL);
+    DWORD attr = GetFileAttributesW((LPCWSTR)w);
+    temp_end(t);
+    return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+// apply_vlc_path propage le réglage à vlc.c sans toucher à vlc.c : celui-ci
+// consulte déjà %VIBESYNC_VLC% en premier dans vlc_locate().
+static void apply_vlc_path(App *app, Str8 path) {
+    TempArena t = temp_begin(app->scratch);
+    if (path.len > 0) {
+        u16 *w = utf8_to_utf16(app->scratch, path, NULL);
+        SetEnvironmentVariableW(L"VIBESYNC_VLC", (LPCWSTR)w);
+    } else {
+        SetEnvironmentVariableW(L"VIBESYNC_VLC", NULL);
+    }
+    temp_end(t);
+}
 
 static void settings_load(App *app) {
     Str8 path = ini_path(app->perm);
@@ -243,17 +272,87 @@ static void settings_load(App *app) {
     v = ini_get(&app->ini, "salle", str8_lit(""));
     if (v.len) ui_text_set(&app->ui.f_room, v);
     // Le mot de passe n'est volontairement pas mémorisé.
+
+    // Détection automatique de VLC, mesurée avant d'appliquer le réglage.
+    app->vlc_auto = str8_lit("");
+    TempArena t = temp_begin(app->scratch);
+    Str8 found;
+    if (vlc_locate(app->scratch, &found)) app->vlc_auto = str8_copy(app->perm, found);
+    temp_end(t);
+    apply_vlc_path(app, ini_get(&app->ini, "vlc", str8_lit("")));
 }
 
+// settings_save réécrit le fichier en CONSERVANT les clés qu'on ne gère pas
+// ici (chemin VLC en particulier) : app->ini est la référence, pas un ini neuf.
 static void settings_save(App *app) {
+    ini_set(app->perm, &app->ini, "serveur", ui_text_str(&app->ui.f_server));
+    ini_set(app->perm, &app->ini, "pseudo", ui_text_str(&app->ui.f_name));
+    ini_set(app->perm, &app->ini, "salle", ui_text_str(&app->ui.f_room));
     TempArena t = temp_begin(app->scratch);
-    Ini ini;
-    ini_clear(&ini);
-    ini_set(app->scratch, &ini, "serveur", ui_text_str(&app->ui.f_server));
-    ini_set(app->scratch, &ini, "pseudo", ui_text_str(&app->ui.f_name));
-    ini_set(app->scratch, &ini, "salle", ui_text_str(&app->ui.f_room));
-    ini_save_file(app->scratch, ini_path(app->scratch), ini_write(app->scratch, &ini));
+    ini_save_file(app->scratch, ini_path(app->scratch), ini_write(app->scratch, &app->ini));
     temp_end(t);
+}
+
+// --- panneau Réglages ---
+
+static void settings_open(App *app) {
+    UiApp *ui = &app->ui;
+    ui_text_set(&ui->f_set_server, ini_get(&app->ini, "serveur", ui_text_str(&ui->f_server)));
+    ui_text_set(&ui->f_set_name, ini_get(&app->ini, "pseudo", ui_text_str(&ui->f_name)));
+    ui_text_set(&ui->f_set_room, ini_get(&app->ini, "salle", ui_text_str(&ui->f_room)));
+    ui_text_set(&ui->f_set_vlc, ini_get(&app->ini, "vlc", str8_lit("")));
+    snprintf(ui->settings_auto_vlc, sizeof(ui->settings_auto_vlc), "%.*s", (int)app->vlc_auto.len,
+             app->vlc_auto.data);
+    ui->settings_msg[0] = 0;
+    ui->settings_msg_error = 0;
+    ui->settings_vlc_state = 0;
+    strbuf_set(&app->vlc_checked, str8_lit("\x01"));  // force une revalidation
+    ui->focus = 0;
+    ui->settings_open = 1;
+}
+
+// settings_apply valide puis enregistre. Renvoie 0 si un réglage est refusé.
+static b32 settings_apply(App *app) {
+    UiApp *ui = &app->ui;
+    Str8 vlc = str8_trim(ui_text_str(&ui->f_set_vlc));
+    if (vlc.len > 0 && !file_exists(app->scratch, vlc)) {
+        snprintf(ui->settings_msg, sizeof(ui->settings_msg), "Rien n'a été enregistré.");
+        ui->settings_msg_error = 1;
+        return 0;
+    }
+    ini_set(app->perm, &app->ini, "serveur", str8_trim(ui_text_str(&ui->f_set_server)));
+    ini_set(app->perm, &app->ini, "pseudo", str8_trim(ui_text_str(&ui->f_set_name)));
+    ini_set(app->perm, &app->ini, "salle", str8_trim(ui_text_str(&ui->f_set_room)));
+    ini_set(app->perm, &app->ini, "vlc", vlc);
+    TempArena t = temp_begin(app->scratch);
+    b32 ok = ini_save_file(app->scratch, ini_path(app->scratch), ini_write(app->scratch, &app->ini));
+    temp_end(t);
+    if (!ok) {
+        snprintf(ui->settings_msg, sizeof(ui->settings_msg), "vibesync.ini non modifiable.");
+        ui->settings_msg_error = 1;
+        return 0;
+    }
+    // Rechargement à chaud : le chemin VLC vaut pour le prochain lancement, les
+    // valeurs par défaut repeuplent l'écran de connexion.
+    apply_vlc_path(app, ini_get(&app->ini, "vlc", str8_lit("")));
+    ui_text_set(&ui->f_server, ui_text_str(&ui->f_set_server));
+    ui_text_set(&ui->f_name, ui_text_str(&ui->f_set_name));
+    ui_text_set(&ui->f_room, ui_text_str(&ui->f_set_room));
+    return 1;
+}
+
+// settings_validate rafraîchit le voyant du chemin VLC quand il a changé.
+// Renvoie 1 si l'affichage doit être redessiné.
+static b32 settings_validate(App *app) {
+    UiApp *ui = &app->ui;
+    if (!ui->settings_open) return 0;
+    Str8 vlc = str8_trim(ui_text_str(&ui->f_set_vlc));
+    if (strbuf_eq(&app->vlc_checked, vlc)) return 0;
+    strbuf_set(&app->vlc_checked, vlc);
+    i32 state = vlc.len == 0 ? 0 : (file_exists(app->scratch, vlc) ? 1 : 2);
+    b32 changed = state != ui->settings_vlc_state;
+    ui->settings_vlc_state = state;
+    return changed;
 }
 
 // --- sorties du moteur ---
@@ -615,6 +714,34 @@ static void handle_actions(App *app) {
             worker_open(&app->vlc, path);
         }
     }
+    if (ui->act_settings_open) {
+        ui->act_settings_open = 0;
+        settings_open(app);
+        redraw(app);
+    }
+    if (ui->act_settings_detect) {
+        ui->act_settings_detect = 0;
+        ui_text_set(&ui->f_set_vlc, app->vlc_auto);
+        redraw(app);
+    }
+    if (ui->act_settings_cancel) {
+        ui->act_settings_cancel = 0;
+        ui->settings_open = 0;
+        ui->focus = 0;
+        redraw(app);
+    }
+    if (ui->act_settings_save) {
+        ui->act_settings_save = 0;
+        if (settings_apply(app)) {
+            ui->settings_open = 0;
+            ui->focus = 0;
+            ui_toast(ui, "Réglages enregistrés.", 0, now_ms());
+        }
+        redraw(app);
+    }
+    // Le voyant du chemin VLC est recalculé hors frame : un accès disque par
+    // changement de texte, pas un par image.
+    if (settings_validate(app)) redraw(app);
     dispatch_output(app, &out);
     refresh_view(app);
 }
@@ -708,6 +835,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ui_on_mouse_down(&app->ui, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
             redraw(app);
             return 0;
+        case WM_LBUTTONDBLCLK:
+            SetCapture(hwnd);
+            ui_on_mouse_double(&app->ui, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+            redraw(app);
+            return 0;
         case WM_LBUTTONUP:
             ReleaseCapture();
             ui_on_mouse_up(&app->ui, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
@@ -721,10 +853,14 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ui_on_char(&app->ui, (u32)wp);
             redraw(app);
             return 0;
-        case WM_KEYDOWN:
-            ui_on_key(&app->ui, (u32)wp, (GetKeyState(VK_CONTROL) & 0x8000) != 0);
+        case WM_KEYDOWN: {
+            u32 mods = 0;
+            if (GetKeyState(VK_CONTROL) & 0x8000) mods |= UI_MOD_CTRL;
+            if (GetKeyState(VK_SHIFT) & 0x8000) mods |= UI_MOD_SHIFT;
+            ui_on_key(&app->ui, (u32)wp, mods);
             redraw(app);
             return 0;
+        }
         case WM_SETCURSOR:
             if (LOWORD(lp) == HTCLIENT) return 1;  // le curseur est géré dans la frame
             break;
@@ -962,17 +1098,47 @@ static void capture_screens(App *app, Str8 dir) {
     i32 w = MulDiv(1000, app->ui.dpi, 96), h = MulDiv(660, app->ui.dpi, 96);
     ensure_backbuffer(app, w, h);
 
-    ui_set_status(&app->ui, "Serveur injoignable. Nouvelle tentative…", 1);
-    ui_text_set(&app->ui.f_server, str8_lit("wss://vibesync.thibault.fr/ws"));
-    ui_text_set(&app->ui.f_name, str8_lit("thibault"));
-    ui_text_set(&app->ui.f_room, str8_lit("soirée-film"));
-    ui_text_set(&app->ui.f_password, str8_lit("secret"));
-    app->ui.screen = UI_SCREEN_CONNECT;
-    ui_frame(&app->ui, app->mem_dc, w, h, now_ms());
+    UiApp *ui = &app->ui;
+    ui_set_status(ui, "Serveur injoignable. Nouvelle tentative…", 1);
+    ui_text_set(&ui->f_server, str8_lit("wss://vibesync.thibault.fr/ws"));
+    ui_text_set(&ui->f_name, str8_lit("thibault"));
+    ui_text_set(&ui->f_room, str8_lit("soirée-film"));
+    ui_text_set(&ui->f_password, str8_lit("secret"));
+    ui->screen = UI_SCREEN_CONNECT;
+
+    // Sélection à la souris, pour de vrai : une frame de mesure, puis un
+    // appui-glisser-relâcher sur le champ Pseudo (2e champ dessiné). La capture
+    // exerce donc le hit-test et le rendu de sélection, elle ne les mime pas.
+    ui->probe_index = 2;
+    ui_frame(ui, app->mem_dc, w, h, now_ms());
+    i32 fy = ui->probe_y + ui->probe_h / 2;
+    i32 x0 = ui->probe_x + MulDiv(24, ui->dpi, 96);
+    i32 x1 = ui->probe_x + MulDiv(200, ui->dpi, 96);  // au-delà du texte : jusqu'à la fin
+    ui_on_mouse_down(ui, x0, fy);
+    ui_frame(ui, app->mem_dc, w, h, now_ms());
+    ui_on_mouse_move(ui, (x0 + x1) / 2, fy);
+    ui_frame(ui, app->mem_dc, w, h, now_ms());
+    ui_on_mouse_move(ui, x1, fy);
+    ui_frame(ui, app->mem_dc, w, h, now_ms());
+    ui_on_mouse_up(ui, x1, fy);
+    ui->probe_index = 0;
+    ui_frame(ui, app->mem_dc, w, h, now_ms());
     png_write(app->scratch, str8_cat(app->scratch, dir, str8_lit("\\ui-connexion.png")),
               (const u8 *)app->bits, w, h);
 
-    UiApp *ui = &app->ui;
+    // Panneau Réglages, superposé au même écran.
+    settings_open(app);
+    ui_text_set(&ui->f_set_server, str8_lit("wss://vibesync.thibault.fr/ws"));
+    ui_text_set(&ui->f_set_name, str8_lit("thibault"));
+    ui_text_set(&ui->f_set_room, str8_lit("soirée-film"));
+    ui_text_set(&ui->f_set_vlc, str8_lit("C:\\Program Files\\VideoLAN\\VLC\\vlc.exe"));
+    snprintf(ui->settings_auto_vlc, sizeof(ui->settings_auto_vlc), "C:\\Program Files\\VideoLAN\\VLC\\vlc.exe");
+    ui->settings_vlc_state = 1;
+    ui_frame(ui, app->mem_dc, w, h, now_ms());
+    png_write(app->scratch, str8_cat(app->scratch, dir, str8_lit("\\ui-reglages.png")), (const u8 *)app->bits,
+              w, h);
+    ui->settings_open = 0;
+
     ui->screen = UI_SCREEN_ROOM;
     ui->phase = VS_PHASE_CONNECTED;
     snprintf(ui->room, sizeof(ui->room), "soirée-film");
@@ -1070,10 +1236,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show) {
     WNDCLASSEXW wc;
     memset(&wc, 0, sizeof(wc));
     wc.cbSize = sizeof(wc);
-    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;  // CS_DBLCLKS : sélection de mot
     wc.lpfnWndProc = wnd_proc;
     wc.hInstance = inst;
     wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    // Icône de la ressource 1 : grande taille pour Alt+Tab et la barre des
+    // tâches, petite taille pour la barre de titre (le .ico porte les deux).
+    wc.hIcon = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, 0, 0, LR_DEFAULTSIZE | LR_SHARED);
+    wc.hIconSm = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
+                                   GetSystemMetrics(SM_CYSMICON), LR_SHARED);
     wc.lpszClassName = L"vibesync_window";
     RegisterClassExW(&wc);
 
