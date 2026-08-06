@@ -7,7 +7,7 @@ on:
   pull_request:
 
 jobs:
-  qa:
+  qa-go:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,42 +19,38 @@ jobs:
           go vet ./...
           go install honnef.co/go/tools/cmd/staticcheck@latest
           staticcheck ./...
-      - name: Tests
+      - name: Tests (unitaires + e2e simulés)
         run: go test ./...
 
-  release-core:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: qa
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - { goos: windows, goarch: amd64, ext: ".exe" }
-          - { goos: darwin, goarch: arm64, ext: "" }
-          - { goos: linux, goarch: amd64, ext: "" }
+  client-windows:
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.26"
-      - name: Build core ${{ matrix.goos }}/${{ matrix.goarch }}
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: "0"
+      - name: Toolchain llvm-mingw
+        shell: pwsh
         run: |
-          go build -trimpath -ldflags="-s -w" \
-            -o dist/vibesync-core-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }} \
-            ./cmd/vibesync
-      - name: Budget taille (ADR-007, part core seule)
+          $url = "https://github.com/mstorsjo/llvm-mingw/releases/download/20260616/llvm-mingw-20260616-ucrt-x86_64.zip"
+          Invoke-WebRequest $url -OutFile llvm.zip
+          tar -xf llvm.zip -C C:\
+          Rename-Item C:\llvm-mingw-20260616-ucrt-x86_64 C:\llvm-mingw
+          echo "C:\llvm-mingw\bin" >> $env:GITHUB_PATH
+      - name: Tests C (973+ vérifications, vecteurs golden inclus)
+        shell: cmd
+        working-directory: ui/win32
+        run: build.bat test
+      - name: Build release + budget taille (ADR-007/008)
+        shell: pwsh
+        working-directory: ui/win32
         run: |
-          size=$(stat -c%s dist/vibesync-core-*)
-          echo "core: $((size / 1024 / 1024)) Mo"
-          test "$size" -lt $((10 * 1024 * 1024))
+          cmd /c build.bat
+          $size = (Get-Item build\vibesync.exe).Length
+          "vibesync.exe : $([math]::Round($size/1KB,1)) Ko"
+          if ($size -gt 500KB) { throw "budget 500 Ko dépassé" }
       - uses: actions/upload-artifact@v4
         with:
-          name: vibesync-core-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/*
+          name: vibesync-windows
+          path: ui/win32/build/vibesync.exe
 
-# L'app WPF (ui/windows) et l'app SwiftUI (ui/macos) auront leurs jobs dédiés
-# (windows-latest / macos-latest) une fois les projets créés — VS-011/VS-012.
+# Le serveur est construit par Coolify depuis le Dockerfile du repo.
+# Le client macOS (ui/macos) sera buildé sur le Mac (voir docs/build-macos.md) ;
+# un job macos-latest pourra être ajouté quand le build y sera reproductible.
