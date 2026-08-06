@@ -32,7 +32,7 @@ Source de vérité du protocole client↔serveur. Les types Go correspondants vi
 
 | type | data | notes |
 |---|---|---|
-| `hello` | `{version, name, room, password?, session?}` | premier message obligatoire ; `session` = jeton opaque aléatoire (≥ 16 octets hex) généré par le client à son premier hello et conservé pour toute la vie du processus |
+| `hello` | `{version, name, room, password?, session?}` | premier message obligatoire ; `session` = jeton opaque aléatoire (≥ 16 octets hex) généré par le client à son premier hello et **persisté dans ses réglages** — un redémarrage du client réutilise le même jeton, la reprise de session (règle serveur 6) couvre donc aussi le cas « je ferme l'app et je la relance » sans attendre le timeout du zombie |
 | `ping` | `{t}` | `t` = clientMs ; toutes les 2 s |
 | `setReady` | `{ready}` | |
 | `setFile` | `{name, durationSec, sizeBytes}` | à l'ouverture d'un fichier dans VLC |
@@ -134,6 +134,9 @@ Source de vérité du protocole client↔serveur. Les types Go correspondants vi
 
 - Reconnexion WS automatique du client (backoff 1 s → 10 s), re-`hello` avec le même
   pseudo, resync via `welcome`.
+- **Départ volontaire** : une déconnexion voulue (bouton Quitter la salle, fermeture
+  de l'app) envoie la fermeture WebSocket (close 1000) avant de couper — le serveur
+  retire le membre immédiatement, le pseudo est libéré sans délai.
 - **File d'attente hors ligne** : seuls les messages `chat` composés pendant une
   déconnexion sont mis en file (bornée à 20, les plus anciens sont abandonnés) et
   envoyés après le re-hello. La file est liée à la salle visée : elle est vidée
