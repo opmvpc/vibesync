@@ -9,9 +9,11 @@
 
 #include "base.h"
 #include "engine.h"
+#include "ini.h"
 #include "json.h"
 #include "net.h"
 #include "protocol.h"
+#include "ui.h"
 #include "vlc.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -1113,6 +1115,120 @@ static void test_net_queue_saturation(Arena *a) {
     temp_end(top);
 }
 
+// ------------------------------------------------------------ ini + ui ---
+
+static void test_ini(Arena *a) {
+    section("ini");
+    TempArena top = temp_begin(a);
+
+    // Analyse : commentaires, sections, espaces, accents, clé répétée.
+    Ini ini;
+    Str8 src = S("# commentaire\r\n"
+                 "[vibesync]\r\n"
+                 "serveur = wss://vibesync.exemple.fr/ws \r\n"
+                 "pseudo=Thibault Éloïse\r\n"
+                 "salle=soirée-été\r\n"
+                 "; autre commentaire\r\n"
+                 "vide=\r\n"
+                 "salle=dernière\r\n"
+                 "sans_egal\r\n");
+    CHECK(ini_parse(a, src, &ini), "analyse ini");
+    CHECK(ini.count == 4, "%lld entrées, attendu 4", (long long)ini.count);
+    CHECK(str8_eq(ini_get(&ini, "serveur", S("")), S("wss://vibesync.exemple.fr/ws")), "valeur détourée");
+    CHECK(str8_eq(ini_get(&ini, "pseudo", S("")), S("Thibault Éloïse")), "valeur accentuée");
+    CHECK(str8_eq(ini_get(&ini, "salle", S("")), S("dernière")), "clé répétée : la dernière gagne");
+    CHECK(ini_get(&ini, "vide", S("x")).len == 0, "valeur vide");
+    CHECK(str8_eq(ini_get(&ini, "absent", S("défaut")), S("défaut")), "valeur par défaut");
+
+    // Écriture puis relecture : aller-retour exact.
+    Str8 text = ini_write(a, &ini);
+    Ini back;
+    CHECK(ini_parse(a, text, &back), "relecture");
+    CHECK(back.count == ini.count, "aller-retour : %lld entrées", (long long)back.count);
+    CHECK(str8_eq(ini_get(&back, "pseudo", S("")), S("Thibault Éloïse")), "accents préservés");
+    CHECK(str8_eq(ini_get(&back, "salle", S("")), S("dernière")), "salle préservée");
+
+    // Modification.
+    ini_set(a, &ini, "pseudo", S("Zoé"));
+    CHECK(str8_eq(ini_get(&ini, "pseudo", S("")), S("Zoé")), "ini_set remplace");
+    ini_set(a, &ini, "nouveau", S("valeur"));
+    CHECK(str8_eq(ini_get(&ini, "nouveau", S("")), S("valeur")), "ini_set ajoute");
+
+    // Débordement : refus propre, pas d'écriture hors bornes.
+    Ini big;
+    ini_clear(&big);
+    b32 all = 1;
+    for (int i = 0; i < INI_MAX_ENTRIES + 10; i++) {
+        char key[32];
+        snprintf(key, sizeof(key), "k%d", i);
+        if (!ini_set(a, &big, key, S("v"))) all = 0;
+    }
+    CHECK(!all && big.count == INI_MAX_ENTRIES, "plafond d'entrées (%lld)", (long long)big.count);
+
+    // Fichier : écriture, relecture, BOM toléré.
+    {
+        u16 wtmp[MAX_PATH];
+        DWORD n = GetTempPathW(MAX_PATH, (LPWSTR)wtmp);
+        CHECK(n > 0, "dossier temporaire");
+        Str8 dir = utf16_to_utf8(a, wtmp);
+        Str8 path = str8_cat(a, dir, S("vibesync-test.ini"));
+        CHECK(ini_save_file(a, path, text), "écriture du fichier");
+        Ini loaded;
+        CHECK(ini_load_file(a, path, &loaded), "lecture du fichier");
+        CHECK(str8_eq(ini_get(&loaded, "pseudo", S("")), S("Thibault Éloïse")), "accents sur disque");
+        Str8 bom = str8_cat(a, S("\xef\xbb\xbf"), text);
+        CHECK(ini_save_file(a, path, bom), "écriture avec BOM");
+        CHECK(ini_load_file(a, path, &loaded), "lecture avec BOM");
+        CHECK(str8_eq(ini_get(&loaded, "serveur", S("")), S("wss://vibesync.exemple.fr/ws")), "BOM ignoré");
+        u16 *wpath = utf8_to_utf16(a, path, NULL);
+        DeleteFileW((LPCWSTR)wpath);
+        Ini none;
+        CHECK(!ini_load_file(a, path, &none) && none.count == 0, "fichier absent");
+    }
+
+    section("ui");
+    struct {
+        f64 sec;
+        const char *want;
+    } times[] = {
+        {0, "0:00"},        {5, "0:05"},       {59.9, "0:59"},     {60, "1:00"},
+        {83, "1:23"},       {599, "9:59"},     {3600, "1:00:00"},  {5025, "1:23:45"},
+        {-5, "0:00"},       {36000, "10:00:00"},
+    };
+    for (isize i = 0; i < VS_ARRAY_COUNT(times); i++) {
+        char buf[32];
+        ui_format_time(times[i].sec, buf, sizeof(buf));
+        CHECK(strcmp(buf, times[i].want) == 0, "temps %.1f = %s, attendu %s", times[i].sec, buf,
+              times[i].want);
+    }
+    {
+        char buf[32];
+        // Valeur non finie : repli sur 0:00 plutôt qu'un affichage absurde.
+        ui_format_time(1e308 * 10, buf, sizeof(buf));
+        CHECK(strcmp(buf, "0:00") == 0, "durée infinie : %s", buf);
+        // Valeur finie démesurée : bornée à 99:59:59.
+        ui_format_time(9999999, buf, sizeof(buf));
+        CHECK(strcmp(buf, "99:59:59") == 0, "durée démesurée bornée : %s", buf);
+    }
+    // Champ de saisie : troncature sur frontière UTF-8, jamais au milieu.
+    {
+        UiText t;
+        memset(&t, 0, sizeof(t));
+        u8 big_text[UI_TEXT_CAP * 2];
+        for (isize i = 0; i < (isize)sizeof(big_text); i += 2) {
+            big_text[i] = 0xc3;  // « é » en UTF-8 : deux octets
+            big_text[i + 1] = 0xa9;
+        }
+        ui_text_set(&t, str8(big_text, (isize)sizeof(big_text)));
+        CHECK(t.len < UI_TEXT_CAP, "champ tronqué (%lld)", (long long)t.len);
+        CHECK(utf8_validate(ui_text_str(&t)), "troncature au milieu d'un caractère UTF-8");
+        ui_text_set(&t, S("bonjour"));
+        CHECK(str8_eq(ui_text_str(&t), S("bonjour")) && t.caret == 7, "contenu et caret");
+    }
+
+    temp_end(top);
+}
+
 // --------------------------------------------- faux VLC HTTP (sur socket) ---
 //
 // Sert /requests/status.json comme le vrai VLC, pour exercer le chemin réseau
@@ -1982,6 +2098,7 @@ int main(int argc, char **argv) {
     test_protocol(a);
     test_vlc(a);
     test_engine_units();
+    test_ini(a);
     test_vlc_live(a);
     test_net_live(a);
     test_net_queue_saturation(a);

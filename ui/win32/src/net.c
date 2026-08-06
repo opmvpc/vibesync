@@ -126,6 +126,14 @@ static void queue_push(Net *n, NetEventKind kind, u32 code, const u8 *data, isiz
     ReleaseSRWLockExclusive(SRW(n->queue_lock));
     if (saturated) InterlockedExchange(&n->stop, 1);
     if (n->wakeup) SetEvent((HANDLE)n->wakeup);
+    if (n->notify_hwnd) PostMessageW((HWND)n->notify_hwnd, n->notify_msg, 0, 0);
+}
+
+void net_set_notify(Net *n, void *hwnd, unsigned msg) {
+    AcquireSRWLockExclusive(SRW(n->queue_lock));
+    n->notify_hwnd = hwnd;
+    n->notify_msg = msg;
+    ReleaseSRWLockExclusive(SRW(n->queue_lock));
 }
 
 b32 net_poll(Net *n, NetSlot *out) {

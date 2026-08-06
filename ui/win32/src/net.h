@@ -91,6 +91,11 @@ typedef struct {
 
     volatile long stop;
     NetUrl url;
+
+    // Réveil du thread UI : PostMessageW(notify_hwnd, notify_msg, 0, 0) à
+    // chaque événement mis en file (en plus de l'événement auto-reset).
+    void *notify_hwnd;
+    unsigned notify_msg;
 } Net;
 
 // net_poll écrit dans un NetSlot de 64 Kio : allouer le Net et le NetSlot dans
@@ -109,6 +114,8 @@ b32 net_send_text(Net *n, Str8 text);
 b32 net_poll(Net *n, NetSlot *out);
 // net_wakeup_handle renvoie le HANDLE à attendre pour être réveillé.
 void *net_wakeup_handle(Net *n);
+// net_set_notify fait poster `msg` à `hwnd` à chaque événement (thread UI).
+void net_set_notify(Net *n, void *hwnd, unsigned msg);
 // net_state renvoie l'état courant du cycle de vie.
 NetState net_state(Net *n);
 // net_close ferme la connexion et joint le thread réseau (idempotent).
