@@ -144,17 +144,18 @@ func newVecBuilder(t *testing.T, s vecSetup) *vecBuilder {
 	fake := vlctest.New(clock.Now)
 	t.Cleanup(fake.Close)
 	fake.LoadFile(s.file, s.durationSec)
-	fake.SeekTo(s.positionSec)
-	if s.playing {
-		fake.Play()
-	}
 	rec := &recorder{Controller: vlc.NewHTTPClient(fake.URL(), fake.Password())}
 	conn := newFakeConn()
 	e := New(Config{
-		Clock:    clock,
-		Dialer:   DialerFunc(func(context.Context, string) (Conn, error) { return conn, nil }),
-		Locator:  func() (string, error) { return "/faux/vlc", nil },
-		Launcher: func(context.Context, string) (vlc.Controller, error) { return rec, nil },
+		Clock:   clock,
+		Dialer:  DialerFunc(func(context.Context, string) (Conn, error) { return conn, nil }),
+		Locator: func() (string, error) { return "/faux/vlc", nil },
+		Launcher: func(ctx context.Context, _ string) (vlc.Controller, error) {
+			if err := vlc.Prepare(ctx, rec, 5*time.Second); err != nil {
+				return nil, err
+			}
+			return rec, nil
+		},
 	})
 	t.Cleanup(func() { _ = e.Close() })
 	h := &harness{t: t, e: e, clock: clock, fake: fake, conn: conn}
@@ -168,6 +169,12 @@ func newVecBuilder(t *testing.T, s vecSetup) *vecBuilder {
 	}
 	if err := e.OpenFile(context.Background(), path); err != nil {
 		t.Fatalf("OpenFile: %v", err)
+	}
+	// Le média est ouvert et arrêté au début : on installe alors l'état VLC de
+	// départ du scénario.
+	fake.SeekTo(s.positionSec)
+	if s.playing {
+		fake.Play()
 	}
 	rec.drain()
 	conn.take()

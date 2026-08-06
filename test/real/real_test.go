@@ -257,8 +257,16 @@ func (r *rig) newPeer(name, mediaPath string) *peer {
 	r.waitFor(startTimeout, name+" a déclaré son fichier (durée connue)", func() bool {
 		return p.snap().VLC.DurationSec > 0
 	})
-	t.Logf("[%s] fichier ouvert : %s (durée vue par VLC : %.0f s)",
-		name, filepath.Base(mediaPath), p.snap().VLC.DurationSec)
+	// VLC démarre la lecture tout seul à l'ouverture : le driver doit l'avoir
+	// ramené en pause au début avant de déclarer le fichier (docs/protocol.md
+	// §Chargement de fichier). C'est ce qui permet un départ synchronisé.
+	s := p.snap()
+	t.Logf("[%s] fichier ouvert : %s — durée %.0f s, état à l'ouverture : %s à %.2f s",
+		name, filepath.Base(mediaPath), s.VLC.DurationSec, s.VLC.State, s.VLC.PositionSec)
+	if s.VLC.State != string(vlc.StatePaused) || s.VLC.PositionSec >= vlc.StartTolerance {
+		t.Errorf("[%s] le média aurait dû être arrêté au début après l'ouverture (état %s à %.2f s)",
+			name, s.VLC.State, s.VLC.PositionSec)
+	}
 	return p
 }
 

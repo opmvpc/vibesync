@@ -205,11 +205,11 @@
       "driftSec": -1902,
       "vlcCommands": [
         {
-          "cmd": "resume"
-        },
-        {
           "cmd": "seek",
           "value": 2003
+        },
+        {
+          "cmd": "resume"
         }
       ],
       "toServer": [

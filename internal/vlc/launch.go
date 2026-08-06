@@ -35,6 +35,8 @@ type LaunchOptions struct {
 	ExtraArgs []string
 	// ReadyTimeout borne l'attente de l'interface HTTP (défaut 20 s).
 	ReadyTimeout time.Duration
+	// PrepareTimeout borne la mise en pause initiale du média (défaut 15 s).
+	PrepareTimeout time.Duration
 	// KeepAlive : ne pas tuer VLC à la fermeture du client.
 	KeepAlive bool
 }
@@ -86,6 +88,14 @@ func Launch(ctx context.Context, opts LaunchOptions) (*Process, error) {
 		timeout = 20 * time.Second
 	}
 	if err := p.WaitReady(ctx, timeout); err != nil {
+		_ = p.Close()
+		return nil, err
+	}
+	// VLC démarre la lecture tout seul à l'ouverture : on ne rend la main
+	// qu'une fois le média effectivement arrêté au début (docs/protocol.md
+	// §Chargement de fichier). Tant que ce n'est pas fait, le média n'est pas
+	// considéré comme chargé et le moteur n'annonce pas le fichier.
+	if err := Prepare(ctx, p, opts.PrepareTimeout); err != nil {
 		_ = p.Close()
 		return nil, err
 	}

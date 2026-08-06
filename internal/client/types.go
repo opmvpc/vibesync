@@ -20,6 +20,10 @@ const (
 	// NudgeExitSec : hystérésis du nudge — engagé au-delà de DeadZoneSec, il
 	// ne se désengage qu'en dessous de ce seuil.
 	NudgeExitSec = 0.03
+	// StartAlignSec : au départ d'une lecture (pause → play), on cale d'abord
+	// la position par un seek si l'écart atteint ce seuil, au lieu de laisser
+	// le nudge le résorber à 5 %/s.
+	StartAlignSec = 0.3
 	// UserSeekSec : saut de position inexpliqué au-delà duquel on considère
 	// que l'utilisateur a manipulé VLC.
 	UserSeekSec = 3.0

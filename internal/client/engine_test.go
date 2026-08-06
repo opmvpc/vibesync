@@ -89,8 +89,15 @@ func newHarness(t *testing.T) *harness {
 		Clock:   clock,
 		Dialer:  DialerFunc(func(context.Context, string) (Conn, error) { return conn, nil }),
 		Locator: func() (string, error) { return "/faux/vlc", nil },
-		Launcher: func(context.Context, string) (vlc.Controller, error) {
-			return vlc.NewHTTPClient(fake.URL(), fake.Password()), nil
+		Launcher: func(ctx context.Context, _ string) (vlc.Controller, error) {
+			// Même séquence qu'en production : le driver met le média en pause
+			// au début avant de le déclarer chargé (le faux VLC démarre en
+			// lecture, comme le vrai).
+			c := vlc.NewHTTPClient(fake.URL(), fake.Password())
+			if err := vlc.Prepare(ctx, c, 5*time.Second); err != nil {
+				return nil, err
+			}
+			return c, nil
 		},
 		InitialBackoff: 5 * time.Millisecond,
 		MaxBackoff:     20 * time.Millisecond,

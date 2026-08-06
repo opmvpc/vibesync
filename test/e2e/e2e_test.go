@@ -219,8 +219,14 @@ func (f *fixture) newPeer(name string, durationSec float64) *peer {
 		Dialer:  dialer,
 		Logger:  quietLogger(),
 		Locator: func() (string, error) { return "/faux/vlc", nil },
-		Launcher: func(context.Context, string) (vlc.Controller, error) {
-			return vlc.NewHTTPClient(fake.URL(), fake.Password()), nil
+		Launcher: func(ctx context.Context, _ string) (vlc.Controller, error) {
+			// Séquence de production : le driver arrête le média au début avant
+			// de le déclarer chargé (le faux VLC autoplay comme le vrai).
+			c := vlc.NewHTTPClient(fake.URL(), fake.Password())
+			if err := vlc.Prepare(ctx, c, 10*time.Second); err != nil {
+				return nil, err
+			}
+			return c, nil
 		},
 		// Reconnexion rapide : on veut voir le rejoin dans le budget du test.
 		InitialBackoff: 300 * time.Millisecond,
@@ -535,6 +541,49 @@ func TestE2E(t *testing.T) {
 		})
 		f.waitUpTo(convergeTimeout, "drift entre A et B < 0,5 s", func() bool {
 			return pairDrift(a, b) < driftMax
+		})
+	})
+
+	// Le faux VLC démarre en lecture à l'ouverture, comme le vrai : les deux
+	// médias ne s'ouvrent jamais exactement au même instant, et un écart de
+	// départ de l'ordre de la demi-seconde est la norme. Il doit être résorbé
+	// par le calage au départ (seek), pas par le nudge — qui mettrait ~11 s
+	// pour 0,55 s à 5 %/s (docs/protocol.md §Départ et reprise de lecture).
+	t.Run("08-depart-avec-autoplay", func(t *testing.T) {
+		f := newFixture(t)
+		a, b := joinBoth(f, filmDuration, filmDuration)
+		markReady(f, a, b)
+
+		// On place la salle à 100 s, à l'arrêt, les deux lecteurs calés dessus.
+		a.eng.Seek(100)
+		f.waitFor("les deux lecteurs sont calés sur 100 s à l'arrêt", func() bool {
+			return math.Abs(a.pos()-100) < 0.6 && math.Abs(b.pos()-100) < 0.6 &&
+				a.vlcState() != "playing" && b.vlcState() != "playing"
+		})
+
+		// Le média de bob a pris du retard à l'ouverture : 0,55 s, juste sous le
+		// seuil de correction en pause (0,6 s), donc rien ne le recale.
+		b.fake.SeekTo(99.45)
+		f.holds(600*time.Millisecond, "l'écart de départ n'est pas corrigé en pause", func() bool {
+			return b.vlcState() != "playing" && b.pos() < 99.9
+		})
+
+		start := time.Now()
+		startPlayback(f, a, a, b)
+		// Discriminant : chaque moteur doit être calé sur la salle presque tout
+		// de suite. Sans le seek de calage, bob resterait à ~0,55 s et mettrait
+		// plus de 5 s à repasser sous 0,3 s au rythme du nudge.
+		f.waitUpTo(1500*time.Millisecond, "chaque moteur est calé sur la salle dès le départ",
+			func() bool {
+				return math.Abs(a.snap().DriftSec) < client.StartAlignSec &&
+					math.Abs(b.snap().DriftSec) < client.StartAlignSec
+			})
+		f.waitUpTo(2*time.Second, "les deux lecteurs sont synchronisés",
+			func() bool { return pairDrift(a, b) < driftMax })
+		t.Logf("synchronisation atteinte en %s (le nudge seul aurait mis ~11 s pour 0,55 s)",
+			time.Since(start).Round(time.Millisecond))
+		f.holds(2*time.Second, "la synchronisation tient après le départ décalé", func() bool {
+			return pairDrift(a, b) < driftMax && a.vlcState() == "playing" && b.vlcState() == "playing"
 		})
 	})
 

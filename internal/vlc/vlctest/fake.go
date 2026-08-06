@@ -31,6 +31,16 @@ type Fake struct {
 	requests int
 	fail     int
 
+	// autoplay reproduit le comportement réel de VLC : à l'ouverture d'un
+	// fichier, la lecture démarre toute seule (docs/protocol.md §Chargement de
+	// fichier). loadDelay simule le temps d'ouverture du média, pendant lequel
+	// VLC se déclare encore `stopped`.
+	autoplay      bool
+	loadDelay     time.Duration
+	pendingName   string
+	pendingLength float64
+	pendingAt     time.Time
+
 	srv *httptest.Server
 }
 
@@ -46,6 +56,7 @@ func New(now func() time.Time) *Fake {
 		rate:     1,
 		password: "faux-mdp",
 		length:   0,
+		autoplay: true,
 	}
 	f.lastAt = now()
 	mux := http.NewServeMux()
@@ -63,16 +74,56 @@ func (f *Fake) Password() string { return f.password }
 // Close arrête le serveur httptest.
 func (f *Fake) Close() { f.srv.Close() }
 
-// LoadFile charge un média : état pause, position 0.
+// LoadFile ouvre un média. Comme VLC, la lecture démarre automatiquement à la
+// fin du chargement — c'est précisément la course que le client doit gérer.
+// Voir SetAutoplay et SetLoadDelay pour s'en écarter.
 func (f *Fake) LoadFile(name string, lengthSec float64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.advanceLocked()
+	if f.loadDelay <= 0 {
+		f.activateLocked(name, lengthSec, f.now())
+		return
+	}
+	// Ouverture en cours : VLC n'a encore aucun média à montrer.
+	f.state = "stopped"
+	f.file = ""
+	f.length = 0
+	f.pos = 0
+	f.pendingName, f.pendingLength = name, lengthSec
+	f.pendingAt = f.now().Add(f.loadDelay)
+}
+
+// SetAutoplay règle le démarrage automatique à l'ouverture (vrai par défaut,
+// comme VLC).
+func (f *Fake) SetAutoplay(v bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.autoplay = v
+}
+
+// SetLoadDelay règle le temps d'ouverture d'un média : pendant ce délai, le
+// faux VLC se déclare `stopped`, sans durée ni fichier.
+func (f *Fake) SetLoadDelay(d time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.loadDelay = d
+}
+
+// activateLocked rend le média disponible à l'instant at.
+func (f *Fake) activateLocked(name string, lengthSec float64, at time.Time) {
 	f.file = name
 	f.length = lengthSec
 	f.pos = 0
-	f.state = "paused"
 	f.rate = 1
+	f.lastAt = at
+	f.pendingAt = time.Time{}
+	f.pendingName, f.pendingLength = "", 0
+	if f.autoplay {
+		f.state = "playing"
+	} else {
+		f.state = "paused"
+	}
 }
 
 // Play démarre la lecture (comme si l'utilisateur appuyait sur play).
@@ -164,6 +215,12 @@ func (f *Fake) Tick() {
 
 func (f *Fake) advanceLocked() {
 	now := f.now()
+	// Fin du chargement : le média devient disponible (et démarre si autoplay).
+	// On l'active à sa date théorique pour que la position reste juste même si
+	// personne n'a interrogé le faux VLC entre-temps.
+	if !f.pendingAt.IsZero() && !now.Before(f.pendingAt) {
+		f.activateLocked(f.pendingName, f.pendingLength, f.pendingAt)
+	}
 	elapsed := now.Sub(f.lastAt).Seconds()
 	f.lastAt = now
 	if elapsed <= 0 || f.state != "playing" || f.stalled {
@@ -200,7 +257,8 @@ func (f *Fake) handleStatus(w http.ResponseWriter, r *http.Request) {
 			f.state = "playing"
 		}
 	case "seek":
-		if v, err := parseSeek(q.Get("val")); err == nil {
+		// VLC ignore un seek tant qu'aucun média n'est ouvert.
+		if v, err := parseSeek(q.Get("val")); err == nil && f.state != "stopped" {
 			f.pos = clamp(v, 0, f.length)
 			f.seeks++
 		}

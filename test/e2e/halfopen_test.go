@@ -161,8 +161,12 @@ func TestRejoinApresCoupureSilencieuse(t *testing.T) {
 		Dialer:  dialer,
 		Logger:  quietLogger(),
 		Locator: func() (string, error) { return "/faux/vlc", nil },
-		Launcher: func(context.Context, string) (vlc.Controller, error) {
-			return vlc.NewHTTPClient(fake.URL(), fake.Password()), nil
+		Launcher: func(ctx context.Context, _ string) (vlc.Controller, error) {
+			c := vlc.NewHTTPClient(fake.URL(), fake.Password())
+			if err := vlc.Prepare(ctx, c, 10*time.Second); err != nil {
+				return nil, err
+			}
+			return c, nil
 		},
 		InitialBackoff: 300 * time.Millisecond,
 		MaxBackoff:     time.Second,

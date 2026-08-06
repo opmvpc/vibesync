@@ -203,7 +203,17 @@ func (e *Engine) planLocked(now time.Time) []action {
 	}
 
 	if e.status.State == vlc.StatePaused {
+		// Départ (ou reprise) de lecture : on cale la position AVANT de lancer
+		// VLC (docs/protocol.md §Départ et reprise de lecture). Compter sur le
+		// nudge coûterait ~10 s pour un demi-seconde d'écart au démarrage.
+		if math.Abs(drift) >= StartAlignSec {
+			acts = append(acts, action{kind: actSeek, val: expected})
+			e.correcting = "seek"
+		}
 		acts = append(acts, action{kind: actResume})
+		e.nudging = false
+		rateAction(base)
+		return e.armLocked(acts, now)
 	}
 	abs := math.Abs(drift)
 	switch {
