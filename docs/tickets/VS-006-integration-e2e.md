@@ -1,7 +1,7 @@
 ---
 id: VS-006
 titre: Intégration + tests e2e simulés + review croisée
-statut: ouvert
+statut: terminé
 priorité: haute
 dépend-de: [VS-003, VS-004, VS-005]
 créé: 2026-08-05
@@ -16,14 +16,17 @@ Assemblage par l'orchestrateur : review croisée du code des agents, test e2e
 
 ## Critères d'acceptation
 
-- [ ] Review croisée effectuée (codex terra ou juge Opus), remarques traitées
-- [ ] Test e2e simulé : play/pause/seek propagés < 500 ms, drift final < 0,5 s, ready-gate, rejoin
-- [ ] `go test ./...` + `go vet` + `staticcheck` verts sur tout le repo
-- [ ] Test manuel réel : 2 VLC locaux synchronisés (play/pause/seek dans les 2 sens)
-- [ ] Vecteurs de test du moteur de sync exportés dans `test/vectors/*.json` depuis
-      l'implémentation Go de référence (scénarios : offset médian, nudge, seek dur,
-      grâce anti-boucle, détection d'action) — consommés ensuite par VS-014/VS-015
+- [x] Review croisée effectuée (terra sur serveur, sol high sur client/ws), remarques traitées
+- [x] Test e2e simulé : 7 scénarios + reprise de session, drift < 0,5 s, ready-gate, rejoin
+- [x] `go test ./...` + `go vet` + `staticcheck` verts sur tout le repo
+- [x] Test réel : 2 vrais VLC synchronisés en Windows Sandbox, 7/7 étapes (drift 0,25 s)
+- [x] Vecteurs de test du moteur exportés dans `test/vectors/*.json` (12 golden files,
+      rejoués par les ports C et Swift)
 
 ## Journal du ticket
 
 - 2026-08-05 : créé.
+- 2026-08-05 : e2e 7 scénarios verts ; bug rejoin silencieux trouvé → fix jeton de session.
+- 2026-08-06 : 1er run réel sandbox ÉCHEC (course autoplay VLC + nudge trop lent au
+  départ) → 2 règles gelées dans la spec, fixes driver/moteur, 2e run réel : 7/7 PASS
+  (drift 0,25 s). Harnais sandbox de Thibault adopté comme outil de validation standard.
