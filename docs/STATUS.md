@@ -24,11 +24,17 @@ Module Go renommé thibsix→opmvpc (f676295). Serveur prod inchangé
 (attention : 3 flakes infra GitHub « Failed to resolve action download info »
 aujourd'hui — toujours re-lancer avant de chercher un bug).
 
-**Nouvelle direction validée par Thibault : couche applicative C commune aux
-deux clients** (lib statique, PAS le modèle core+façade abandonné d'ADR-006).
-Analyse chiffrée : `docs/research/2026-08-06-analyse-couche-c-commune.md` —
-faisable en 5 phases, ~2 730 lignes de C déjà portables telles quelles,
-risque principal l'UTF-16 dispersé. ADR-010 + tickets à rédiger.
+**Couche applicative C commune (ADR-010) : 4 phases sur 5 livrées le jour
+même.** `core/` est la vérité unique des deux clients : moteur, protocole,
+JSON, parsing status VLC, médias, politique de connexion. L'app macOS tourne
+sur le moteur C (CoreEngine.swift = frontière sans décision, −883 lignes
+dupliquées ; puis −~420 lignes de règles en phase 4), chaque phase validée par
+les 13 vecteurs des deux côtés + séance réelle PASS 10/10 contre la prod. La
+suite C tourne sur macOS (878 checks asan+ubsan via scripts/test-core-macos.sh).
+Trouvailles en chemin : fichiers accentués NFD introuvables sur APFS (corrigé,
+normalisation NFC dans name_eq_ci posix), bannière de versions fausse sur les
+2 clients (VS-036 corrigé : proto_newer_version, portage exact du Go). Reste
+phase 5 (VS-034, job CI macos) — bloquée par la panne GitHub Actions.
 
 **Environnement Windows local en préparation** : UTM installé (+ utmctl), ISO
 Windows 11 ARM64 25H2 française officielle en téléchargement vers ~/Downloads
@@ -44,18 +50,21 @@ UTM en guise de jetable). VMware Fusion impossible sans compte Broadcom.
 | VS-009..012 | Pistes Wails/WPF/SwiftUI-façade | abandonnés (ADR-006/008) |
 | VS-029 | Attache VLC chez l'utilisateur | blindage livré ; **validation réelle Windows en attente (VM ou PC)** |
 | VS-020 | Overlay OSD Windows (ADR-009) | en attente du PC Windows (demande de Thibault) |
-| (à créer) | Couche C commune — ADR-010 + phases 1..5 | analyse faite, ADR à rédiger |
+| VS-030..033, 036 | Couche C commune phases 1-4 + fix semver | terminés (VS-031/033 : CI Windows à confirmer post-panne) |
+| VS-034 | Phase 5 — job CI macos-latest | à faire (attend le retour de GitHub Actions) |
+| VS-035 | UB str_to_i64 (préexistant) | ouvert, priorité basse |
 
 ## Prochaine action
 
-1. Rédiger ADR-010 (couche C commune) + tickets de phases, faire valider, puis
-   lancer la phase 1 (scission portable/Win32 de vlc.c/media.c/ini.c/base.c).
-2. Monter la VM Win11 (UTM + ISO dans ~/Downloads) → dérouler les critères
-   Windows-only de VS-029 (repro vlcrc Syncplay, détection d'action réelle,
-   séance 2 clients C) puis tag v0.2.1.
+1. Au retour de GitHub Actions (panne majeure le 06 au soir, moniteur armé) :
+   re-lancer la CI de tête — valide build.bat avec les chemins core/ (VS-031)
+   et main.c/test_semver (VS-036) — puis VS-034 (job CI macos-latest).
+2. Monter la VM Win11 (UTM installé + ISO dans ~/Downloads) → dérouler les
+   critères Windows-only de VS-029 (repro vlcrc Syncplay, détection d'action
+   réelle, séance 2 clients C) puis tag v0.2.1.
 3. Reliquats : aligner internal/vlc/launch.go sur les 9 nouveaux drapeaux VLC
-   du C ; toast « Reprise à HH:MM:SS » dans l'UI mac ; captures mac du guide
-   amis ; retours de ini_flush ignorés (durcissement, non bloquant).
+   du C ; captures mac du guide amis ; retours de ini_flush ignorés
+   (durcissement) ; VS-035.
 
 ## Repères
 
