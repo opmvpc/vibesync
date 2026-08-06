@@ -114,6 +114,10 @@ Source de vérité du protocole client↔serveur. Les types Go correspondants vi
 - **Buffering** : la détection (position figée > 700 ms en lecture) est suspendue
   pendant 2 s après tout seek (commandé ou utilisateur) et après chaque transition
   play/pause — un seek fige mécaniquement la position le temps que VLC cherche.
+  Anti-masquage : une nouvelle suspension ne peut pas démarrer moins de 1 s après
+  la fin de la précédente (les seeks de correction en boucle ne doivent pas
+  empêcher le diagnostic) ; propriété exigée : un VLC durablement figé est
+  diagnostiqué bufferisant en ≤ 5 s malgré des corrections répétées.
 - **Assainissement** : toute donnée entrante est validée — valeurs non finies
   rejetées ; fraction VLC bornée à [0,1] ; positions bornées à [0, durée] (durée
   connue) ; `rate` serveur hors [0,25, 4] rejeté ; seek utilisateur borné à
@@ -132,18 +136,23 @@ Source de vérité du protocole client↔serveur. Les types Go correspondants vi
   pseudo, resync via `welcome`.
 - **File d'attente hors ligne** : seuls les messages `chat` composés pendant une
   déconnexion sont mis en file (bornée à 20, les plus anciens sont abandonnés) et
-  envoyés après le re-hello. `setReady` et `setFile` ne sont pas mis en file :
+  envoyés après le re-hello. La file est liée à la salle visée : elle est vidée
+  sans envoi si l'utilisateur change de salle ou se déconnecte volontairement —
+  elle ne survit qu'aux reconnexions automatiques vers la même salle. `setReady` et `setFile` ne sont pas mis en file :
   l'état courant est re-déclaré après chaque `welcome`. Les `control` ne sont
   JAMAIS rejoués (une action périmée écraserait la salle) ; `ping` et `report`
   jamais mis en file.
 - **Reconnexion sans écrasement** : après un `welcome`, le moteur adopte l'état de
   la salle (seek local si nécessaire) et n'émet aucun `control` de rattrapage —
   la détection d'action utilisateur est inhibée pendant cet alignement.
-- **Salle vierge (reprise après perte du serveur)** : si le `welcome` montre une
-  salle qui n'a jamais reçu de control (`setBy` vide, position 0) et que VLC est
-  au-delà de 5 s, le client émet UNE reprise `control seek` à sa position
-  (toast « Reprise à HH:MM:SS »). Couvre le redémarrage du serveur qui a perdu
-  ses salles malgré le linger ; si plusieurs clients reviennent, le dernier gagne
-  (positions quasi identiques par construction).
+- **Salle vierge (reprise après perte du serveur)** : conditions cumulatives —
+  le `welcome` montre une salle sans aucun control (`setBy` vide, position 0),
+  ET le client était **précédemment connecté à cette même salle dans ce même
+  processus** avec une position de salle connue > 5 s. Alors il émet UNE reprise
+  `control seek` à cette dernière position connue (pas la position VLC brute),
+  toast « Reprise à HH:MM:SS ». Un premier join dans une salle neuve ne déclenche
+  jamais de reprise, quel que soit l'état de VLC. Si plusieurs clients reviennent
+  ensemble, chacun peut émettre sa reprise : le dernier gagne, positions quasi
+  identiques par construction (comportement assumé).
 - Serveur : ping WS de transport toutes les 30 s, timeout de lecture 60 s.
 - Tout message inconnu est ignoré (forward-compat) mais loggé en debug.
