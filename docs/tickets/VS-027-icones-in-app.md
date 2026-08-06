@@ -1,7 +1,7 @@
 ---
 id: VS-027
 titre: Icônes in-app mal rasterisées — logo ≠ icône de l'app, roue dentée difforme
-statut: ouvert
+statut: terminé
 priorité: moyenne
 dépend-de: [VS-019]
 créé: 2026-08-06
@@ -30,3 +30,7 @@ Réglages est « cheloue » (polygones GDI aliasés à basse résolution).
 
 - 2026-08-06 : créé (retour v0.2.0), assigné à un agent Opus (avec boucle
   build → capture → inspection visuelle).
+- 2026-08-06 : livré (a63f207). Le vrai problème de la roue était la géométrie
+  (2 rayons alternés = étoile, pas des dents) EN PLUS du crénelage. Logo rendu
+  depuis la ressource icône (moyenne de blocs 256→taille DPI), supersampling ×4
+  maison pour roue/coche/play/pastille. Vérifié à 100 % et 150 % de DPI. Terminé.

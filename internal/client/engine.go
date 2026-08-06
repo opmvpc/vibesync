@@ -52,6 +52,13 @@ type Config struct {
 	// injectée au build). Défaut "dev" : illisible en semver, donc jamais de
 	// proposition de mise à jour — le client Go est un harnais, pas un livrable.
 	Version string
+	// StateDir est le dossier de l'état persistant du client : aujourd'hui le
+	// seul jeton de reprise de session, qui doit survivre à un redémarrage pour
+	// que le pseudo soit repris sans attendre l'expiration du zombie (VS-028).
+	// Vide = aucune persistance, jeton neuf à chaque processus — c'est ce que
+	// veulent les tests, qui ne doivent rien écrire dans le profil utilisateur.
+	// `cmd/vibesync` y place DefaultStateDir().
+	StateDir string
 }
 
 func (c *Config) applyDefaults() {
@@ -227,7 +234,7 @@ func New(cfg Config) *Engine {
 		subs:       map[chan Event]struct{}{},
 	}
 	e.roomState = protocol.RoomState{Paused: true, Rate: 1}
-	if token, err := newSessionToken(); err == nil {
+	if token, err := loadSessionToken(cfg.StateDir, e.log); err == nil {
 		e.sessionToken = token
 	} else {
 		// Sans jeton, on reste fonctionnel : la reprise de session après une
@@ -241,7 +248,7 @@ func New(cfg Config) *Engine {
 // newSessionToken tire le jeton de reprise de session (16 octets aléatoires
 // en hexadécimal, cf. docs/protocol.md).
 func newSessionToken() (string, error) {
-	buf := make([]byte, 16)
+	buf := make([]byte, sessionTokenBytes)
 	if _, err := rand.Read(buf); err != nil {
 		return "", fmt.Errorf("client: génération du jeton de session: %w", err)
 	}

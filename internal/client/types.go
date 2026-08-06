@@ -63,6 +63,10 @@ const (
 	offsetSamples = 5
 )
 
+// maxSessionTokenLen borne le jeton relu du fichier d'état : le serveur refuse
+// au-delà (maxSessionLen côté server), autant ne pas le lui envoyer.
+const maxSessionTokenLen = 128
+
 // DevVersion est la version d'un binaire construit sans injection de VERSION :
 // illisible en semver, donc jamais comparée (aucune bannière de mise à jour).
 const DevVersion = "dev"

@@ -33,6 +33,8 @@ func main() {
 		keepVLC  = flag.Bool("keep-vlc", false, "laisser VLC ouvert à la fermeture du client")
 		debug    = flag.Bool("debug", false, "journal détaillé")
 		version  = flag.Bool("version", false, "afficher la version et quitter")
+		stateDir = flag.String("state-dir", "",
+			"dossier de l'état persistant (défaut : dossier de config utilisateur)")
 	)
 	flag.Parse()
 	if *version {
@@ -47,10 +49,22 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 	logger.Info("vibesync", "version", appVersion)
 
+	// Le jeton de reprise de session y est conservé d'un lancement à l'autre :
+	// c'est lui qui permet de récupérer son pseudo tout de suite après une
+	// fermeture, sans attendre l'expiration de la connexion précédente.
+	dir := *stateDir
+	if dir == "" {
+		var err error
+		if dir, err = client.DefaultStateDir(); err != nil {
+			logger.Warn("état persistant indisponible, jeton de session non conservé", "err", err)
+		}
+	}
+
 	engine := client.New(client.Config{
 		Logger:      logger,
 		KeepVLCOpen: *keepVLC,
 		Version:     appVersion,
+		StateDir:    dir,
 	})
 	server, err := webui.New(engine, webui.Options{})
 	if err != nil {
