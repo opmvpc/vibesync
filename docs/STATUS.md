@@ -60,19 +60,18 @@ chemins Gatekeeper dont Sequoia). Publiée au prochain tag (v0.2.1).
 |---|---|---|
 | VS-001..008, 013..019, 021..028 | Socle → sprint retours terrain → clients natifs | terminés |
 | VS-009..012 | Pistes Wails/WPF/SwiftUI-façade | abandonnés (ADR-006/008) |
-| VS-029 | Attache VLC chez l'utilisateur | blindage livré ; **validation réelle Windows en attente (VM ou PC)** |
+| VS-029 | Attache VLC chez l'utilisateur | **terminé** — bug terrain trouvé/corrigé dans le moteur commun, séance 2 clients C PASS 13/13 dans la VM, vecteur 14 |
 | VS-020 | Overlay OSD Windows (ADR-009) | en attente du PC Windows (demande de Thibault) |
 | VS-030..034, 036 | Couche C commune (ADR-010, 5 phases) + fix semver | **terminés, CI verte 3 jobs** |
 | VS-035 | UB str_to_i64 (préexistant) | ouvert, priorité basse |
 
 ## Prochaine action
 
-1. Dérouler les critères Windows-only de VS-029 dans la VM par SSH (repro
-   vlcrc Syncplay, détection d'action réelle, séance 2 clients C) puis tag
-   v0.2.1 (premier tag qui publie aussi la .app).
+1. Tag v0.2.1 (premier tag qui publie aussi la .app) — VS-029 est clos.
 2. Reliquats : aligner internal/vlc/launch.go sur les 9 nouveaux drapeaux VLC
    du C ; captures mac du guide amis ; retours de ini_flush ignorés
-   (durcissement) ; VS-035.
+   (durcissement) ; VS-035 ; revérifier le piège one-instance sur un vrai PC
+   x86_64 (non reproductible isolément sur VLC ARM64).
 
 ## Repères
 

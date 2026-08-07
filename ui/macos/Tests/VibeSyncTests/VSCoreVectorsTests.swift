@@ -143,12 +143,12 @@ final class VSCoreVectorsTests: XCTestCase {
             .contentsOfDirectory(atPath: dir.path)
             .filter { $0.hasSuffix(".json") }
             .sorted()
-        XCTAssertGreaterThanOrEqual(names.count, 13,
-                                    "\(names.count) vecteur(s) dans \(dir.path), attendu au moins 13")
+        XCTAssertGreaterThanOrEqual(names.count, 14,
+                                    "\(names.count) vecteur(s) dans \(dir.path), attendu au moins 14")
         for name in names {
             replay(dir.appendingPathComponent(name))
         }
-        // Plancher, pas un compte exact : les 13 vecteurs totalisent 146 pas
+        // Plancher, pas un compte exact : les 14 vecteurs totalisent 176 pas
         // aujourd'hui, un vecteur ajouté ne doit pas rendre ce test rouge. Le
         // but est d'attraper le rejeu qui ne compare RIEN (trace vide, sortie
         // anticipée) — panne silencieuse, sinon.

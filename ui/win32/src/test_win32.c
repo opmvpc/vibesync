@@ -6,6 +6,7 @@
 // socket. La logique portable — vecteurs de conformité compris — est dans
 // test_core.c.
 
+#include "auto.h"
 #include "conn.h"
 #include "engine.h"
 #include "health.h"
@@ -1406,6 +1407,75 @@ static void test_vlc_live(Arena *a) {
     temp_end(top);
 }
 
+// ------------------------------------ pilote du harnais réel (VS-029) ---
+//
+// Le fichier de commandes est écrit par un script : une ligne mal formée doit
+// être IGNORÉE, jamais faire tomber l'application ni décaler le compteur de
+// lignes exécutées.
+
+static void test_auto(Arena *a) {
+    section("auto");
+    AutoCmd c;
+    CHECK(auto_parse(S("play"), &c) && c.kind == AUTO_CMD_PLAY, "play");
+    CHECK(auto_parse(S("  PAUSE  "), &c) && c.kind == AUTO_CMD_PAUSE, "pause insensible à la casse");
+    CHECK(auto_parse(S("seek 42.5"), &c) && c.kind == AUTO_CMD_SEEK && approx(c.value, 42.5, 1e-9),
+          "seek fractionnaire");
+    CHECK(auto_parse(S("seek 0"), &c) && c.kind == AUTO_CMD_SEEK && c.value == 0, "seek 0");
+    CHECK(!auto_parse(S("seek"), &c), "seek sans argument accepté");
+    CHECK(!auto_parse(S("seek abc"), &c), "seek non numérique accepté");
+    CHECK(auto_parse(S("ready"), &c) && c.kind == AUTO_CMD_READY && c.flag, "ready");
+    CHECK(auto_parse(S("ready 0"), &c) && c.kind == AUTO_CMD_READY && !c.flag, "ready 0");
+    CHECK(auto_parse(S("ready false"), &c) && !c.flag, "ready false");
+    CHECK(auto_parse(S("unready"), &c) && c.kind == AUTO_CMD_READY && !c.flag, "unready");
+    CHECK(auto_parse(S("chat bonjour tout le monde"), &c) && c.kind == AUTO_CMD_CHAT &&
+              str8_eq(c.text, S("bonjour tout le monde")),
+          "chat : reste de la ligne");
+    CHECK(!auto_parse(S("chat"), &c), "chat vide accepté");
+    CHECK(auto_parse(S("open C:\\media\\film.mkv"), &c) && c.kind == AUTO_CMD_OPEN &&
+              str8_eq(c.text, S("C:\\media\\film.mkv")),
+          "open");
+    CHECK(auto_parse(S("quit"), &c) && c.kind == AUTO_CMD_QUIT, "quit");
+    CHECK(!auto_parse(S(""), &c) && !auto_parse(S("   "), &c), "ligne vide");
+    CHECK(!auto_parse(S("# commentaire"), &c), "commentaire");
+    CHECK(!auto_parse(S("danse"), &c), "verbe inconnu accepté");
+
+    // Sans VIBESYNC_AUTO_URL, le mode auto n'existe pas : c'est la garantie que
+    // rien ne change pour l'utilisateur.
+    AutoPilot ap;
+    SetEnvironmentVariableW(L"VIBESYNC_AUTO_URL", NULL);
+    CHECK(!auto_from_env(a, &ap) && !ap.on, "mode auto actif sans URL");
+    SetEnvironmentVariableW(L"VIBESYNC_AUTO_URL", L"  ws://127.0.0.1:8080/ws  ");
+    SetEnvironmentVariableW(L"VIBESYNC_AUTO_NAME", L"alice");
+    SetEnvironmentVariableW(L"VIBESYNC_AUTO_PASSWORD", L"secret ");
+    CHECK(auto_from_env(a, &ap) && ap.on && str8_eq(ap.url, S("ws://127.0.0.1:8080/ws")),
+          "URL rognée");
+    CHECK(str8_eq(ap.name, S("alice")) && str8_eq(ap.room, S("salon")), "pseudo lu, salle par défaut");
+    // Un espace final EST un caractère du mot de passe.
+    CHECK(str8_eq(ap.password, S("secret ")), "mot de passe rogné à tort");
+    SetEnvironmentVariableW(L"VIBESYNC_AUTO_URL", NULL);
+    SetEnvironmentVariableW(L"VIBESYNC_AUTO_NAME", NULL);
+    SetEnvironmentVariableW(L"VIBESYNC_AUTO_PASSWORD", NULL);
+
+    // Écriture atomique de l'état : le fichier final ne doit jamais être vu
+    // à moitié écrit, et le .tmp ne doit pas rester derrière.
+    TempArena t = temp_begin(a);
+    u16 wtmp[MAX_PATH];
+    GetTempPathW(MAX_PATH, wtmp);
+    Str8 dir = utf16_to_utf8(a, wtmp);
+    Str8 path = str8_cat(a, dir, S("vibesync-auto-test.json"));
+    CHECK(auto_write_atomic(a, path, S("{\"a\":1}\n")), "écriture atomique");
+    CHECK(str8_eq(auto_read_text(a, path), S("{\"a\":1}\n")), "relecture");
+    CHECK(auto_write_atomic(a, path, S("{\"a\":2}\n")), "réécriture");
+    CHECK(str8_eq(auto_read_text(a, path), S("{\"a\":2}\n")), "relecture après remplacement");
+    Str8 leftover = auto_read_text(a, str8_cat(a, path, S(".tmp")));
+    CHECK(leftover.len == 0, "fichier temporaire laissé derrière");
+    CHECK(auto_read_text(a, str8_cat(a, dir, S("vibesync-absent-xyz.json"))).len == 0,
+          "fichier absent : chaîne vide attendue");
+    u16 *wpath = utf8_to_utf16(a, path, NULL);
+    DeleteFileW((LPCWSTR)wpath);
+    temp_end(t);
+}
+
 // ------------------------------------------------------------ ordonnancement ---
 
 void test_win32_run(Arena *a) {
@@ -1416,6 +1486,7 @@ void test_win32_run(Arena *a) {
     test_text_edit();
     test_media(a);
     test_secret(a);
+    test_auto(a);
     test_vlc_live(a);
     test_net_live(a);
     test_net_queue_saturation(a);

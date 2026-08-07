@@ -585,8 +585,23 @@ static void arm(VsEngine *e, i64 now, const VsCmd *cmds, isize count) {
                 break;
         }
     }
-    e->grace_until = now + VS_GRACE_NS;
-    if (hold) e->hold_until = now + VS_GRACE_NS;
+    // La grâce n'est armée QUE par les commandes qui changent ce que la
+    // détection compare : pause, reprise, seek. Un changement de rate ne touche
+    // ni l'état lecture/pause ni la position (l'attendu absorbe le nouveau rate
+    // juste au-dessus, donc expect_predict reste juste).
+    //
+    // Pourquoi c'est vital (VS-029, mesuré dans la VM Win11) : la position que
+    // rend VLC oscille de ±0,15 s autour de la référence, donc le nudge
+    // s'engage et se relâche à presque chaque tour (rate 1 → 1,05 → 0,95 → 1,
+    // observé à 5 Hz). En armant la grâce à chaque rate, la fenêtre de 500 ms
+    // ne se refermait JAMAIS pendant la lecture : detect_user_action n'était
+    // plus appelée du tout et une pause faite dans VLC était annulée par la
+    // correction 250 ms plus tard, sans jamais partir au serveur. C'est très
+    // exactement le point 2 du retour terrain de VS-029.
+    if (hold) {
+        e->grace_until = now + VS_GRACE_NS;
+        e->hold_until = now + VS_GRACE_NS;
+    }
 }
 
 // plan décide des corrections à appliquer à VLC.

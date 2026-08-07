@@ -1377,6 +1377,115 @@ static void test_buffering_suspend(void) {
           (long long)(diagnosed_at < 0 ? -1 : diagnosed_at / MS));
 }
 
+// ------------------------- action faite DANS VLC pendant la lecture (VS-029) ---
+//
+// Le trou historique du ticket : « pause faite dans VLC, non propagée ». La
+// cause, mesurée dans la VM Win11 avec un vrai VLC, n'était pas dans la
+// détection mais dans ce qui la GATE — la fenêtre de grâce. La position que
+// rend VLC oscille de ±0,15 s autour de la référence, le nudge s'engage et se
+// relâche donc à presque chaque poll, et chaque commande `rate` réarmait 500 ms
+// de grâce : la fenêtre ne se refermait jamais et detect_user_action n'était
+// plus jamais appelée en lecture. Ce test reproduit exactement ce régime.
+
+static void test_user_action_in_vlc(void) {
+    section("action utilisateur dans VLC");
+    const i64 MS = 1000000LL;
+    i64 t0 = 1785960000000LL * MS;
+    VsEngine e;
+    VsOutput out;
+
+    // play_with_churn : `polls` polls de 200 ms en lecture, position oscillante.
+    // Rend le nombre de commandes rate émises (le régime doit bien churner,
+    // sinon le test ne prouverait rien) et la dernière position observée.
+    isize rate_cmds = 0;
+    f64 pos = 0;
+    i64 t = t0;
+
+    engine_init(&e);
+    vs_output_reset(&out);
+    join_room(&e, t, "salon", 100, &out);
+    for (int i = 1; i <= 20; i++) {
+        t += 200 * MS;
+        pos = engine_expected_position(&e, t) + ((i % 2) ? 0.15 : -0.15);
+        VsStatus st = mk_status(VS_PLAY_PLAYING, pos, 7200);
+        vs_output_reset(&out);
+        engine_on_vlc_status(&e, t, &st, &out);
+        engine_on_tick(&e, t, &out);
+        for (isize k = 0; k < out.cmd_count; k++) {
+            if (out.cmds[k].kind == VS_CMD_RATE) rate_cmds++;
+        }
+    }
+    CHECK(rate_cmds >= 5, "régime de churn attendu : %lld commandes rate sur 20 polls",
+          (long long)rate_cmds);
+
+    // L'utilisateur appuie sur Espace dans VLC : un control pause doit partir.
+    b32 seen_pause = 0;
+    for (int i = 1; i <= 3 && !seen_pause; i++) {
+        t += 200 * MS;
+        VsStatus st = mk_status(VS_PLAY_PAUSED, pos, 7200);
+        vs_output_reset(&out);
+        engine_on_vlc_status(&e, t, &st, &out);
+        for (isize k = 0; k < out.msg_count; k++) {
+            if (out.msgs[k].kind == VS_MSG_CONTROL && out.msgs[k].action == VS_ACT_PAUSE) seen_pause = 1;
+        }
+        engine_on_tick(&e, t, &out);
+    }
+    CHECK(seen_pause, "pause faite dans VLC en pleine lecture : NON détectée (VS-029)");
+
+    // Même chose pour un seek fait à la souris dans la barre de VLC.
+    engine_init(&e);
+    vs_output_reset(&out);
+    t = t0 + 60000 * MS;
+    join_room(&e, t, "salon", 100, &out);
+    for (int i = 1; i <= 20; i++) {
+        t += 200 * MS;
+        pos = engine_expected_position(&e, t) + ((i % 2) ? 0.15 : -0.15);
+        VsStatus st = mk_status(VS_PLAY_PLAYING, pos, 7200);
+        vs_output_reset(&out);
+        engine_on_vlc_status(&e, t, &st, &out);
+        engine_on_tick(&e, t, &out);
+    }
+    b32 seen_seek = 0;
+    f64 seek_pos = 0;
+    for (int i = 1; i <= 3 && !seen_seek; i++) {
+        t += 200 * MS;
+        VsStatus st = mk_status(VS_PLAY_PLAYING, pos + 300, 7200);
+        vs_output_reset(&out);
+        engine_on_vlc_status(&e, t, &st, &out);
+        for (isize k = 0; k < out.msg_count; k++) {
+            if (out.msgs[k].kind == VS_MSG_CONTROL && out.msgs[k].action == VS_ACT_SEEK) {
+                seen_seek = 1;
+                seek_pos = out.msgs[k].position_sec;
+            }
+        }
+        engine_on_tick(&e, t, &out);
+    }
+    CHECK(seen_seek, "seek fait dans VLC en pleine lecture : NON détecté (VS-029)");
+    CHECK(seen_seek && approx(seek_pos, pos + 300, 0.5), "le seek remonté porte la position de VLC (%.2f)",
+          seek_pos);
+
+    // L'anti-boucle, elle, doit rester : ce que le moteur vient de commander
+    // (pause, reprise, seek) ne doit JAMAIS revenir comme action utilisateur.
+    engine_init(&e);
+    vs_output_reset(&out);
+    t = t0 + 120000 * MS;
+    join_room(&e, t, "salon", 100, &out);
+    VsStatus st = mk_status(VS_PLAY_PLAYING, engine_expected_position(&e, t), 7200);
+    vs_output_reset(&out);
+    engine_on_vlc_status(&e, t, &st, &out);
+    // Correction dure : le moteur commande un seek, VLC obéit au poll suivant.
+    vs_output_reset(&out);
+    // NB : emit_user_control n'arme PAS la grâce (aligné avec le Go) ; ici
+    // l'anti-boucle tient à la grâce armée par le welcome du join_room.
+    engine_user_control(&e, t, VS_ACT_SEEK, 500, 1, &out);
+    t += 200 * MS;
+    st = mk_status(VS_PLAY_PLAYING, 500, 7200);
+    vs_output_reset(&out);
+    engine_on_vlc_status(&e, t, &st, &out);
+    CHECK(count_msgs(&out, VS_MSG_CONTROL) == 0,
+          "le saut que le moteur vient d'ordonner est remonté comme action utilisateur");
+}
+
 // ------------------------------------------------------------ moteur : unités ---
 
 static void test_engine_units(void) {
@@ -2134,8 +2243,8 @@ void test_core_vectors(Arena *a, Str8 override) {
     }
     FileList files;
     list_vectors(a, dir, &files);
-    if (files.count < 12) {
-        failf("%lld vecteur(s) trouvé(s) dans %.*s, attendu au moins 12", (long long)files.count, (int)dir.len,
+    if (files.count < 14) {
+        failf("%lld vecteur(s) trouvé(s) dans %.*s, attendu au moins 14", (long long)files.count, (int)dir.len,
               dir.data);
         return;
     }
@@ -2162,5 +2271,6 @@ void test_core_run(Arena *a) {
     test_offline_queue();
     test_virgin_resume();
     test_buffering_suspend();
+    test_user_action_in_vlc();
     test_media_core(a);
 }

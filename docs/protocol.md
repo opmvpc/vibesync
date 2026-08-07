@@ -126,7 +126,12 @@ Source de vérité du protocole client↔serveur. Les types Go correspondants vi
 - **Détection d'action utilisateur** : le client garde la dernière commande qu'il a
   lui-même envoyée à VLC (avec tolérance) ; tout changement observé non provoqué par
   lui (pause/play, saut de position > 3 s) = action utilisateur → `control` au serveur.
-  Anti-boucle : après application d'un `roomState`, fenêtre de grâce de 500 ms.
+  Anti-boucle : fenêtre de grâce de 500 ms, armée par l'application d'un `roomState`
+  et par les commandes qui changent ce que la détection compare — `pause`, reprise,
+  `seek`. Un ajustement de `rate` (nudge) ne l'arme **pas** : le nudge churne en
+  régime permanent (la position rendue par VLC oscille de ±0,15 s, le rate défile à
+  presque chaque poll), armer sur `rate` laisserait la fenêtre ouverte en continu et
+  rendrait la détection d'action utilisateur inopérante en lecture.
 - **Ready** : bouton dans l'UI ; un utilisateur qui met pause pendant la lecture ne
   perd pas son ready (le ready ne gate que le premier démarrage).
 

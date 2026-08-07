@@ -36,7 +36,7 @@ set "CORE_SHARED="%CORE_DIR%\src\base_core.c" "%CORE_DIR%\src\json.c" "%CORE_DIR
 rem CORE_WIN32 = ce qui ne quittera jamais Windows : arenes/journal/UTF-16,
 rem Winsock, WinHTTP, DPAPI, GDI. Pendant exact de core\posix (macOS), qui
 rem n'est JAMAIS compile ici.
-set "CORE_WIN32="%ROOT%src\base_win32.c" "%ROOT%src\vlc_win32.c" "%ROOT%src\net.c" "%ROOT%src\ini_win32.c" "%ROOT%src\health.c" "%ROOT%src\secret.c" "%ROOT%src\media_win32.c" "%ROOT%src\ui.c""
+set "CORE_WIN32="%ROOT%src\base_win32.c" "%ROOT%src\vlc_win32.c" "%ROOT%src\net.c" "%ROOT%src\ini_win32.c" "%ROOT%src\health.c" "%ROOT%src\secret.c" "%ROOT%src\media_win32.c" "%ROOT%src\auto.c" "%ROOT%src\ui.c""
 set "CORE=%CORE_SHARED% %CORE_WIN32%"
 rem La moitie portable de la suite vit avec le core (core\tests) ; test_win32.c
 rem et l'ordonnanceur test_main.c restent ici.

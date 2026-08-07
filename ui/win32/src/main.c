@@ -11,6 +11,7 @@
 //     le dernier statut sous verrou et réveille l'UI par PostMessage.
 // Aucune structure du moteur n'est touchée hors du thread UI.
 
+#include "auto.h"
 #include "base.h"
 #include "conn.h"
 #include "engine.h"
@@ -40,6 +41,7 @@
 #define TIMER_ENGINE 1
 #define TIMER_UI 2
 #define TIMER_SHOT 3
+#define TIMER_AUTO 4
 
 // Message d'échec d'ouverture : cause + piste actionnable (VS-029). Il est
 // affiché en toast (tronqué à sa capacité) et journalisé en entier.
@@ -405,10 +407,17 @@ typedef struct {
     isize media_dir_count;
     StrBuf pending_find;  // nom recherché, pour le message d'échec
 
+    // Pilote du harnais de test réel (VS-029) : inactif hors mode auto.
+    AutoPilot autop;
+
     // Réglages : chemin VLC détecté au démarrage, AVANT que %VIBESYNC_VLC% ne
     // soit forcé par le réglage — sinon la « détection automatique » affichée
     // ne ferait que renvoyer le réglage à l'utilisateur.
     Str8 vlc_auto;
+    // Valeur HÉRITÉE de %VIBESYNC_VLC% : celle que l'utilisateur (ou un
+    // harnais) a posée dans l'environnement avant de lancer l'exe. Elle sert
+    // de repli quand le réglage de l'ini est vide, cf. apply_vlc_path.
+    Str8 vlc_env;
     StrBuf vlc_checked;  // dernier chemin validé (évite un accès disque par frame)
 } App;
 
@@ -428,10 +437,29 @@ static b32 file_exists(Arena *scratch, Str8 path) {
     return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+// env_str lit une variable d'environnement en UTF-8 (vide si absente).
+static Str8 env_str(Arena *a, const wchar_t *name) {
+    DWORD n = GetEnvironmentVariableW(name, NULL, 0);
+    if (n == 0) return str8_lit("");
+    u16 *buf = arena_push_array(a, u16, (isize)n + 1);
+    DWORD got = GetEnvironmentVariableW(name, (LPWSTR)buf, n);
+    if (got == 0 || got > n) return str8_lit("");
+    return utf16_to_utf8(a, buf);
+}
+
 // apply_vlc_path propage le réglage à vlc.c sans toucher à vlc.c : celui-ci
 // consulte déjà %VIBESYNC_VLC% en premier dans vlc_locate().
+//
+// Réglage VIDE ne veut pas dire « efface la variable » mais « rends la
+// valeur HÉRITÉE » : %VIBESYNC_VLC% est documenté comme la façon d'indiquer un
+// VLC hors des emplacements standards (c'est même la piste affichée par
+// vlc_error_text), et l'écraser au démarrage la rendait inopérante — un VLC
+// installé ailleurs restait « introuvable » quoi qu'on mette dans
+// l'environnement. Trouvé par le harnais VS-029 dans la VM Win11, où VLC vit
+// dans %USERPROFILE%\tools\vlc.
 static void apply_vlc_path(App *app, Str8 path) {
     TempArena t = temp_begin(app->scratch);
+    if (path.len == 0) path = app->vlc_env;  // retour à l'héritage
     if (path.len > 0) {
         u16 *w = utf8_to_utf16(app->scratch, path, NULL);
         SetEnvironmentVariableW(L"VIBESYNC_VLC", (LPCWSTR)w);
@@ -485,6 +513,8 @@ static void settings_load(App *app) {
     // Détection automatique de VLC, mesurée avant d'appliquer le réglage.
     app->vlc_auto = str8_lit("");
     TempArena t = temp_begin(app->scratch);
+    // Valeur héritée de l'environnement, lue AVANT toute écriture de notre fait.
+    app->vlc_env = str8_copy(app->perm, env_str(app->scratch, L"VIBESYNC_VLC"));
     Str8 found;
     if (vlc_locate(app->scratch, &found)) app->vlc_auto = str8_copy(app->perm, found);
     temp_end(t);
@@ -1394,6 +1424,175 @@ static void handle_actions(App *app) {
     refresh_view(app);
 }
 
+// ------------------------------------------------- pilote du harnais réel ---
+//
+// Voir auto.h. Trois entrées seulement : auto_start (démarrage), auto_pump
+// (une fois par TIMER_AUTO) et auto_write_status (publication de l'état).
+
+// auto_write_status publie l'état courant, une ligne de JSON, pour que le
+// script puisse asserter. Mêmes clés que l'état du client macOS
+// (AppModel.autoWriteStatus) : le harnais Windows et le harnais mac lisent le
+// même vocabulaire.
+static void auto_write_status(App *app) {
+    AutoPilot *ap = &app->autop;
+    if (!ap->on || ap->status_path.len == 0) return;
+    VsEngine *e = &app->engine;
+    UiApp *ui = &app->ui;
+    i64 now = vs_now_ns();
+
+    b32 vlc_running;
+    int vlc_port;
+    char vlc_password[64];
+    AcquireSRWLockExclusive(&app->vlc.lock);
+    vlc_running = app->vlc.running;
+    vlc_port = app->vlc.client.port;
+    memcpy(vlc_password, app->vlc.client.password, sizeof(vlc_password));
+    ReleaseSRWLockExclusive(&app->vlc.lock);
+
+    TempArena t = temp_begin(app->scratch);
+    JsonWriter w;
+    jw_init(&w, app->scratch);
+    jw_obj_begin(&w);
+    jw_kv_i64(&w, "ts", vs_ns_to_unix_ms(now));
+    jw_kv_i64(&w, "pid", (i64)GetCurrentProcessId());
+    jw_kv_str(&w, "scenario", ap->scenario);
+    jw_kv_str(&w, "name", ap->name);
+    jw_kv_str(&w, "room", ap->room);
+    jw_key(&w, "phase");
+    jw_cstr(&w, e->phase == VS_PHASE_CONNECTED ? "connected"
+                                               : (e->phase == VS_PHASE_CONNECTING ? "connecting" : "idle"));
+    jw_kv_bool(&w, "connected", e->phase == VS_PHASE_CONNECTED);
+    jw_kv_i64(&w, "users", (i64)ui->user_count);
+    jw_kv_bool(&w, "ready", e->ready);
+    jw_kv_str(&w, "file", strbuf_str(&e->file_name));
+    jw_kv_bool(&w, "fileDeclared", e->have_file);
+    jw_kv_bool(&w, "vlcRunning", vlc_running);
+    // Port et mot de passe de l'interface locale de VLC. MODE AUTO UNIQUEMENT :
+    // sans eux, un tiers ne peut pas jouer le rôle de l'utilisateur DANS VLC
+    // (pause/seek envoyés hors du client), puisqu'ils sont tirés au hasard à
+    // chaque lancement — et c'est très exactement ce que VS-029 demande de
+    // prouver. Ils ne quittent jamais le fichier d'état du harnais (dossier
+    // temporaire) et n'apparaissent JAMAIS dans vibesync.log.
+    jw_kv_i64(&w, "vlcPort", vlc_running ? (i64)vlc_port : 0);
+    jw_key(&w, "vlcPassword");
+    jw_cstr(&w, vlc_running ? vlc_password : "");
+    jw_key(&w, "vlcState");
+    jw_cstr(&w, e->have_status ? vs_play_state_name(e->status.state) : "stopped");
+    jw_kv_num(&w, "positionSec", e->have_status ? e->status.position_sec : 0);
+    jw_kv_num(&w, "durationSec", e->have_status ? e->status.length_sec : 0);
+    jw_kv_num(&w, "roomPositionSec", engine_expected_position(e, now));
+    jw_kv_bool(&w, "paused", e->room_state.paused || !e->have_state);
+    jw_kv_num(&w, "driftSec", e->drift);
+    jw_kv_bool(&w, "buffering", e->buffering);
+    jw_kv_i64(&w, "latencyMs", e->latency_ms);
+    jw_kv_bool(&w, "correcting", e->correcting != VS_CORRECT_NONE);
+    // Libellés de l'interface : c'est là que se lisent la cause d'un échec de
+    // connexion et l'état du lancement de VLC.
+    jw_key(&w, "error");
+    jw_cstr(&w, ui->status_error ? ui->status : "");
+    jw_key(&w, "connection");
+    jw_cstr(&w, ui->status);
+    jw_key(&w, "lastError");
+    jw_cstr(&w, ui->toast_level > 0 ? ui->toast : "");
+    jw_key(&w, "media");
+    jw_cstr(&w, ui->media_notice_show ? ui->media_notice : ui->file_name);
+    jw_obj_end(&w);
+
+    Str8 line = str8_cat(app->scratch, jw_result(&w), str8_lit("\n"));
+    if (!auto_write_atomic(app->scratch, ap->status_path, line)) {
+        // Un état non écrit ne doit pas faire tomber l'application ; il doit
+        // laisser une trace, une seule.
+        static b32 warned = 0;
+        if (!warned) {
+            warned = 1;
+            vs_log("auto: état non écrit dans \"%.*s\"", (int)ap->status_path.len,
+                   (const char *)ap->status_path.data);
+        }
+    }
+    temp_end(t);
+}
+
+// auto_run exécute une commande du pilote. Elle passe par les MÊMES entrées du
+// moteur que les boutons de l'interface (engine_user_control…) : le harnais
+// exerce le vrai chemin, pas un raccourci.
+static void auto_run(App *app, const AutoCmd *cmd) {
+    VsOutput out;
+    vs_output_reset(&out);
+    i64 now = vs_now_ns();
+    switch (cmd->kind) {
+        case AUTO_CMD_PLAY: engine_user_control(&app->engine, now, VS_ACT_PLAY, 0, 0, &out); break;
+        case AUTO_CMD_PAUSE: engine_user_control(&app->engine, now, VS_ACT_PAUSE, 0, 0, &out); break;
+        case AUTO_CMD_SEEK:
+            engine_user_control(&app->engine, now, VS_ACT_SEEK, cmd->value, 1, &out);
+            break;
+        case AUTO_CMD_READY: engine_set_ready(&app->engine, cmd->flag, &out); break;
+        case AUTO_CMD_CHAT: engine_chat(&app->engine, cmd->text, &out); break;
+        case AUTO_CMD_OPEN: worker_open(&app->vlc, cmd->text); break;
+        case AUTO_CMD_QUIT:
+            // Chemin NORMAL de fermeture : c'est lui qui envoie la close 1000
+            // et arrête VLC (VS-028).
+            PostMessageW(app->hwnd, WM_CLOSE, 0, 0);
+            break;
+        case AUTO_CMD_NONE: break;
+    }
+    dispatch_output(app, &out);
+    refresh_view(app);
+}
+
+// auto_pump : commandes en attente puis état publié.
+static void auto_pump(App *app) {
+    AutoPilot *ap = &app->autop;
+    if (!ap->on) return;
+    if (ap->cmds_path.len > 0) {
+        TempArena t = temp_begin(app->scratch);
+        Str8 text = auto_read_text(app->scratch, ap->cmds_path);
+        // Le fichier n'est jamais réécrit par l'application : le script y
+        // ajoute, nous comptons ce qui a déjà été fait. Seules les lignes
+        // TERMINÉES par un saut de ligne sont exécutées — la dernière peut
+        // être en cours d'écriture.
+        isize start = 0, index = 0;
+        for (isize i = 0; i < text.len; i++) {
+            if (text.data[i] != '\n') continue;
+            Str8 line = str8_sub(text, start, i - start);
+            start = i + 1;
+            index++;
+            if (index <= ap->cmds_done) continue;
+            ap->cmds_done = index;
+            AutoCmd cmd;
+            if (auto_parse(line, &cmd)) auto_run(app, &cmd);
+        }
+        temp_end(t);
+    }
+    i64 now = now_ms();
+    if (now - ap->last_status_ms >= VS_AUTO_STATUS_PERIOD_MS) {
+        ap->last_status_ms = now;
+        auto_write_status(app);
+    }
+}
+
+// auto_start : connexion immédiate, ouverture du média, premier état publié.
+// Sans pilote, ne fait rien.
+static void auto_start(App *app) {
+    AutoPilot *ap = &app->autop;
+    if (!ap->on) return;
+    UiApp *ui = &app->ui;
+    ui_text_set(&ui->f_server, ap->url);
+    ui_text_set(&ui->f_name, ap->name);
+    ui_text_set(&ui->f_room, ap->room);
+    ui_text_set(&ui->f_password, ap->password);
+    // Le harnais n'a aucune raison de laisser un secret derrière lui, même
+    // chiffré : le mot de passe reste en mémoire et n'entre pas dans l'ini.
+    ui->remember_password = 0;
+    vs_log("auto: pilote actif (scénario \"%.*s\", salle \"%.*s\", fichier \"%.*s\")",
+           (int)ap->scenario.len, (const char *)ap->scenario.data, (int)ap->room.len,
+           (const char *)ap->room.data, (int)ap->file.len, (const char *)ap->file.data);
+    do_connect(app);
+    if (ap->file.len > 0) worker_open(&app->vlc, ap->file);
+    auto_write_status(app);
+    ap->last_status_ms = now_ms();
+    SetTimer(app->hwnd, TIMER_AUTO, VS_AUTO_PUMP_MS, NULL);
+}
+
 // ------------------------------------------------------------ back-buffer ---
 
 static void ensure_backbuffer(App *app, i32 w, i32 h) {
@@ -1523,6 +1722,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 KillTimer(hwnd, TIMER_SHOT);
                 png_write(app->scratch, app->shot_path, (const u8 *)app->bits, app->bw, app->bh);
                 PostQuitMessage(0);
+                return 0;
+            }
+            if (wp == TIMER_AUTO) {
+                auto_pump(app);
+                redraw(app);
                 return 0;
             }
             if (wp == TIMER_ENGINE) engine_step(app);
@@ -2047,6 +2251,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show) {
             SetTimer(hwnd, TIMER_SHOT, with_file ? 12000 : 4000, NULL);
         }
     }
+
+    // Mode auto (VS-029) : piloté par l'environnement, pour le harnais de test
+    // réel scripts/run-real-vm.ps1. Sans VIBESYNC_AUTO_URL, rien ne change.
+    if (auto_from_env(perm, &app->autop)) auto_start(app);
 
     // Premier diagnostic de joignabilité : la pastille est renseignée avant même
     // que l'utilisateur touche au formulaire.

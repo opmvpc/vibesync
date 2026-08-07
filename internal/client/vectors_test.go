@@ -282,6 +282,29 @@ func (b *vecBuilder) userEvent(kind string, arg float64) {
 	}
 }
 
+// churn joue `polls` polls en plaçant VLC à « position attendue ± 0,15 s » par
+// un userSeek sous le seuil de détection (3 s). C'est le bruit que rend le vrai
+// VLC (VS-029, mesuré dans la VM Win11) : à ce régime le nudge s'engage et se
+// relâche à presque chaque tour, et les `rate` défilent en continu. Le seul
+// vocabulaire employé est celui que tous les harnais de rejeu comprennent
+// (userSeek + poll) : aucun réglage caché du faux VLC.
+func (b *vecBuilder) churn(polls int) {
+	for i := 1; i <= polls; i++ {
+		jitter := 0.15
+		if i%2 == 0 {
+			jitter = -0.15
+		}
+		next := b.h.clock.Now().Add(PollInterval)
+		b.h.e.mu.Lock()
+		want := b.h.e.expectedPositionLocked(next) + jitter
+		b.h.e.mu.Unlock()
+		// Le seek place la position MAINTENANT : on retranche ce que VLC va
+		// lire d'ici au poll pour qu'il s'y présente à `want`.
+		b.userEvent("userSeek", round3(want-PollInterval.Seconds()*b.h.fake.Rate()))
+		b.run(1)
+	}
+}
+
 // sessionLost consigne une coupure de la session serveur.
 func (b *vecBuilder) sessionLost() {
 	b.vec.Events = append(b.vec.Events, vectorEvent{AtMs: b.atMs(), Type: "connectionLost"})
@@ -560,6 +583,54 @@ func TestVectors(t *testing.T) {
 	b.event(protocol.TypeRoomState, reprise)
 	b.run(4)
 	b.check()
+
+	// 14. Action utilisateur sous le churn du nudge (VS-029). La position que
+	// rend VLC oscille de ±0,15 s autour de la référence : le nudge s'engage et
+	// se relâche à presque chaque poll, les `rate` défilent en continu. La
+	// fenêtre de grâce ne doit PAS être réarmée par ces `rate` — sinon elle
+	// reste ouverte en permanence, la détection d'action utilisateur ne tourne
+	// plus jamais en lecture, et une pause faite dans VLC est annulée par la
+	// correction du poll suivant au lieu de partir au serveur.
+	b = newVecBuilder(t, vecSetup{
+		name: "14-action-utilisateur-sous-churn", file: "ep1.mkv", durationSec: 7200,
+		positionSec: 1000, playing: true,
+		description: "Régime de churn du nudge (position VLC bruitée de ±0,15 s) : " +
+			"pause puis reprise puis seek faits DANS VLC sont bien détectés et " +
+			"remontés en control — la grâce n'est pas réarmée par les rate.",
+		scenario: "Préconditions du moteur au premier événement : session serveur " +
+			"déjà établie, aucun état de salle connu, aucune mesure d'offset " +
+			"d'horloge. Fichier ep1.mkv ouvert, durée 7200 s, taille 15 octets, " +
+			"position 1000 s, lecture en cours, rate 1. Les événements `userSeek` " +
+			"de ±0,15 s ne sont PAS des actions utilisateur (bien sous le seuil de " +
+			"3 s) : ils reproduisent le bruit de la position rendue par VLC, qui " +
+			"fait churner le nudge. Déroulé : (1) welcome + pong d'une salle en " +
+			"lecture à 1000 s, puis 10 polls de churn ; (2) l'utilisateur met VLC " +
+			"en pause lui-même — le control pause doit partir malgré le churn ; " +
+			"(3) le serveur renvoie la pause en écho (setBy = u1) et le hold " +
+			"tombe ; (4) l'utilisateur relance la lecture dans VLC — control play, " +
+			"écho du serveur ; (5) 8 polls de churn, puis l'utilisateur saute de " +
+			"300 s dans la barre de VLC — control seek.",
+	})
+	b.welcome(b.h.playing(1000))
+	b.churn(10)
+	// L'utilisateur appuie sur Espace dans VLC, en plein régime de churn.
+	b.userEvent("userPause", 0)
+	b.run(3)
+	echoPause := b.h.paused(b.lastControlPosition())
+	echoPause.SetBy = "u1"
+	b.event(protocol.TypeRoomState, echoPause)
+	b.run(3)
+	// … puis il relance la lecture, toujours dans VLC.
+	b.userEvent("userPlay", 0)
+	b.run(3)
+	echoPlay := b.h.playing(b.lastControlPosition())
+	echoPlay.SetBy = "u1"
+	b.event(protocol.TypeRoomState, echoPlay)
+	b.churn(8)
+	// … et finit par un saut à la souris dans la barre de VLC.
+	b.userEvent("userSeek", round3(b.h.fake.Position())+300)
+	b.run(3)
+	b.check()
 }
 
 // lastControlPosition rend la position du dernier `control` que le moteur a
@@ -588,8 +659,8 @@ func TestVectorsGoldenComplets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(files) < 13 {
-		t.Fatalf("%d vecteurs golden, attendu au moins 13", len(files))
+	if len(files) < 14 {
+		t.Fatalf("%d vecteurs golden, attendu au moins 14", len(files))
 	}
 	for _, f := range files {
 		raw, err := os.ReadFile(f)

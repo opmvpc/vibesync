@@ -563,6 +563,102 @@ func TestFenetreDeGraceApresRoomState(t *testing.T) {
 	}
 }
 
+// churn place VLC à « position attendue + jitter » au poll suivant et rend le
+// nombre de changements de rate observés. C'est le régime réel mesuré dans la
+// VM Win11 (VS-029) : la position que rend VLC oscille de ±0,15 s autour de la
+// référence, donc le nudge s'engage et se relâche à presque chaque tour.
+func (h *harness) churn(polls int) int {
+	h.t.Helper()
+	rates := 0
+	for i := 1; i <= polls; i++ {
+		jitter := 0.15
+		if i%2 == 0 {
+			jitter = -0.15
+		}
+		next := h.clock.Now().Add(PollInterval)
+		h.e.mu.Lock()
+		want := h.e.expectedPositionLocked(next) + jitter
+		h.e.mu.Unlock()
+		// SeekTo place la position MAINTENANT : on retranche ce que VLC va
+		// lire d'ici au poll pour qu'il s'y présente à `want`.
+		rate := h.fake.Rate()
+		h.fake.SeekTo(want - PollInterval.Seconds()*rate)
+		h.tick(PollInterval)
+		if math.Abs(h.fake.Rate()-rate) > 1e-3 {
+			rates++
+		}
+	}
+	return rates
+}
+
+// TestActionUtilisateurDansVLCSousChurnDeNudge est le miroir Go de
+// core/tests/test_core.c::test_user_action_in_vlc — le trou terrain de VS-029 :
+// « pause faite dans VLC, jamais propagée ». La cause n'était pas la détection
+// mais ce qui la gate, la fenêtre de grâce : tant que celle-ci était réarmée par
+// chaque commande `rate`, le churn du nudge la maintenait ouverte en permanence
+// et detectUserActionLocked n'était plus jamais appelée en lecture.
+func TestActionUtilisateurDansVLCSousChurnDeNudge(t *testing.T) {
+	// 1. Pause faite dans VLC en pleine lecture, sous churn.
+	h := newHarness(t)
+	h.openFile("ep1.mkv", 7200)
+	h.connect(h.playing(100))
+	h.fake.SeekTo(100)
+	h.fake.Play()
+	h.ticks(2)
+	h.conn.take()
+
+	if n := h.churn(20); n < 5 {
+		t.Fatalf("régime de churn attendu : %d changement(s) de rate sur 20 polls", n)
+	}
+	h.conn.take()
+
+	h.fake.Pause() // l'utilisateur appuie sur Espace dans VLC
+	h.ticks(3)
+	got := controls(h.conn.take())
+	if len(got) == 0 || got[0].Action != protocol.ActionPause {
+		t.Fatalf("pause faite dans VLC en pleine lecture : non propagée (VS-029), controls = %+v", got)
+	}
+
+	// 2. Seek fait à la souris dans la barre de VLC, même régime.
+	h = newHarness(t)
+	h.openFile("ep1.mkv", 7200)
+	h.connect(h.playing(1000))
+	h.fake.SeekTo(1000)
+	h.fake.Play()
+	h.ticks(2)
+	h.conn.take()
+	h.churn(20)
+	h.conn.take()
+
+	target := h.fake.Position() + 300
+	h.fake.SeekTo(target)
+	h.ticks(3)
+	got = controls(h.conn.take())
+	if len(got) == 0 || got[0].Action != protocol.ActionSeek {
+		t.Fatalf("seek fait dans VLC en pleine lecture : non propagé (VS-029), controls = %+v", got)
+	}
+	if math.Abs(got[0].PositionSec-target) > 1 {
+		t.Fatalf("position du control = %v, VLC à %v", got[0].PositionSec, target)
+	}
+
+	// 3. L'anti-boucle, elle, reste : ce que le moteur commande lui-même
+	// (pause + seek de la salle) ne doit JAMAIS revenir comme action utilisateur.
+	h = newHarness(t)
+	h.openFile("ep1.mkv", 7200)
+	h.connect(h.playing(100))
+	h.fake.SeekTo(100)
+	h.fake.Play()
+	h.ticks(2)
+	h.churn(10)
+	h.conn.take()
+
+	h.server(protocol.TypeRoomState, h.paused(400))
+	h.ticks(12)
+	if c := controls(h.conn.take()); len(c) != 0 {
+		t.Fatalf("boucle : le moteur renvoie sa propre correction %+v", c)
+	}
+}
+
 func TestResyncSurWelcomeRejoin(t *testing.T) {
 	h := newHarness(t)
 	h.openFile("ep1.mkv", 3600)
