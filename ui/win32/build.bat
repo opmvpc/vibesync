@@ -72,8 +72,10 @@ echo [test] compilation
 if errorlevel 1 exit /b 1
 echo [test] execution
 "%ROOT%build\vibesync_tests.exe" "%VECTORS%"
-if errorlevel 1 (
-  echo [test] ECHEC
+rem `if errorlevel 1` est FAUX pour un code negatif : cmd compare en signe, et
+rem un crash Windows (0xC0000135 = -1073741515) passait pour un succes.
+if not "%errorlevel%"=="0" (
+  echo [test] ECHEC ^(code %errorlevel%^)
   exit /b 1
 )
 echo [test] OK
@@ -84,10 +86,16 @@ echo [asan] compilation
 "%CC%" %STD% %WARN% %INC% %TESTINC% -O1 -g -fsanitize=address -fno-omit-frame-pointer -o "%ROOT%build\vibesync_tests_asan.exe" %CORE% %TESTS% %LIBS%
 if errorlevel 1 exit /b 1
 echo [asan] execution
-set "PATH=C:\Users\thibs\tools\llvm-mingw\bin;%PATH%"
+rem La DLL du runtime ASan n'est pas dans <toolchain>\bin (binaires de l'hote)
+rem mais dans <toolchain>\x86_64-w64-mingw32\bin. On la localise depuis %CC%,
+rem chemin absolu ou nom resolu par le PATH : marche quel que soit l'hote.
+set "CCFULL=%CC%"
+for /f "delims=" %%D in ('where "%CC%" 2^>nul') do set "CCFULL=%%D"
+for %%D in ("%CCFULL%") do set "LLVMROOT=%%~dpD.."
+set "PATH=%LLVMROOT%\x86_64-w64-mingw32\bin;%LLVMROOT%\bin;%PATH%"
 "%ROOT%build\vibesync_tests_asan.exe" "%VECTORS%"
-if errorlevel 1 (
-  echo [asan] ECHEC
+if not "%errorlevel%"=="0" (
+  echo [asan] ECHEC ^(code %errorlevel%^)
   exit /b 1
 )
 echo [asan] OK
