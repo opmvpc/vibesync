@@ -1,6 +1,6 @@
 # STATUS — vibesync
 
-*Dernière mise à jour : 2026-08-07 — **ADR-010 intégralement livré***
+*Dernière mise à jour : 2026-08-07 — **v0.2.1 publiée** (VS-029 clos, première .app)*
 
 ## Où on en est
 
@@ -67,11 +67,15 @@ chemins Gatekeeper dont Sequoia). Publiée au prochain tag (v0.2.1).
 
 ## Prochaine action
 
-1. Tag v0.2.1 (premier tag qui publie aussi la .app) — VS-029 est clos.
-2. Reliquats : aligner internal/vlc/launch.go sur les 9 nouveaux drapeaux VLC
-   du C ; captures mac du guide amis ; retours de ini_flush ignorés
-   (durcissement) ; VS-035 ; revérifier le piège one-instance sur un vrai PC
-   x86_64 (non reproductible isolément sur VLC ARM64).
+**v0.2.1 est publiée** (tag sur 769aca1, CI verte, release avec vibesync.exe
+258 Ko + VibeSync-macos-arm64.zip 311 Ko — la première .app). Serveur prod
+redéployé (Coolify healthy, sonde OK depuis la VM).
+
+Reliquats, par ordre d'intérêt : aligner internal/vlc/launch.go sur les 9
+drapeaux VLC du C ; captures mac du guide amis ; retours de ini_flush ignorés
+(durcissement) ; VS-035 ; revérifier le piège one-instance sur un vrai PC
+x86_64 (non reproductible isolément sur VLC ARM64). VS-020 (overlay OSD)
+attend toujours le PC Windows.
 
 ## Repères
 
