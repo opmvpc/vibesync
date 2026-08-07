@@ -51,6 +51,24 @@ jobs:
           name: vibesync-windows
           path: ui/win32/build/vibesync.exe
 
+  client-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Suite C portable (asan+ubsan, core/tests + 13 vecteurs)
+        run: ./scripts/test-core-macos.sh
+      - name: swift test (moteur Swift wrapper + API C, 41 tests)
+        run: swift test
+      - name: Build release + budget taille (ADR-007/008, < 10 Mo)
+        run: |
+          ./scripts/build-macos.sh
+          size=$(du -sk ui/macos/build/VibeSync.app | cut -f1)
+          echo "VibeSync.app : ${size} Ko"
+          if [ "$size" -gt 10240 ]; then
+            echo "budget 10 Mo dépassé" >&2
+            exit 1
+          fi
+
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [qa-go, client-windows]
@@ -70,5 +88,6 @@ jobs:
             --title "vibesync $GITHUB_REF_NAME" vibesync.exe
 
 # Le serveur est construit par Coolify depuis le Dockerfile du repo.
-# Le client macOS (ui/macos) sera buildé sur le Mac (voir docs/build-macos.md) ;
-# un job macos-latest pourra être ajouté quand le build y sera reproductible.
+# Le client macOS (ui/macos) est couvert par le job client-macos ci-dessus ;
+# la release ne dépend pas de lui (aucune release n'embarque le .app pour
+# l'instant — voir docs/research/2026-08-07-vs034-ci-macos.md).

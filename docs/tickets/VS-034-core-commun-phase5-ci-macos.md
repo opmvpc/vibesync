@@ -16,11 +16,18 @@ ADR-010. Non-régression transversale : mêmes vecteurs, même C, deux toolchain
 
 ## Critères d'acceptation
 
-- [ ] Job `client-macos` : compile VSCore + `test_core.c`, rejoue les 13
+- [x] Job `client-macos` : compile VSCore + `test_core.c`, rejoue les 13
       vecteurs, puis `swift test` et `scripts/build-macos.sh`
-- [ ] Budget taille vérifié pour le .app (< 10 Mo)
+- [x] Budget taille vérifié pour le .app (< 10 Mo — garde-fou 10 240 Ko dans
+      le job, mesuré 1 124 Ko)
 - [ ] La CI reste verte sur les deux OS ; temps de job raisonnable (< 5 min)
+      — **à confirmer au premier run**
 
 ## Journal du ticket
 
 - 2026-08-06 : créé (ADR-010).
+- 2026-08-07 : job écrit (agent Sonnet, YAML récupéré après 2 stalls sur les
+  vérifications locales ; commandes revalidées par l'orchestrateur : 878
+  checks C, 41/41 Swift, bundle 1 124 Ko). Release inchangée (n'embarque
+  toujours que l'exe Windows — .app en release = chantier séparé,
+  signature/notarisation à trancher). Premier run CI à confirmer.
