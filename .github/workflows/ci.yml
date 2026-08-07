@@ -68,10 +68,36 @@ jobs:
             echo "budget 10 Mo dépassé" >&2
             exit 1
           fi
+      # build-macos.sh signe déjà le bundle en ad hoc (codesign --force --sign -)
+      # mais tolère un échec de signature. En CI on ne tolère rien : la .app
+      # distribuée DOIT être signée, sinon Gatekeeper la refuse même après un
+      # clic droit → Ouvrir. On vérifie donc au lieu de resigner.
+      - name: Vérifier la signature ad hoc et l'architecture
+        run: |
+          codesign --verify --deep --strict --verbose=2 ui/macos/build/VibeSync.app
+          codesign -dv ui/macos/build/VibeSync.app 2>&1 | grep -q "Signature=adhoc"
+          archs=$(lipo -archs ui/macos/build/VibeSync.app/Contents/MacOS/VibeSync)
+          echo "architecture : $archs"
+          case " $archs " in
+            *" arm64 "*) ;;
+            *) echo "binaire non arm64 : $archs" >&2; exit 1 ;;
+          esac
+      # ditto (et pas zip) : seul lui préserve les attributs étendus, les droits
+      # d'exécution et la signature d'un bundle .app à travers l'archive.
+      - name: Archiver la .app pour la release (tags v* uniquement)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          ditto -c -k --keepParent ui/macos/build/VibeSync.app VibeSync-macos-arm64.zip
+          ls -l VibeSync-macos-arm64.zip
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: vibesync-macos
+          path: VibeSync-macos-arm64.zip
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [qa-go, client-windows]
+    needs: [qa-go, client-windows, client-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -80,14 +106,30 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: vibesync-windows
-      - name: Créer la release et attacher l'exe
+      - uses: actions/download-artifact@v4
+        with:
+          name: vibesync-macos
+      # Un seul job crée la release et y attache les deux clients : pas de
+      # course entre deux jobs sur la même release. Le `gh release view` rend
+      # l'étape rejouable (re-run d'un tag déjà publié : on remplace les
+      # fichiers au lieu d'échouer sur « release already exists »).
+      - name: Créer la release et attacher les clients
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --generate-notes \
-            --title "vibesync $GITHUB_REF_NAME" vibesync.exe
+          set -eu
+          files="vibesync.exe VibeSync-macos-arm64.zip"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            # shellcheck disable=SC2086
+            gh release upload "$GITHUB_REF_NAME" --clobber $files
+          else
+            # shellcheck disable=SC2086
+            gh release create "$GITHUB_REF_NAME" --generate-notes \
+              --title "vibesync $GITHUB_REF_NAME" $files
+          fi
 
 # Le serveur est construit par Coolify depuis le Dockerfile du repo.
-# Le client macOS (ui/macos) est couvert par le job client-macos ci-dessus ;
-# la release ne dépend pas de lui (aucune release n'embarque le .app pour
-# l'instant — voir docs/research/2026-08-07-vs034-ci-macos.md).
+# Les deux clients sont publiés sur la même release GitHub (tags v*) :
+# vibesync.exe (Windows, non signé) et VibeSync-macos-arm64.zip (macOS Apple
+# Silicon, signature ad hoc, sans notarisation — les amis passent par
+# clic droit → Ouvrir la première fois, cf. docs/guide-amis-macos.md).

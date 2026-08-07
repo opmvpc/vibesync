@@ -15,22 +15,47 @@ qui reste calé sur la même image chez tout le monde.
 
 ## Installation
 
-1. Télécharge `VibeSync.app` (ou l'archive qui la contient) depuis les
-   releases GitHub : `https://github.com/opmvpc/vibesync/releases/latest`
+1. Va sur la page des versions :
+   `https://github.com/opmvpc/vibesync/releases/latest`
    *(lien à confirmer par la personne qui t'a envoyé ce guide)*.
-2. Déplace `VibeSync.app` dans `/Applications` (ou où tu veux).
+2. Dans la section **Assets**, télécharge le fichier
+   **`VibeSync-macos-arm64.zip`** (celui pour Mac ; le `.exe` à côté, c'est la
+   version Windows, elle ne te sert à rien).
+3. Double-clique le `.zip` dans ton dossier **Téléchargements** : il se
+   décompresse et te laisse **VibeSync.app**.
+4. Glisse **VibeSync.app** dans ton dossier **Applications** — pas
+   obligatoire, mais tu la retrouveras plus facilement la prochaine fois.
 
-## Contourner Gatekeeper (première fois seulement)
+## Le premier lancement (à faire une seule fois)
 
-L'app n'est pas signée par un compte développeur Apple ni notarisée. Un
-double-clic normal sera refusé par macOS la toute première fois. La manœuvre :
+L'app est bricolée à la maison : elle n'est pas signée par un compte
+développeur Apple. macOS se méfie donc au tout premier lancement, et **un
+simple double-clic sera refusé**. C'est normal, et il y a deux façons de lui
+dire « oui, je sais ce que je fais ». Essaie la première ; si ton Mac est
+récent (macOS Sequoia ou plus), ce sera la seconde.
 
-1. **Clic droit** (ou Ctrl+clic) sur **VibeSync.app** → **Ouvrir**.
-2. Une boîte de dialogue prévient que l'éditeur n'est pas identifié → clique
-   à nouveau **Ouvrir**.
+**Méthode 1 — clic droit → Ouvrir**
 
-C'est à faire **une seule fois** : tous les lancements suivants se font
-normalement, par simple double-clic.
+1. **Clic droit** (ou Ctrl + clic) sur **VibeSync.app** → **Ouvrir** dans le
+   menu qui apparaît.
+2. Une fenêtre prévient que l'éditeur n'est pas identifié : clique le bouton
+   **Ouvrir**.
+
+**Méthode 2 — passer par les Réglages Système**
+
+Si le menu ne propose pas d'**Ouvrir**, ou si le message refuse l'app sans te
+laisser le choix :
+
+1. Double-clique **VibeSync.app** une première fois et laisse macOS refuser
+   (c'est cet essai qui déclenche la suite).
+2. Ouvre le menu  → **Réglages Système** → **Confidentialité et sécurité**.
+3. Descends jusqu'à la section **Sécurité** : une ligne mentionne VibeSync.
+   Clique **Ouvrir quand même**.
+4. Confirme (mot de passe ou Touch ID si ton Mac le demande), puis clique
+   **Ouvrir** dans la dernière fenêtre.
+
+Dans les deux cas, c'est à faire **une seule fois** : ensuite, VibeSync
+s'ouvre d'un simple double-clic comme n'importe quelle autre app.
 
 ![Écran connexion](captures/mac-connexion.png)
 
@@ -57,8 +82,10 @@ normalement, par simple double-clic.
 ## Dépannage
 
 **« VibeSync.app est endommagée et ne peut pas être ouverte »** (au lieu du
-message Gatekeeper normal) — arrive si le fichier a perdu son attribut de
-quarantaine dans un état bizarre après téléchargement. Dans le Terminal :
+message Gatekeeper normal) — commence par redézipper l'archive avec le
+décompresseur intégré de macOS (double-clic sur le `.zip`) : certains outils
+tiers (The Unarchiver, WinZip...) abîment l'app en la décompressant. Si le
+message persiste, dans le Terminal :
 
 ```sh
 xattr -dr com.apple.quarantine /Applications/VibeSync.app

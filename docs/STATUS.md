@@ -37,11 +37,18 @@ normalisation NFC dans name_eq_ci posix), bannière de versions fausse sur les
 **Phase 5 livrée le 07 (b9dfa78)** : job CI client-macos (suite C asan+ubsan,
 swift test, budget .app) — les 3 jobs verts ensemble. ADR-010 : FAIT.
 
-**Environnement Windows local en préparation** : UTM installé (+ utmctl), ISO
-Windows 11 ARM64 25H2 française officielle en téléchargement vers ~/Downloads
-→ VM à monter pour retrouver build.bat/asan/tests réels Windows (M1 Pro : pas de
-virtualisation imbriquée, donc pas de Windows Sandbox dans la VM ; snapshots
-UTM en guise de jetable). VMware Fusion impossible sans compte Broadcom.
+**VM Win11 installée (UTM)** : pilotage par code uniquement — qemu-guest-agent
+via `utmctl exec/file push/file pull` (exec en SYSTEM sans stdout → fichiers ;
+pull impossible sur fichier ouvert → copier d'abord), bootstrap OpenSSH Server
+en cours (clé `~/.ssh/vibesync_vm_ed25519`, IP 192.168.64.2). Ensuite : script
+toolchain (Go, llvm-mingw, git, VLC) → build.bat test + asan dans la VM.
+Le pilotage écran (souris relative, clavier BEFR) est abandonné : trop cher.
+
+**Release .app tranchée par Thibault : signature ad hoc** (pas de compte Apple
+Developer). CI adaptée : vérif dure de la signature dans client-macos, zip
+`ditto` sur tag v*, release à 3 needs qui attache exe Windows + .app macOS en
+un seul `gh release create` (rejouable). Guides amis/build mis à jour (2
+chemins Gatekeeper dont Sequoia). Publiée au prochain tag (v0.2.1).
 
 ## Chantiers
 
@@ -56,12 +63,13 @@ UTM en guise de jetable). VMware Fusion impossible sans compte Broadcom.
 
 ## Prochaine action
 
-1. Monter la VM Win11 (UTM installé + ISO dans ~/Downloads) → dérouler les
-   critères Windows-only de VS-029 (repro vlcrc Syncplay, détection d'action
-   réelle, séance 2 clients C) puis tag v0.2.1.
+1. Finir le bootstrap SSH de la VM → installer la toolchain par script →
+   dérouler les critères Windows-only de VS-029 (repro vlcrc Syncplay,
+   détection d'action réelle, séance 2 clients C) puis tag v0.2.1 (premier tag
+   qui publie aussi la .app).
 2. Reliquats : aligner internal/vlc/launch.go sur les 9 nouveaux drapeaux VLC
    du C ; captures mac du guide amis ; retours de ini_flush ignorés
-   (durcissement) ; VS-035 ; .app dans les releases (signature à trancher).
+   (durcissement) ; VS-035.
 
 ## Repères
 

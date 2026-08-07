@@ -82,6 +82,20 @@ peut aussi retirer la mise en quarantaine :
 xattr -dr com.apple.quarantine /Applications/VibeSync.app
 ```
 
+Sur macOS Sequoia et plus récent, le clic droit → Ouvrir ne suffit plus
+toujours : le chemin est alors Réglages Système → Confidentialité et sécurité →
+**Ouvrir quand même**, après un premier double-clic refusé. Les deux chemins
+sont décrits pour les amis dans `docs/guide-amis-macos.md`.
+
+### Ce que publie la CI (tags `v*`)
+
+Le job `client-macos` de `.github/workflows/ci.yml` archive le bundle avec
+`ditto -c -k --keepParent` (le seul outil qui préserve les xattrs, le bit
+d'exécution et la signature d'une `.app`) sous le nom
+**`VibeSync-macos-arm64.zip`**, et le job `release` l'attache à la même release
+GitHub que `vibesync.exe`. Aucune notarisation : c'est un choix assumé (pas de
+compte Apple Developer), d'où la manœuvre Gatekeeper ci-dessus.
+
 ## 5. Utilisation
 
 1. Écran de connexion : serveur (`wss://…/ws`), pseudo, salle — mémorisés dans
