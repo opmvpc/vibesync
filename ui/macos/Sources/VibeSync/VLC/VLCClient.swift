@@ -20,7 +20,7 @@ public enum VLCError: Error {
     public var text: String {
         switch self {
         case .notFound:
-            return "VLC introuvable (installez VLC dans /Applications ou renseignez VIBESYNC_VLC)"
+            return "VLC introuvable (installez VLC dans /Applications, ou indiquez son chemin dans les Réglages)"
         case .spawn(let m):
             return "lancement de VLC impossible : \(m)"
         case .unreachable(let m):

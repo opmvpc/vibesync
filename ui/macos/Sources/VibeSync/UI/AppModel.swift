@@ -8,6 +8,7 @@
 import AppKit
 import Combine
 import Foundation
+import UniformTypeIdentifiers
 import VSCore
 
 public struct ChatLine: Identifiable {
@@ -54,6 +55,10 @@ public final class AppModel: ObservableObject {
     // Dossiers médias et bandeaux associés (VS-026).
     @Published public var showSettings: Bool = false
     @Published public var mediaDirs: [String] = []
+    /// Chemin de VLC réglé à la main (vide = détection automatique) et l'état
+    /// affiché sous le champ. Parité avec le champ du panneau Windows.
+    @Published public var vlcPath: String = ""
+    @Published public var vlcStatus: VLCPathStatus = .undetected
     /// « X regarde <fichier> — cliquer pour l'ouvrir chez vous ».
     @Published public var watchWho: String = ""
     @Published public var watchFile: String = ""
@@ -136,6 +141,8 @@ public final class AppModel: ObservableObject {
         // immédiatement, sans attendre l'expiration de la connexion zombie.
         sessionToken = Preferences.sessionToken(store)
         mediaDirs = Preferences.mediaDirs(store)
+        vlcPath = Preferences.vlcPath(store)
+        vlcStatus = VLCLauncher.pathStatus(setting: vlcPath)
         rememberPassword = Preferences.rememberPassword(store)
         if let auto = auto {
             // Pilote : tout vient de l'environnement, et surtout PAS du
@@ -536,6 +543,46 @@ public final class AppModel: ObservableObject {
         Preferences.setMediaDirs(mediaDirs, store)
     }
 
+    // MARK: - Chemin de VLC
+
+    /// Le champ a changé (frappe ou retour du sélecteur) : on enregistre et on
+    /// recalcule l'état affiché. Un accès disque par frappe, comme le client
+    /// Windows — c'est un stat sur un chemin, pas une recherche.
+    public func vlcPathChanged() {
+        Preferences.setVLCPath(vlcPath, store)
+        refreshVLCStatus()
+    }
+
+    public func refreshVLCStatus() {
+        let status = VLCLauncher.pathStatus(setting: vlcPath)
+        if status != vlcStatus {
+            vlcStatus = status
+        }
+    }
+
+    /// « Parcourir… » : l'utilisateur désigne VLC.app ou un binaire nu. On
+    /// stocke EXACTEMENT ce qu'il a choisi ; la traversée d'un bundle vers son
+    /// exécutable est faite au lancement (VLCLauncher.settingBinary), pour que
+    /// le champ reste lisible et corrigeable à la main.
+    public func browseVLC() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        // Un bundle .app est un dossier : il ne doit surtout pas être traversé,
+        // sinon on ne peut plus le sélectionner, seulement entrer dedans.
+        panel.treatsFilePackagesAsDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.title = "Choisir VLC"
+        panel.message = "Sélectionnez VLC.app, ou directement le binaire vlc."
+        panel.prompt = "Choisir"
+        panel.allowedContentTypes = [.application, .unixExecutable, .executable]
+        if panel.runModal() == NSApplication.ModalResponse.OK, let url = panel.url {
+            vlcPath = url.path
+            vlcPathChanged()
+        }
+    }
+
     // MARK: - Pilote du harnais de test réel
 
     /// Vrai si l'application est pilotée par l'environnement.
@@ -845,7 +892,7 @@ public final class AppModel: ObservableObject {
         mediaName = url.lastPathComponent
         mediaLabel = "lancement de VLC…"
 
-        VLCLauncher.launch(filePath: url.path) { [weak self] result in
+        VLCLauncher.launch(filePath: url.path, setting: vlcPath) { [weak self] result in
             guard let self = self else {
                 return
             }

@@ -33,15 +33,176 @@ public final class VLCProcess {
     }
 }
 
+/// Ce que l'interface a le droit de dire du chemin de VLC — l'équivalent du
+/// `settings_vlc_state` du client Windows (ui/win32/src/ui.c). Fonction pure du
+/// couple (réglage, disque) : c'est `VLCLauncher.pathStatus` qui le calcule, la
+/// vue ne fait que le peindre.
+public enum VLCPathStatus: Equatable {
+    /// Réglage vide, détection automatique réussie (le binaire retenu).
+    case detected(String)
+    /// Réglage vide et aucun VLC trouvé sur la machine.
+    case undetected
+    /// Réglage renseigné et exécutable (le binaire réellement lancé — pour un
+    /// bundle, celui qui est dedans).
+    case configured(String)
+    /// Réglage renseigné mais rien d'exécutable au bout : il sera IGNORÉ.
+    case invalid
+
+    public enum Severity {
+        case ok
+        case info
+        case warn
+        case error
+    }
+
+    public var severity: Severity {
+        switch self {
+        case .detected:
+            return .info
+        case .undetected:
+            return .warn
+        case .configured:
+            return .ok
+        case .invalid:
+            return .error
+        }
+    }
+
+    public var text: String {
+        switch self {
+        case .detected(let path):
+            return "VLC détecté : \(path)"
+        case .undetected:
+            return "Aucun VLC détecté sur cette machine : indiquez le chemin de VLC.app."
+        case .configured(let path):
+            return "VLC trouvé à ce chemin : \(path)"
+        case .invalid:
+            return "VLC introuvable à ce chemin — corrigez-le, ou videz le champ "
+                 + "pour revenir à la détection automatique."
+        }
+    }
+}
+
 public enum VLCLauncher {
 
     /// Variable d'environnement prioritaire (même nom que la référence Go).
     public static let envBinary = "VIBESYNC_VLC"
 
-    public static func locate() -> String? {
-        let forced = ProcessInfo.processInfo.environment[envBinary] ?? ""
+    /// Prédicat « ce chemin est un fichier exécutable ». Injecté dans les
+    /// fonctions de résolution pour que les tests n'aient pas besoin de disque.
+    public typealias ExistsFn = (String) -> Bool
+
+    // MARK: - Résolution du binaire
+    //
+    // ORDRE, identique au client Windows (ui/win32/src/main.c, apply_vlc_path) :
+    //
+    //   1. le réglage de l'utilisateur, s'il n'est pas vide ET s'il mène à un
+    //      exécutable ;
+    //   2. %VIBESYNC_VLC% / $VIBESYNC_VLC ;
+    //   3. les emplacements standards, puis le PATH.
+    //
+    // Le réglage passe donc DEVANT l'environnement. Sur Windows le même ordre
+    // est obtenu autrement (le réglage écrase la variable au démarrage, un
+    // réglage vide restituant la valeur héritée) ; ici rien n'est écrit dans
+    // l'environnement du processus, le réglage est simplement passé à `launch`.
+    //
+    // Conséquence pour le harnais de test réel (scripts/run-real-macos.sh) : il
+    // isole chaque instance par VIBESYNC_SUITE, donc leur réglage est vide et
+    // $VIBESYNC_VLC continue de commander. Vérifié : une UserDefaults ouverte
+    // sur une suite lit la valeur de la suite quand elle existe, et NON celle
+    // du domaine applicatif normal quand la suite est muette.
+
+    /// Binaire à lancer, tous critères confondus. `nil` : aucun VLC.
+    public static func binary(setting: String,
+                              env: [String: String] = ProcessInfo.processInfo.environment,
+                              exists: ExistsFn = isExecutableFile) -> String? {
+        // Un réglage invalide n'est pas fatal : on le laisse tomber et on
+        // retombe sur la détection (l'interface, elle, le signale en rouge).
+        if let configured = settingBinary(setting, exists: exists) {
+            return configured
+        }
+        return locate(env: env, exists: exists)
+    }
+
+    /// État à afficher sous le champ des Réglages, pour le réglage donné.
+    public static func pathStatus(setting: String,
+                                  env: [String: String] = ProcessInfo.processInfo.environment,
+                                  exists: ExistsFn = isExecutableFile) -> VLCPathStatus {
+        if setting.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            if let found = locate(env: env, exists: exists) {
+                return .detected(found)
+            }
+            return .undetected
+        }
+        if let configured = settingBinary(setting, exists: exists) {
+            return .configured(configured)
+        }
+        return .invalid
+    }
+
+    /// Binaire correspondant au réglage seul. `nil` si le réglage est vide, ou
+    /// s'il ne mène à aucun exécutable.
+    public static func settingBinary(_ setting: String, exists: ExistsFn = isExecutableFile) -> String? {
+        let path = normalize(setting)
+        if path.isEmpty {
+            return nil
+        }
+        let candidate = resolveBundle(path)
+        if exists(candidate) {
+            return candidate
+        }
+        // Un bundle renommé (« VLC 3.app ») ne porte plus le nom de son
+        // exécutable : on demande alors au bundle lui-même. Purement de
+        // rattrapage — le chemin nominal ci-dessus n'a pas besoin du disque.
+        if path.lowercased().hasSuffix(".app"),
+           let inside = Bundle(path: path)?.executableURL?.path,
+           exists(inside) {
+            return inside
+        }
+        return nil
+    }
+
+    /// Rogne, développe le `~` et retire les barres obliques finales — ce que
+    /// donne un copier-coller ou un glisser-déposer depuis le Finder.
+    public static func normalize(_ setting: String) -> String {
+        var path = setting.trimmingCharacters(in: .whitespacesAndNewlines)
+        if path.isEmpty {
+            return ""
+        }
+        path = (path as NSString).expandingTildeInPath
+        while path.count > 1 && path.hasSuffix("/") {
+            path.removeLast()
+        }
+        return path
+    }
+
+    /// Chemin nominal de l'exécutable d'un bundle : `…/VLC.app` →
+    /// `…/VLC.app/Contents/MacOS/VLC`. Tout le reste est rendu tel quel — un
+    /// binaire nu (`/opt/homebrew/bin/vlc`) est déjà ce qu'on veut exécuter.
+    /// Fonction pure : aucun accès disque, gelée par les tests.
+    public static func resolveBundle(_ path: String) -> String {
+        guard path.lowercased().hasSuffix(".app") else {
+            return path
+        }
+        let name = (path as NSString).lastPathComponent
+        let base = String(name.dropLast(4))  // « VLC.app » → « VLC »
+        if base.isEmpty {
+            return path
+        }
+        return path + "/Contents/MacOS/" + base
+    }
+
+    /// Détection automatique : l'environnement d'abord, puis les emplacements
+    /// standards. Ne connaît PAS le réglage — c'est ce qui permet à l'interface
+    /// d'afficher ce que donnerait un champ vide sans toucher au champ.
+    public static func locate(env: [String: String] = ProcessInfo.processInfo.environment,
+                              exists: ExistsFn = isExecutableFile) -> String? {
+        let forced = env[envBinary] ?? ""
         if !forced.isEmpty {
-            return isExecutableFile(forced) ? forced : nil
+            // Une variable qui pointe dans le vide reste une consigne
+            // explicite : on ne va pas chercher ailleurs derrière son dos.
+            let candidate = resolveBundle(normalize(forced))
+            return exists(candidate) ? candidate : nil
         }
         let home = NSHomeDirectory()
         let candidates = [
@@ -51,31 +212,42 @@ public enum VLCLauncher {
             "/opt/homebrew/bin/vlc",
             "/usr/local/bin/vlc",
         ]
-        for path in candidates where isExecutableFile(path) {
+        for path in candidates where exists(path) {
             return path
         }
         // Dernier recours : le PATH.
-        for dir in (ProcessInfo.processInfo.environment["PATH"] ?? "").split(separator: ":") {
+        for dir in (env["PATH"] ?? "").split(separator: ":") {
             let path = String(dir) + "/vlc"
-            if isExecutableFile(path) {
+            if exists(path) {
                 return path
             }
         }
         return nil
     }
 
-    private static func isExecutableFile(_ path: String) -> Bool {
+    /// Fichier régulier ET exécutable par nous. Le bit d'exécution compte :
+    /// sans lui `Process.run()` échouerait plus loin, avec un message bien plus
+    /// obscur qu'un « VLC introuvable à ce chemin » dans les Réglages.
+    public static func isExecutableFile(_ path: String) -> Bool {
         var isDir: ObjCBool = false
-        let exists = FileManager.default.fileExists(atPath: path, isDirectory: &isDir)
-        return exists && !isDir.boolValue
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: path, isDirectory: &isDir), !isDir.boolValue else {
+            return false
+        }
+        return fm.isExecutableFile(atPath: path)
     }
 
     /// Lance VLC sur `filePath` et attend que son interface HTTP réponde.
     /// Le rappel arrive sur la file principale.
+    ///
+    /// `setting` est le chemin réglé dans les Réglages (vide = détection
+    /// automatique) ; il est passé explicitement plutôt que relu ici, pour que
+    /// le lanceur reste sans état.
     public static func launch(filePath: String,
+                              setting: String = "",
                               timeoutSec: Double = 20,
                               completion: @escaping (Result<VLCProcess, VLCError>) -> Void) {
-        guard let binary = locate() else {
+        guard let binary = binary(setting: setting) else {
             DispatchQueue.main.async { completion(.failure(.notFound)) }
             return
         }

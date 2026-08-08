@@ -93,13 +93,18 @@ xattr -dr com.apple.quarantine /Applications/VibeSync.app
 
 puis relance normalement (clic droit → Ouvrir si besoin).
 
-**« VLC introuvable »** — vibesync cherche VLC dans `/Applications/VLC.app`.
-Deux solutions :
+**« VLC introuvable »** — vibesync cherche VLC dans `/Applications/VLC.app`
+(et quelques autres emplacements habituels). Deux solutions :
 - installer VLC normalement à cet emplacement si ce n'est pas déjà fait ;
-- si VLC est ailleurs, lancer l'app depuis un Terminal avec la variable
-  `VIBESYNC_VLC` pointant vers le binaire VLC :
+- si VLC est ailleurs : **Réglages… → VLC → Parcourir…**, et sélectionne
+  `VLC.app` (ou directement le binaire `vlc`). La ligne sous le champ te dit
+  tout de suite si le chemin est bon. Vider le champ revient à la détection
+  automatique.
+
+  Pour un lancement scripté, la variable d'environnement `VIBESYNC_VLC` marche
+  toujours — le réglage de l'app, lui, passe devant :
   ```sh
-  VIBESYNC_VLC=/chemin/vers/VLC open /Applications/VibeSync.app
+  VIBESYNC_VLC=/chemin/vers/VLC.app open /Applications/VibeSync.app
   ```
 
 **« Fichiers différents entre amis »** (toast d'avertissement) — le serveur

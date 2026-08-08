@@ -109,8 +109,14 @@ compte Apple Developer), d'où la manœuvre Gatekeeper ci-dessus.
    synchronisés par le serveur ; l'indicateur de drift à droite montre l'écart
    courant avec la salle.
 
-Pour forcer le chemin de VLC : `VIBESYNC_VLC=/chemin/vers/VLC open …` ou
-exporter la variable avant de lancer l'app depuis un terminal.
+Pour forcer le chemin de VLC, deux voies, dans cet ordre de priorité :
+
+1. **Réglages… → VLC** : champ + **Parcourir…** (VLC.app ou binaire nu), avec
+   une ligne d'état sous le champ. Vide = détection automatique. C'est le
+   pendant du champ « Chemin de VLC » du client Windows.
+2. `VIBESYNC_VLC=/chemin/vers/VLC.app open …`, ou la variable exportée avant de
+   lancer l'app depuis un terminal — utilisée seulement si le réglage est vide
+   (c'est le cas des instances du harnais, isolées par `VIBESYNC_SUITE`).
 
 ## 6. Organisation du paquet (depuis VS-031)
 
@@ -119,7 +125,7 @@ référence pas de sources hors racine du paquet). Toutes les commandes `swift`
 partent donc de la racine :
 
 ```sh
-swift test               # 34 tests, dont le rejeu des 13 vecteurs via l'API C
+swift test               # 55 tests, dont le rejeu des 14 vecteurs via l'API C
 swift build -c release
 ./scripts/build-macos.sh # bundle .app signé ad hoc + version injectée
 ./scripts/test-core-macos.sh  # suite C portable (asan+ubsan) hors SwiftPM

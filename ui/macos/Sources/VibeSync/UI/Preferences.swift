@@ -30,6 +30,10 @@ public enum Preferences {
     public static let keySession = "vibesync.session"
     public static let keyRememberPassword = "vibesync.rememberPassword"
     public static let keyMediaDirs = "vibesync.mediaDirs"
+    /// Chemin de VLC choisi par l'utilisateur (binaire ou bundle `.app`).
+    /// Vide = détection automatique. Pendant du réglage `vlc` du vibesync.ini
+    /// du client Windows (ui/win32/src/main.c, `apply_vlc_path`).
+    public static let keyVLC = "vibesync.vlc"
 
     /// Nombre de dossiers médias retenus (même borne que le client Windows).
     public static let maxMediaDirs = 8
@@ -122,6 +126,23 @@ public enum Preferences {
             }
         }
         return out
+    }
+
+    // MARK: - Chemin de VLC (parité avec le champ du client Windows)
+
+    /// Chemin de VLC réglé par l'utilisateur, rogné. Vide = détection
+    /// automatique : c'est `VLCLauncher.locate()` qui tranchera.
+    public static func vlcPath(_ store: PrefStore) -> String {
+        let raw = store.string(forKey: keyVLC) ?? ""
+        return raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Enregistre le chemin réglé. Vide (ou blanc) est une valeur légitime —
+    /// « rends-moi la détection automatique » — et non un effacement de clé :
+    /// on écrit la chaîne vide plutôt que de retirer l'entrée, pour que la
+    /// relecture donne exactement ce que l'utilisateur voit dans le champ.
+    public static func setVLCPath(_ path: String, _ store: PrefStore) {
+        store.set(path.trimmingCharacters(in: .whitespacesAndNewlines), forKey: keyVLC)
     }
 
     public static func defaultMediaDirs() -> [String] {
