@@ -6,6 +6,10 @@
 //	assets/png/icon-{16,24,32,48,64,128,256}.png
 //	assets/vibesync.ico   (conteneur ICO, PNG embarqués — valides depuis Vista)
 //
+// Avec -iconset <dir>, produit à la place les 10 PNG d'un .iconset macOS,
+// chacun rendu nativement depuis le vecteur (aucun rééchantillonnage), à
+// assembler ensuite sur un Mac : iconutil -c icns <dir> -o VibeSync.icns
+//
 // Principes (ADR-008, philosophie handmade) :
 //   - aucune dépendance : image, image/draw, image/png uniquement ;
 //   - rastérisation maison par fonctions de distance signée (SDF) sur des
@@ -17,6 +21,8 @@
 //     bit à bit à chaque exécution.
 //
 // Usage : go run ./tools/genicon [-out assets]
+//
+//	go run ./tools/genicon -iconset VibeSync.iconset
 package main
 
 import (
@@ -68,6 +74,26 @@ var (
 )
 
 var icoSizes = []int{16, 24, 32, 48, 64, 128, 256}
+
+// icnsFiles — les 10 représentations que réclame `iconutil -c icns`, avec leur
+// côté en pixels. Plusieurs noms partagent la même taille (icon_16x16@2x et
+// icon_32x32 font tous deux 32 px) : le rendu n'est fait qu'une fois par taille
+// et les octets sont réutilisés tels quels.
+var icnsFiles = []struct {
+	name string
+	size int
+}{
+	{"icon_16x16.png", 16},
+	{"icon_16x16@2x.png", 32},
+	{"icon_32x32.png", 32},
+	{"icon_32x32@2x.png", 64},
+	{"icon_128x128.png", 128},
+	{"icon_128x128@2x.png", 256},
+	{"icon_256x256.png", 256},
+	{"icon_256x256@2x.png", 512},
+	{"icon_512x512.png", 512},
+	{"icon_512x512@2x.png", 1024},
+}
 
 // ---------------------------------------------------------------------------
 // Vecteurs et distances signées
@@ -309,6 +335,16 @@ func minU8(a, b uint8) uint8 {
 	return b
 }
 
+// encodePNG rend l'icône à la taille demandée et renvoie le PNG encodé.
+func encodePNG(size int) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := png.Encoder{CompressionLevel: png.BestCompression}
+	if err := enc.Encode(&buf, render(size)); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
 // ---------------------------------------------------------------------------
 // Conteneur ICO
 // ---------------------------------------------------------------------------
@@ -349,10 +385,56 @@ func writeICO(path string, images [][]byte, sizes []int) error {
 }
 
 // ---------------------------------------------------------------------------
+// Jeu .iconset macOS
+// ---------------------------------------------------------------------------
+
+// writeIconset remplit dir avec les 10 PNG attendus par iconutil. Aucun
+// rééchantillonnage : chaque taille distincte est rastérisée depuis le vecteur.
+func writeIconset(dir string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	var cachedSizes []int
+	var cachedBlobs [][]byte
+	for _, f := range icnsFiles {
+		var data []byte
+		for i, s := range cachedSizes {
+			if s == f.size {
+				data = cachedBlobs[i]
+				break
+			}
+		}
+		if data == nil {
+			var err error
+			if data, err = encodePNG(f.size); err != nil {
+				return err
+			}
+			cachedSizes = append(cachedSizes, f.size)
+			cachedBlobs = append(cachedBlobs, data)
+		}
+		name := filepath.Join(dir, f.name)
+		if err := os.WriteFile(name, data, 0o644); err != nil {
+			return err
+		}
+		fmt.Printf("%-40s %4d px %8d o\n", name, f.size, len(data))
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
 
 func main() {
 	out := flag.String("out", "assets", "répertoire de sortie")
+	iconset := flag.String("iconset", "", "produire à la place un .iconset macOS dans ce répertoire")
 	flag.Parse()
+
+	if *iconset != "" {
+		if err := writeIconset(*iconset); err != nil {
+			fail(err)
+		}
+		fmt.Printf("\nassembler sur un Mac : iconutil -c icns %s -o ui/macos/Resources/VibeSync.icns\n", *iconset)
+		return
+	}
 
 	pngDir := filepath.Join(*out, "png")
 	if err := os.MkdirAll(pngDir, 0o755); err != nil {
@@ -361,13 +443,10 @@ func main() {
 
 	blobs := make([][]byte, 0, len(icoSizes))
 	for _, size := range icoSizes {
-		img := render(size)
-		var buf bytes.Buffer
-		enc := png.Encoder{CompressionLevel: png.BestCompression}
-		if err := enc.Encode(&buf, img); err != nil {
+		data, err := encodePNG(size)
+		if err != nil {
 			fail(err)
 		}
-		data := buf.Bytes()
 		name := filepath.Join(pngDir, fmt.Sprintf("icon-%d.png", size))
 		if err := os.WriteFile(name, data, 0o644); err != nil {
 			fail(err)

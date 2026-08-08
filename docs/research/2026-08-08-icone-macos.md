@@ -6,14 +6,20 @@ par `tools/genicon`. On comble le trou côté mac, avec le même asset source
 `assets/icon.svg` et les mêmes contraintes ADR-008 : zéro dépendance, zéro
 installation, outils système uniquement.
 
-## Méthode de rendu retenue
+> **Mise à jour du même jour — la réserve « WebKit » est levée.** `tools/genicon` a
+> reçu un flag `-iconset` et produit désormais les 10 PNG lui-même ; le `.icns`
+> committé est celui-là. Le rendu WebKit décrit ci-dessous n'a plus qu'une valeur
+> historique (il reste en annexe comme trace de la première passe). Voir
+> [Regénération](#regénération-la-procédure-actuelle) pour la procédure en vigueur.
+
+## Méthode de rendu retenue (première passe, historique)
 
 **Swift + WebKit** (`WKWebView.takeSnapshot`), le SVG inliné dans une page à fond
 transparent. Les deux autres pistes ont été écartées après mesure :
 
 | Piste | Verdict |
 |---|---|
-| `tools/genicon` (Go, rastériseur SDF maison) | **Impossible ici** : aucune toolchain Go sur ce Mac (`go` absent, pas de mise/asdf/brew). C'est pourtant l'outil canonique du projet. |
+| `tools/genicon` (Go, rastériseur SDF maison) | **Impossible sur ce Mac** : aucune toolchain Go (`go` absent, pas de mise/asdf/brew). C'est pourtant l'outil canonique du projet — repris depuis via la VM Windows, voir plus bas. |
 | `qlmanage -t -s 1024` | **Infidèle** : QuickLook applique sa décoration de vignette — ombre portée + inset. Le squircle n'occupe que ~80 % du cadre et déborde d'une ombre grise. Inutilisable. |
 | **Swift + WebKit** | **Retenu** : plein cadre, alpha préservé, géométrie exacte. |
 
@@ -54,22 +60,58 @@ asset**, exactement comme `assets/vibesync.ico` côté Windows.
 
 ## Poids
 
-| | |
-|---|---|
-| `ui/macos/Resources/VibeSync.icns` | **950 259 o** (0,91 Mio) |
-| `VibeSync.app` (bundle complet) | **2,0 Mio** (binaire 1 142 608 o + icône) |
-| Budget CI (ADR-007/008) | 10 Mio → **20 % consommé** |
+| | rendu WebKit | rendu `genicon` |
+|---|---|---|
+| `ui/macos/Resources/VibeSync.icns` | 950 259 o (0,91 Mio) | **356 922 o** (0,34 Mio) |
+| `VibeSync.app` (bundle complet) | 2,0 Mio | **1,4 Mio** (binaire 1 142 608 o + icône) |
+| Budget CI (ADR-007/008) | 10 Mio → 20 % | 10 Mio → **14 % consommé** |
 
-Sous la barre du méga-octet, mais il y a une marge connue : **WebKit trame ses
-dégradés** (bruit ±1 LSB), ce qui plombe la compression PNG. Mesure faite avec un
-`.icns` d'essai ne contenant qu'une entrée 256 : 22 455 o depuis le PNG `genicon`
-(non tramé) contre 49 500 o depuis le PNG WebKit — **×2,2**. Un `.icns` rendu par
-`genicon` pèserait donc de l'ordre de 430 Ko.
+La cause était identifiée dès la première passe : **WebKit trame ses dégradés**
+(bruit ±1 LSB), ce qui plombe la compression PNG. Mesure faite alors avec un `.icns`
+d'essai ne contenant qu'une entrée 256 : 22 455 o depuis le PNG `genicon` (non tramé)
+contre 49 500 o depuis le PNG WebKit — **×2,2**, d'où une prévision « de l'ordre de
+430 Ko » pour un `.icns` `genicon`. Le passage effectif à `genicon` donne **356 922 o**,
+soit **−62,4 %** — mieux que prévu (le tramage coûte proportionnellement plus cher aux
+grandes tailles, qui dominent le fichier).
 
 À noter : `iconutil` **ré-encode systématiquement** les PNG qu'on lui donne (via
 ImageIO). Un ré-encodage maison sans perte (filtre adaptatif par ligne + zlib 9)
 divisait pourtant les PNG par deux (1024 : 514 887 → 272 517 o) — peine perdue,
-`iconutil` jette ces octets et réécrit les siens. Optimiser en amont ne sert à rien.
+`iconutil` jette ces octets et réécrit les siens. Optimiser en amont ne sert à rien ;
+ce qui compte est que les **pixels** entrants soient propres, pas leur encodage.
+
+## Regénération — la procédure actuelle
+
+`tools/genicon` accepte `-iconset <dir>` : il rastérise nativement (SDF + supersampling
+×4, comme pour le `.ico`) les tailles 16/32/64/128/256/512/1024 et écrit les 10 noms
+attendus par `iconutil`. Les tailles du `.ico` Windows (`icoSizes`) sont inchangées ;
+`go run ./tools/genicon` sans le flag se comporte exactement comme avant.
+
+**Go n'est pas installé sur le Mac de Thibault** — tant que c'est le cas, l'étape Go
+passe par la VM Windows 11 ARM64 (voir `scripts/provision-vm.ps1`), et seul
+l'assemblage `iconutil` se fait sur le Mac :
+
+```sh
+# 1. rendu des 10 PNG dans la VM (Go absent du Mac)
+ssh -i ~/.ssh/vibesync_vm_ed25519 OPMVPC@192.168.64.2 \
+  'cd C:\Users\OPMVPC\vibesync && go run ./tools/genicon -iconset C:\Users\OPMVPC\VibeSync.iconset'
+
+# 2. rapatriement sur le Mac
+scp -i ~/.ssh/vibesync_vm_ed25519 -r \
+  OPMVPC@192.168.64.2:C:/Users/OPMVPC/VibeSync.iconset/ .
+
+# 3. assemblage (iconutil n'existe que sur macOS)
+iconutil -c icns VibeSync.iconset -o ui/macos/Resources/VibeSync.icns
+```
+
+Le jour où le Mac a une toolchain Go, les étapes 1–2 se réduisent à
+`go run ./tools/genicon -iconset VibeSync.iconset`.
+
+Contrôle de non-régression gratuit : les PNG 16/32/64/128/256 du `.iconset` sont
+**bit à bit identiques** à `assets/png/icon-{16,32,64,128,256}.png` déjà committés
+(même rastériseur, même encodeur) — un `cmp` suffit à prouver que le dessin n'a pas
+bougé. Et après `iconutil`, la représentation 256 extraite du `.icns` est
+**pixel-identique** (0/65536) à `assets/png/icon-256.png`.
 
 ## Câblage dans le build
 
@@ -93,20 +135,35 @@ puis vérifie signature et budget, tout passe.
 | `codesign --verify --deep --strict` | `valid on disk`, `satisfies its Designated Requirement` |
 | Icône scellée dans `_CodeSignature/CodeResources` | OK (`Resources/VibeSync.icns` présent dans `files2`) |
 | `iconutil -c iconset` (relecture inverse) | 10 représentations, toutes aux dimensions attendues |
-| `NSWorkspace.icon(forFile:)` sur le bundle | renvoie **notre** icône (32 représentations), pas l'icône générique |
+| 256 du `.icns` vs `assets/png/icon-256.png` | **0/65536 pixels d'écart** (rendu `genicon` identique par construction) |
+| `NSWorkspace.icon(forFile:)` sur le bundle | renvoie **notre** icône (32 représentations, jusqu'à 2048²), pas l'icône générique |
 | `swift test` | **45/45**, 0 échec |
+| Go dans la VM : `build` / `test` / `vet` / `staticcheck` | tout vert (10 paquets testés) |
 
 Le contrôle `NSWorkspace` est le seul qui prouve vraiment que *le système* voit
 l'icône : LaunchServices résout le bundle et rend le squircle violet, pas le
 document blanc générique.
 
+Piège de lecture sur ce contrôle : sous **macOS 26 (Tahoe)**, `NSWorkspace` ne rend
+pas nos pixels tels quels — il **remasque** l'icône d'application dans la superellipse
+système et lui ajoute une ombre portée. Une comparaison pixel à pixel contre
+`assets/png/icon-256.png` donne donc un gros écart (24 797/65536 pixels > 8) **sans que
+rien ne soit cassé** ; l'écart contre une icône système quelconque est bien plus grand
+encore (46 350). Le rendu dumpé en PNG lève tout doute : c'est notre double triangle
+violet sur fond sombre, à la forme Tahoe. Ne pas transformer ce contrôle en assertion
+d'égalité de pixels.
+
 ## Réserves / suites possibles
 
-- **Regénération** : le `.icns` est un binaire committé et le rastériseur utilisé est
-  un one-shot (annexe ci-dessous). Le vrai point de chute serait `tools/genicon`,
-  étendu aux tailles 512/1024 avec une sortie `-iconset` — non fait ici faute de
-  toolchain Go sur cette machine, et par refus de committer du code Go non testé
-  (règle QA du projet). Ça diviserait le `.icns` par ~2 au passage.
+- ~~**Regénération** : le rastériseur utilisé est un one-shot ; le vrai point de chute
+  serait `tools/genicon`, étendu avec une sortie `-iconset`.~~ **Fait** — voir
+  [Regénération](#regénération-la-procédure-actuelle). Le `.icns` reste un binaire
+  committé (comme `assets/vibesync.ico`), mais il est maintenant reproductible par
+  commande, et il est passé de 950 259 à 356 922 o.
+- **Reste ouvert** : le rendu Go doit passer par la VM Windows tant que le Mac n'a pas
+  de toolchain Go — c'est le seul asset du projet dont la regénération est à cheval sur
+  deux machines (Go dans la VM, `iconutil` sur le Mac). Un `go` sur le Mac ferait
+  disparaître l'aller-retour.
 - **Cosmétique, hors périmètre** : le squircle occupe 93,75 % du cadre (240/256) avec
   un rayon de 21,9 %, là où la grille Apple met le sien à ~80,5 % avec ~18 % de rayon.
   L'icône paraîtra donc un peu plus grosse et plus carrée que ses voisines dans le
@@ -114,7 +171,12 @@ document blanc générique.
   le SVG *et* dans `genicon`.
 - Le libellé de l'étape CI dit encore « 41 tests » alors qu'il y en a 45.
 
-## Annexe — le rastériseur (à relancer tel quel pour regénérer)
+## Annexe — le rastériseur WebKit de la première passe (historique)
+
+Conservé pour mémoire : ce n'est **plus** la procédure de regénération (voir
+[Regénération](#regénération-la-procédure-actuelle)). Il reste utile comme moyen
+indépendant de rendre `assets/icon.svg` sans toolchain Go — c'est d'ailleurs lui qui
+a servi à vérifier que le SVG et `genicon` dessinent bien la même chose.
 
 ```swift
 // rendersvg.swift — swift rendersvg.swift assets/icon.svg <outdir> 512 256 128 64 32 16 8
@@ -175,7 +237,8 @@ for size in sizes {
 }
 ```
 
-Puis l'assemblage :
+Puis l'assemblage — cette copie manuelle est précisément ce que `genicon -iconset`
+fait maintenant tout seul, en écrivant directement les bons noms :
 
 ```sh
 mkdir VibeSync.iconset
