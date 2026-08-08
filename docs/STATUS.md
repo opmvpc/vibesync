@@ -1,6 +1,7 @@
 # STATUS — vibesync
 
-*Dernière mise à jour : 2026-08-07 — **v0.2.1 publiée** (VS-029 clos, première .app)*
+*Dernière mise à jour : 2026-08-08 — **reliquats apurés** (VS-035, ini, drapeaux
+Go+Swift, captures mac, icône .app)*
 
 ## Où on en est
 
@@ -71,11 +72,16 @@ chemins Gatekeeper dont Sequoia). Publiée au prochain tag (v0.2.1).
 258 Ko + VibeSync-macos-arm64.zip 311 Ko — la première .app). Serveur prod
 redéployé (Coolify healthy, sonde OK depuis la VM).
 
-Reliquats, par ordre d'intérêt : aligner internal/vlc/launch.go sur les 9
-drapeaux VLC du C ; captures mac du guide amis ; retours de ini_flush ignorés
-(durcissement) ; VS-035 ; revérifier le piège one-instance sur un vrai PC
-x86_64 (non reproductible isolément sur VLC ARM64). VS-020 (overlay OSD)
-attend toujours le PC Windows.
+**Sprint reliquats du 08 (journal du jour)** : VS-035 clos, ini_flush durci
+(+ ticket VS-037 écriture atomique, basse), les TROIS lanceurs VLC alignés et
+gelés par tests (launch.go 15/12 par OS, Swift 12 — il lui manquait
+--lua-intf=http, le filet anti-Syncplay), captures mac du guide faites sur une
+vraie séance prod, icône .icns de VibeSync.app livrée (0,91 Mio, WebKit depuis
+assets/icon.svg). Tout committé, à publier dans une future v0.2.2.
+
+Il ne reste QUE ce qui exige un vrai PC Windows x86_64 : VS-020 (overlay OSD),
+revérification one-instance, asan du C Win32. Idée notée : un gel commun des
+3 listes de drapeaux (les gels actuels sont indépendants).
 
 ## Repères
 
