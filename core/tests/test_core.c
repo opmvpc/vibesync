@@ -1493,6 +1493,71 @@ static void test_buffering_suspend(void) {
 // produire AUCUNE commande (dix fois sous la zone morte de 1,5 s), et la
 // détection doit continuer de fonctionner dessous. Ce test prouve les deux.
 
+// VS-039 : ouvrir un autre média invalide l'état de salle de référence. Sans
+// ça, le moteur exigeait du nouveau lecteur la position de l'ANCIEN média,
+// rabotée à la durée du nouveau — c'est-à-dire sa fin. Mesuré en séance réelle :
+// « Pause auto : alice a 125,6 s de retard » sur un média de 42 s, séance morte.
+static void test_file_change(void) {
+    section("changement de fichier en salle");
+    const i64 MS = 1000000LL;
+    i64 t0 = 1785960000000LL * MS;
+    VsEngine e;
+    VsOutput out;
+
+    engine_init(&e);
+    vs_output_reset(&out);
+    // Séance en lecture à 300 s d'un média de 7200 s, bien installée.
+    join_room(&e, t0, "salon", 300, &out);
+    VsStatus st = mk_status(VS_PLAY_PLAYING, 300, 7200);
+    engine_on_vlc_status(&e, t0, &st, &out);
+    tick_at(&e, t0 + 200 * MS, &out);
+    CHECK(e.have_state && e.have_last_room_pos, "préalable : référence et mémoire de séance en place");
+
+    // L'utilisateur ouvre l'épisode suivant : 42 s, bien plus court que la
+    // position de la salle dans le précédent.
+    engine_open_file(&e, S("ep2.mkv"), 15, &out);
+    CHECK(!e.have_state, "l'état de salle de l'ancien média doit être oublié");
+    CHECK(e.drift_count == 0 && e.drift == 0, "historique de dérive vidé");
+    CHECK(!e.have_last_room_pos,
+          "la dernière position de salle appartenait à l'ancien média : elle ne doit "
+          "plus pouvoir être reproposée en reprise « salle vierge »");
+    CHECK(count_msgs(&out, VS_MSG_SET_FILE) == 1, "le nouveau fichier est déclaré au serveur");
+    vs_output_reset(&out);
+
+    // Le driver a laissé le nouveau média en pause à 0. Aucune commande ne doit
+    // partir : ni le seek fatal vers la fin du fichier, ni une reprise.
+    VsStatus neuf = mk_status(VS_PLAY_PAUSED, 0, 42);
+    strbuf_set(&neuf.file_name, S("ep2.mkv"));
+    for (int i = 1; i <= 5; i++) {
+        i64 now = t0 + (200 + 200 * i) * MS;
+        engine_on_vlc_status(&e, now, &neuf, &out);
+        engine_on_tick(&e, now, &out);
+        CHECK(out.cmd_count == 0, "poll %d : %lld commande(s) envoyée(s) à un média fraîchement ouvert", i,
+              (long long)out.cmd_count);
+        vs_output_reset(&out);
+    }
+
+    // Le serveur constate le changement et rediffuse une salle vierge (règle
+    // serveur 5bis) : la référence revient, sans rien à corriger.
+    i64 t1 = t0 + 1600 * MS;
+    VsRoomState reset = mk_room(1, 0, "server", vs_ns_to_unix_ms(t1));
+    engine_on_roomstate(&e, t1, &reset);
+    CHECK(e.have_state, "le roomState du serveur réinstalle la référence");
+    engine_on_vlc_status(&e, t1 + 200 * MS, &neuf, &out);
+    engine_on_tick(&e, t1 + 200 * MS, &out);
+    CHECK(out.cmd_count == 0, "salle vierge et lecteur au début : rien à corriger");
+    vs_output_reset(&out);
+
+    // Et une reprise « salle vierge » ne doit pas ressusciter la position de
+    // l'ancien média sur ce welcome-là.
+    VsRoomState virgin = mk_room(1, 0, "", 1);
+    engine_session_lost(&e);
+    vs_output_reset(&out);
+    engine_on_welcome(&e, t1 + 5000 * MS, S("u1"), &virgin, NULL, &out);
+    CHECK(count_msgs(&out, VS_MSG_CONTROL) == 0 && !out.have_resume_toast,
+          "aucune reprise à la position de l'ancien média");
+}
+
 static void test_user_action_in_vlc(void) {
     section("action utilisateur dans VLC");
     const i64 MS = 1000000LL;
@@ -2373,6 +2438,16 @@ static void run_vector(Arena *a, Str8 dir, Str8 file) {
                 fake_play(&fake, now);
             } else if (str8_eq_cstr(type, "userSeek")) {
                 fake_seek(&fake, json_get_num(data, "positionSec", 0), now);
+            } else if (str8_eq_cstr(type, "openFile")) {
+                // Changement de média en cours de séance (VS-039). fake_load
+                // reproduit ce que le driver garantit au moteur : le nouveau
+                // fichier est chargé, EN PAUSE À 0 (docs/protocol.md
+                // §Chargement de fichier). Les commandes de préparation
+                // appartiennent au driver, pas au moteur : elles ne sont pas
+                // dans la trace.
+                Str8 opened = json_get_str(data, "fileName", S(""));
+                fake_load(&fake, opened, json_get_num(data, "durationSec", 0), now);
+                engine_open_file(&e, opened, VECTOR_FILE_SIZE, &out);
             } else {
                 VsInMsg m;
                 proto_fill(a, type, data, &m);
@@ -2451,8 +2526,8 @@ void test_core_vectors(Arena *a, Str8 override) {
     }
     FileList files;
     list_vectors(a, dir, &files);
-    if (files.count < 14) {
-        failf("%lld vecteur(s) trouvé(s) dans %.*s, attendu au moins 14", (long long)files.count, (int)dir.len,
+    if (files.count < 15) {
+        failf("%lld vecteur(s) trouvé(s) dans %.*s, attendu au moins 15", (long long)files.count, (int)dir.len,
               dir.data);
         return;
     }
@@ -2480,6 +2555,7 @@ void test_core_run(Arena *a) {
     test_virgin_resume();
     test_buffering_suspend();
     test_micro_seek();
+    test_file_change();
     test_user_action_in_vlc();
     test_media_core(a);
 }

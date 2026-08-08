@@ -1,0 +1,308 @@
+{
+  "_doc": "Vecteur de conformité du moteur de sync vibesync (golden file, régénéré par `go test ./internal/client -run TestVectors -update`). Horloge simulée : tous les temps sont en millisecondes depuis le début du scénario. `initialVLC` = état complet de VLC au départ ; `events` = entrées injectées (messages serveur, actions de l'utilisateur dans VLC, coupure de session) ; `trace` = une entrée par poll de 200 ms avec l'état observé de VLC, la position attendue calculée, le drift, les commandes envoyées à VLC et les messages envoyés au serveur. Une réimplémentation est conforme si, pour le même `initialVLC` et les mêmes `events`, elle produit les mêmes `vlcCommands` et `toServer` aux mêmes instants.",
+  "name": "15-changement-de-fichier",
+  "description": "Ouvrir un autre média invalide l'état de salle de référence : AUCUNE commande n'est envoyée au nouveau lecteur (surtout pas le seek vers la position de l'ancien, rabotée à la durée du nouveau, donc sa fin) tant que le serveur n'a pas rediffusé un roomState.",
+  "scenario": "Préconditions du moteur au premier événement : session serveur déjà établie, aucun état de salle connu, aucune mesure d'offset d'horloge. Fichier ep1.mkv ouvert, durée 7200 s, taille 15 octets, position 300 s, lecture en cours, rate 1. Déroulé : (1) welcome + pong d'une salle en lecture à 300 s, 4 polls alignés ; (2) événement \"openFile\" — le lecteur charge ep2.mkv (42 s) et le driver le laisse EN PAUSE À 0 (§Chargement de fichier) ; l'événement porte \"keepOutput\": true, le setFile qu'il déclenche fait partie de la trace. Les 5 polls qui suivent ne doivent produire AUCUNE commande : la référence a été oubliée, la position attendue retombe à 0 ; (3) le serveur constate le changement de média et rediffuse une salle vierge en pause (setBy = server, règle serveur 5bis) — toujours rien à corriger, le lecteur y est déjà ; (4) un autre membre relance la lecture du nouveau média à 0 : le moteur repart, sur ce média-là.",
+  "pollIntervalMs": 200,
+  "initialVLC": {
+    "fileName": "ep1.mkv",
+    "durationSec": 7200,
+    "state": "playing",
+    "positionSec": 300,
+    "rate": 1
+  },
+  "events": [
+    {
+      "atMs": 0,
+      "type": "welcome",
+      "data": {
+        "selfId": "u1",
+        "room": "salon",
+        "state": {
+          "paused": false,
+          "positionSec": 300,
+          "rate": 1,
+          "refServerMs": 1785960000000,
+          "setBy": "u2"
+        },
+        "users": [
+          {
+            "id": "u1",
+            "name": "thib",
+            "ready": false,
+            "positionSec": 0,
+            "latencyMs": 0
+          }
+        ]
+      }
+    },
+    {
+      "atMs": 0,
+      "type": "pong",
+      "data": {
+        "t": 1785960000000,
+        "serverMs": 1785960000000
+      }
+    },
+    {
+      "atMs": 800,
+      "type": "openFile",
+      "data": {
+        "durationSec": 42,
+        "fileName": "ep2.mkv"
+      },
+      "keepOutput": true
+    },
+    {
+      "atMs": 1800,
+      "type": "roomState",
+      "data": {
+        "paused": true,
+        "positionSec": 0,
+        "rate": 1,
+        "refServerMs": 1785960001800,
+        "setBy": "server"
+      }
+    },
+    {
+      "atMs": 2800,
+      "type": "roomState",
+      "data": {
+        "paused": false,
+        "positionSec": 0,
+        "rate": 1,
+        "refServerMs": 1785960002800,
+        "setBy": "u2"
+      }
+    }
+  ],
+  "trace": [
+    {
+      "atMs": 200,
+      "vlcState": "playing",
+      "vlcPositionSec": 300.2,
+      "expectedPositionSec": 300.2,
+      "driftSec": 0,
+      "toServer": [
+        {
+          "type": "setFile",
+          "data": {
+            "name": "ep1.mkv",
+            "durationSec": 7200,
+            "sizeBytes": 15
+          }
+        },
+        {
+          "type": "report",
+          "data": {
+            "positionSec": 300.2,
+            "paused": false,
+            "buffering": false
+          }
+        }
+      ]
+    },
+    {
+      "atMs": 400,
+      "vlcState": "playing",
+      "vlcPositionSec": 300.4,
+      "expectedPositionSec": 300.4,
+      "driftSec": 0
+    },
+    {
+      "atMs": 600,
+      "vlcState": "playing",
+      "vlcPositionSec": 300.6,
+      "expectedPositionSec": 300.6,
+      "driftSec": -0
+    },
+    {
+      "atMs": 800,
+      "vlcState": "playing",
+      "vlcPositionSec": 300.8,
+      "expectedPositionSec": 300.8,
+      "driftSec": -0
+    },
+    {
+      "atMs": 1000,
+      "vlcState": "paused",
+      "vlcPositionSec": 0,
+      "expectedPositionSec": 0,
+      "driftSec": 0,
+      "toServer": [
+        {
+          "type": "setFile",
+          "data": {
+            "name": "ep2.mkv",
+            "durationSec": 0,
+            "sizeBytes": 15
+          }
+        },
+        {
+          "type": "setFile",
+          "data": {
+            "name": "ep2.mkv",
+            "durationSec": 42,
+            "sizeBytes": 15
+          }
+        }
+      ]
+    },
+    {
+      "atMs": 1200,
+      "vlcState": "paused",
+      "vlcPositionSec": 0,
+      "expectedPositionSec": 0,
+      "driftSec": 0,
+      "toServer": [
+        {
+          "type": "report",
+          "data": {
+            "positionSec": 0,
+            "paused": true,
+            "buffering": false
+          }
+        }
+      ]
+    },
+    {
+      "atMs": 1400,
+      "vlcState": "paused",
+      "vlcPositionSec": 0,
+      "expectedPositionSec": 0,
+      "driftSec": 0
+    },
+    {
+      "atMs": 1600,
+      "vlcState": "paused",
+      "vlcPositionSec": 0,
+      "expectedPositionSec": 0,
+      "driftSec": 0
+    },
+    {
+      "atMs": 1800,
+      "vlcState": "paused",
+      "vlcPositionSec": 0,
+      "expectedPositionSec": 0,
+      "driftSec": 0
+    },
+    {
+      "atMs": 2000,
+      "vlcState": "paused",
+      "vlcPositionSec": 0,
+      "expectedPositionSec": 0,
+      "driftSec": 0,
+      "toServer": [
+        {
+          "type": "ping",
+          "data": {
+            "t": 1785960002000
+          }
+        }
+      ]
+    },
+    {
+      "atMs": 2200,
+      "vlcState": "paused",
+      "vlcPositionSec": 0,
+      "expectedPositionSec": 0,
+      "driftSec": 0,
+      "toServer": [
+        {
+          "type": "report",
+          "data": {
+            "positionSec": 0,
+            "paused": true,
+            "buffering": false
+          }
+        }
+      ]
+    },
+    {
+      "atMs": 2400,
+      "vlcState": "paused",
+      "vlcPositionSec": 0,
+      "expectedPositionSec": 0,
+      "driftSec": 0
+    },
+    {
+      "atMs": 2600,
+      "vlcState": "paused",
+      "vlcPositionSec": 0,
+      "expectedPositionSec": 0,
+      "driftSec": 0
+    },
+    {
+      "atMs": 2800,
+      "vlcState": "paused",
+      "vlcPositionSec": 0,
+      "expectedPositionSec": 0,
+      "driftSec": 0
+    },
+    {
+      "atMs": 3000,
+      "vlcState": "paused",
+      "vlcPositionSec": 0,
+      "expectedPositionSec": 0.2,
+      "driftSec": -0.2,
+      "vlcCommands": [
+        {
+          "cmd": "resume"
+        }
+      ]
+    },
+    {
+      "atMs": 3200,
+      "vlcState": "playing",
+      "vlcPositionSec": 0.2,
+      "expectedPositionSec": 0.4,
+      "driftSec": -0.2,
+      "toServer": [
+        {
+          "type": "report",
+          "data": {
+            "positionSec": 0.2,
+            "paused": false,
+            "buffering": false
+          }
+        }
+      ]
+    },
+    {
+      "atMs": 3400,
+      "vlcState": "playing",
+      "vlcPositionSec": 0.4,
+      "expectedPositionSec": 0.6,
+      "driftSec": -0.2
+    },
+    {
+      "atMs": 3600,
+      "vlcState": "playing",
+      "vlcPositionSec": 0.6,
+      "expectedPositionSec": 0.8,
+      "driftSec": -0.2
+    },
+    {
+      "atMs": 3800,
+      "vlcState": "playing",
+      "vlcPositionSec": 0.8,
+      "expectedPositionSec": 1,
+      "driftSec": -0.2
+    },
+    {
+      "atMs": 4000,
+      "vlcState": "playing",
+      "vlcPositionSec": 1,
+      "expectedPositionSec": 1.2,
+      "driftSec": -0.2,
+      "toServer": [
+        {
+          "type": "ping",
+          "data": {
+            "t": 1785960004000
+          }
+        }
+      ]
+    }
+  ]
+}

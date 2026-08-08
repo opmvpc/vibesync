@@ -1,7 +1,7 @@
 # STATUS — vibesync
 
-*Dernière mise à jour : 2026-08-08 (soir) — **VS-038 : 1× constant + micro-seek**
-(le nudge ±5 % est supprimé des 3 implémentations)*
+*Dernière mise à jour : 2026-08-09 — **VS-039 : changement de fichier en cours de
+salle** (la position de salle appartient désormais à un média)*
 
 ## Où on en est
 
@@ -66,6 +66,7 @@ chemins Gatekeeper dont Sequoia). Publiée au prochain tag (v0.2.1).
 | VS-030..034, 036 | Couche C commune (ADR-010, 5 phases) + fix semver | **terminés, CI verte 3 jobs** |
 | VS-035 | UB str_to_i64 (préexistant) | ouvert, priorité basse |
 | VS-038 | Resync 1× constant + micro-seek (retour terrain nudge) | **terminé** — zone morte 1,5 s, médiane de persistance, seek immédiat 5 s ; 0 commande rate dans les 2 séances réelles |
+| VS-039 | Changement de fichier en cours de salle (retour terrain v0.2.3) | **terminé** — règle serveur 5bis (salle vierge au changement de média), référence client invalidée à l'ouverture, bandeau élargi ; vecteur 15, séances réelles mac 18/18 et VM 21/21. **Le serveur change → auto-deploy prod au push** |
 
 ## Prochaine action
 
@@ -89,13 +90,32 @@ séances réelles (mac PASS 11/11, VM 2 clients C PASS 14/14) affichent
 **0 commande rate**. **Publié en v0.2.3** (avec les deux boutons Parcourir…
 du chemin VLC — Windows et la nouvelle section VLC des Réglages mac).
 
+**VS-039 livré le 09** (retour terrain de Thibault sur v0.2.3, deux clients mac) :
+changer de fichier en cours de salle ne tue plus la séance. La position de salle
+appartient désormais à un média — le serveur remet la salle à une position vierge
+quand un membre bascule (règle 5bis, **premier changement du serveur depuis
+longtemps : auto-deploy prod au push**), le moteur oublie sa référence à
+l'ouverture d'un fichier (la garder faisait sauter le nouveau lecteur à la FIN du
+fichier, d'où les « Pause auto : X a N s de retard » en boucle), et le bandeau
+« X regarde … » se déclenche enfin au cas « épisode suivant ». Vecteur 15 ajouté,
+les 14 gelés inchangés au bit près ; séances réelles **mac 18/18** et **VM 2
+clients C 21/21**. Rapport :
+`docs/research/2026-08-09-vs039-changement-fichier.md`.
+
 Il ne reste QUE ce qui exige un vrai PC Windows x86_64 : VS-020 (overlay OSD),
 revérification one-instance, asan du C Win32. Idée notée : un gel commun des
 3 listes de drapeaux (les gels actuels sont indépendants).
 
+**Outillage** : Go tourne sur le Mac via
+`docker run --rm -v "$PWD":/src -w /src golang:1.26-alpine …` (même chaîne que la
+CI) — plus besoin de la VM pour `go test`, `go vet` ou la régénération des
+vecteurs. Un serveur local se monte de même : `docker build -t vibesync-server .`
+puis `docker run -p 8080:8080`, ce qui permet de valider un changement SERVEUR en
+séance réelle avant tout push en prod.
+
 ## Repères
 
-- Spec : `docs/protocol.md` (source de vérité) ; vecteurs : `test/vectors/` (14)
+- Spec : `docs/protocol.md` (source de vérité) ; vecteurs : `test/vectors/` (15)
 - Test réel mac : `VIBESYNC_PASSWORD=... ./scripts/run-real-macos.sh "" wss://vibesync.choboai.com/ws`
 - Sonde prod : `go run ./tools/probe wss://vibesync.choboai.com/ws [mdp]` (Go absent du Mac — passer par la CI ou la VM)
 - Rapports d'agents : `docs/research/` (analyse couche C commune : 2026-08-06)

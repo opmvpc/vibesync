@@ -422,6 +422,10 @@ typedef struct {
     // VsCmdKind). Publiées dans l'état du mode auto : `rateCmds` prouve sur une
     // vraie séance que la vitesse ne corrige plus jamais la dérive (VS-038).
     i64 cmd_counts[4];
+    // Pauses automatiques annoncées par le serveur depuis le lancement : face
+    // visible du symptôme de VS-039 (« Pause auto : X a N s de retard » après un
+    // changement de fichier). Publié dans l'état du mode auto.
+    i64 auto_pause_toasts;
 
     // Réglages : chemin VLC détecté au démarrage, AVANT que %VIBESYNC_VLC% ne
     // soit forcé par le réglage — sinon la « détection automatique » affichée
@@ -875,21 +879,31 @@ static void refresh_view(App *app) {
     }
 }
 
-// refresh_watch_banner propose d'ouvrir le média que les autres regardent déjà,
-// tant que nous n'en avons pas ouvert un. Fermable, et il ne réapparaît pas une
-// fois écarté pour ce fichier.
+// refresh_watch_banner propose d'ouvrir le média qu'un autre membre a déclaré,
+// dès qu'il diffère du nôtre. Fermable, et il ne réapparaît pas une fois écarté
+// pour ce fichier.
+//
+// VS-039 : la version d'origine sortait dès que NOUS avions un fichier ouvert,
+// si bien que le cas « épisode suivant » — un participant change de média en
+// cours de séance — ne proposait jamais rien aux autres. Comparer au nôtre
+// couvre les deux cas d'un coup : sans fichier ouvert, tout nom déclaré diffère
+// du nôtre (vide).
 static void refresh_watch_banner(App *app) {
     UiApp *ui = &app->ui;
-    if (app->engine.have_file) {  // on a déjà notre copie ouverte
-        ui->watch_show = 0;
-        return;
-    }
+    const VsDirOps *ops = vs_dir_ops();
+    // Notre fichier se lit dans le moteur, pas dans le miroir de la vue : ce
+    // dernier n'est rafraîchi qu'en fin de pas, il aurait un broadcast de retard.
+    Str8 mine = app->engine.have_file ? strbuf_str(&app->engine.file_name) : str8_lit("");
     for (isize i = 0; i < ui->user_count; i++) {
         UiUser *u = &ui->users[i];
         if (u->is_self || !u->has_file || u->file[0] == 0) continue;
-        // Même fichier que celui déjà proposé : ne pas ressusciter un bandeau
-        // que l'utilisateur vient de fermer.
-        if (ui->watch_show == 0 && strcmp(ui->watch_file, u->file) == 0) return;
+        TempArena t = temp_begin(app->scratch);
+        Str8 theirs = str8_from_cstr(u->file);
+        b32 same = ops->name_eq_ci(app->scratch, theirs, mine);
+        b32 refused = ops->name_eq_ci(app->scratch, theirs, str8_from_cstr(ui->watch_dismissed));
+        temp_end(t);
+        if (same) continue;  // il regarde la même chose que nous
+        if (refused) return;  // bandeau fermé pour ce fichier : ne pas insister
         snprintf(ui->watch_who, sizeof(ui->watch_who), "%s", u->name);
         snprintf(ui->watch_file, sizeof(ui->watch_file), "%s", u->file);
         ui->watch_show = 1;
@@ -1043,6 +1057,10 @@ static void on_server_message(App *app, Str8 raw) {
             char text[224];
             snprintf(text, sizeof(text), "%.*s", (int)m->text.len, m->text.data);
             int level = str8_eq_cstr(m->level, "error") ? 2 : (str8_eq_cstr(m->level, "warn") ? 1 : 0);
+            // Pauses automatiques annoncées par le serveur : compteur publié
+            // dans l'état du mode auto, c'est lui qui prouve en séance réelle
+            // qu'un changement de fichier ne les déclenche plus (VS-039).
+            if (strncmp(text, "Pause auto", 10) == 0) app->auto_pause_toasts++;
             ui_toast(&app->ui, text, level, now_ms());
             break;
         }
@@ -1457,6 +1475,8 @@ static void handle_actions(App *app) {
     if (ui->act_dismiss_watch) {
         ui->act_dismiss_watch = 0;
         ui->watch_show = 0;
+        // Refus explicite : ce fichier-là ne sera plus proposé.
+        snprintf(ui->watch_dismissed, sizeof(ui->watch_dismissed), "%s", ui->watch_file);
         redraw(app);
     }
     if (ui->act_dismiss_notice) {
@@ -1647,6 +1667,13 @@ static void auto_write_status(App *app) {
     jw_kv_bool(&w, "buffering", e->buffering);
     jw_kv_i64(&w, "latencyMs", e->latency_ms);
     jw_kv_bool(&w, "correcting", e->correcting != VS_CORRECT_NONE);
+    // Bandeau « X regarde <fichier> » (VS-026, élargi au changement de fichier
+    // en cours de salle par VS-039) et pauses automatiques reçues : le harnais
+    // doit pouvoir constater les deux.
+    jw_kv_bool(&w, "watchShow", ui->watch_show);
+    jw_key(&w, "watchFile");
+    jw_cstr(&w, ui->watch_file);
+    jw_kv_i64(&w, "autoPauseToasts", app->auto_pause_toasts);
     // Commandes envoyées à VLC depuis le lancement, par nature : `rateCmds`
     // doit rester à 0 sur une séance normale (VS-038).
     jw_kv_i64(&w, "pauseCmds", app->cmd_counts[VS_CMD_PAUSE]);

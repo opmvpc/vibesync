@@ -67,6 +67,20 @@ Source de vérité du protocole client↔serveur. Les types Go correspondants vi
 4. Un nouvel arrivant reçoit `welcome` avec l'état courant → son client se cale dessus.
 5. Fichiers : si `durationSec` diffère de > 2 s entre membres → `toast` warn (pas de
    blocage). Une durée ≤ 0 signifie « inconnue » et est exclue de la comparaison.
+5bis. **Changement de fichier en cours de salle (VS-039)** : la position de salle
+   n'a de sens que rapportée à un média. Un `setFile` dont le `name` diffère
+   (comparaison insensible à la casse) de celui que **ce même membre** avait déjà
+   déclaré est un changement de média : le serveur remet la salle à une position
+   vierge — `{paused: true, positionSec: 0, rate: 1, refServerMs: now,
+   setBy: "server"}` — puis diffuse `roomState` et un `toast` info
+   « X a changé de fichier : <nom> — la salle repart du début ». Deux cas ne
+   déclenchent JAMAIS ce reset, et c'est ce qui rend la règle sûre : la
+   **première** déclaration d'un membre (un arrivant qui ouvre sa copie au milieu
+   du film ne doit pas ramener tout le monde à zéro) et la **re-déclaration à
+   l'identique** (chaque `welcome` en produit une, §File d'attente hors ligne ;
+   des copies aux noms différents entre membres ne se chassent donc pas l'une
+   l'autre à chaque reconnexion). Le ready-gate n'est pas rejoué : `started`
+   reste levé, changer de média ne redemande pas à tout le monde d'être prêt.
 6. Reprise de session : si un `hello` porte un pseudo déjà présent dans la salle ET
    le même jeton `session` que le détenteur, l'ancienne connexion (zombie après une
    coupure silencieuse) est fermée et remplacée — l'arrivant récupère le pseudo,
@@ -111,6 +125,20 @@ Source de vérité du protocole client↔serveur. Les types Go correspondants vi
   immédiatement pause + position 0 et ne déclare le fichier chargé (`setFile`)
   qu'une fois l'état « en pause » effectivement observé — VLC démarre la lecture
   automatiquement à l'ouverture, cette course est réelle.
+  **Ouvrir un fichier invalide l'état de salle de référence** (VS-039) : la
+  position de la salle appartenait au média précédent, la reprendre reviendrait à
+  jeter le nouveau lecteur à une position qui n'existe pas chez lui (rabotée à sa
+  durée, c'est-à-dire à sa fin). Le moteur oublie donc l'état de salle,
+  l'historique de dérive et la dernière position de salle connue (celle que
+  proposerait une reprise « salle vierge ») : plus aucune correction jusqu'au
+  `roomState` suivant — que le serveur diffuse immédiatement, règle serveur 5bis.
+  C'est aussi ce qui ferme la course entre le premier statut du nouveau média et
+  ce `roomState`.
+- **Proposition de récupération** (VS-026, élargie par VS-039) : dès qu'un autre
+  membre déclare un fichier dont le nom diffère du nôtre — y compris quand nous
+  en avons déjà un ouvert, cas « épisode suivant » —, l'UI propose de l'ouvrir
+  (« X regarde <fichier> — cliquer pour l'ouvrir chez vous »). Bandeau fermable,
+  qui ne ressuscite pas pour le même nom de fichier.
 - **Départ et reprise de lecture** : quand un `roomState` fait passer de pause à
   lecture, le client cale d'abord VLC sur la position de référence (seek si
   l'écart est ≥ 0,3 s) puis lance la lecture — aucune correction ultérieure ne

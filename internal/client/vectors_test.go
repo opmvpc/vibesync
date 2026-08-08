@@ -307,6 +307,27 @@ func (b *vecBuilder) noise(polls int) {
 	}
 }
 
+// openFile consigne un changement de média EN COURS de séance : le lecteur
+// charge un autre fichier et le driver le laisse en pause au début
+// (docs/protocol.md §Chargement de fichier). Ce que le moteur émet en réaction
+// — le `setFile` du nouveau média — fait partie de la trace : c'est la règle
+// testée, comme pour la reprise « salle vierge ».
+//
+// Les commandes de préparation (pause + seek 0) sont le fait du DRIVER, pas du
+// moteur : elles sont drainées ici, et les rejeux C/Swift placent directement
+// leur faux lecteur en pause à 0 sur le nouveau média.
+func (b *vecBuilder) openFile(name string, durationSec float64) {
+	raw, err := json.Marshal(map[string]any{"fileName": name, "durationSec": durationSec})
+	if err != nil {
+		b.t.Fatal(err)
+	}
+	b.vec.Events = append(b.vec.Events, vectorEvent{
+		AtMs: b.atMs(), Type: "openFile", Data: raw, KeepOutput: true,
+	})
+	b.h.openFile(name, durationSec)
+	b.rec.drain()
+}
+
 // sessionLost consigne une coupure de la session serveur.
 func (b *vecBuilder) sessionLost() {
 	b.vec.Events = append(b.vec.Events, vectorEvent{AtMs: b.atMs(), Type: "connectionLost"})
@@ -644,6 +665,50 @@ func TestVectors(t *testing.T) {
 	b.userEvent("userSeek", round3(b.h.fake.Position())+300)
 	b.run(3)
 	b.check()
+
+	// 15. Changement de fichier en cours de salle (VS-039). La salle joue à
+	// 300 s d'un média de 7200 s quand l'utilisateur ouvre un AUTRE fichier, de
+	// 42 s. Sans invalidation de la référence, le moteur exigerait du nouveau
+	// lecteur la position de l'ancien — rabotée à 42 s, c'est-à-dire sa fin :
+	// c'est le seek fatal mesuré sur la séance réelle (« Pause auto : alice a
+	// 125,6 s de retard », séance morte ensuite).
+	b = newVecBuilder(t, vecSetup{
+		name: "15-changement-de-fichier", file: "ep1.mkv", durationSec: 7200,
+		positionSec: 300, playing: true,
+		description: "Ouvrir un autre média invalide l'état de salle de référence : " +
+			"AUCUNE commande n'est envoyée au nouveau lecteur (surtout pas le seek " +
+			"vers la position de l'ancien, rabotée à la durée du nouveau, donc sa " +
+			"fin) tant que le serveur n'a pas rediffusé un roomState.",
+		scenario: "Préconditions du moteur au premier événement : session serveur " +
+			"déjà établie, aucun état de salle connu, aucune mesure d'offset " +
+			"d'horloge. Fichier ep1.mkv ouvert, durée 7200 s, taille 15 octets, " +
+			"position 300 s, lecture en cours, rate 1. Déroulé : (1) welcome + pong " +
+			"d'une salle en lecture à 300 s, 4 polls alignés ; (2) événement " +
+			"\"openFile\" — le lecteur charge ep2.mkv (42 s) et le driver le laisse " +
+			"EN PAUSE À 0 (§Chargement de fichier) ; l'événement porte " +
+			"\"keepOutput\": true, le setFile qu'il déclenche fait partie de la " +
+			"trace. Les 5 polls qui suivent ne doivent produire AUCUNE commande : " +
+			"la référence a été oubliée, la position attendue retombe à 0 ; " +
+			"(3) le serveur constate le changement de média et rediffuse une salle " +
+			"vierge en pause (setBy = server, règle serveur 5bis) — toujours rien à " +
+			"corriger, le lecteur y est déjà ; (4) un autre membre relance la " +
+			"lecture du nouveau média à 0 : le moteur repart, sur ce média-là.",
+	})
+	b.welcome(b.h.playing(300))
+	b.run(4)
+	// L'utilisateur ouvre l'épisode suivant, bien plus court que la position de
+	// la salle dans le précédent.
+	b.openFile("ep2.mkv", 42)
+	b.run(5)
+	// Le serveur a vu le changement de fichier : salle remise à zéro, en pause.
+	reset := b.h.paused(0)
+	reset.SetBy = "server"
+	b.event(protocol.TypeRoomState, reset)
+	b.run(5)
+	// Puis quelqu'un relance la lecture — du nouveau média, depuis son début.
+	b.event(protocol.TypeRoomState, b.h.playing(0))
+	b.run(6)
+	b.check()
 }
 
 // lastControlPosition rend la position du dernier `control` que le moteur a
@@ -672,8 +737,8 @@ func TestVectorsGoldenComplets(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(files) < 14 {
-		t.Fatalf("%d vecteurs golden, attendu au moins 14", len(files))
+	if len(files) < 15 {
+		t.Fatalf("%d vecteurs golden, attendu au moins 15", len(files))
 	}
 	for _, f := range files {
 		raw, err := os.ReadFile(f)

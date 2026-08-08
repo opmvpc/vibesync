@@ -72,12 +72,12 @@ final class VectorsTests: XCTestCase {
             .contentsOfDirectory(atPath: dir.path)
             .filter { $0.hasSuffix(".json") }
             .sorted()
-        XCTAssertGreaterThanOrEqual(names.count, 14,
-                                    "\(names.count) vecteur(s) dans \(dir.path), attendu au moins 14")
+        XCTAssertGreaterThanOrEqual(names.count, 15,
+                                    "\(names.count) vecteur(s) dans \(dir.path), attendu au moins 15")
         for name in names {
             replay(dir.appendingPathComponent(name))
         }
-        // Plancher, pas un compte exact : les 14 vecteurs totalisent 176 pas
+        // Plancher, pas un compte exact : les 15 vecteurs totalisent 202 pas
         // aujourd'hui, un vecteur ajouté ne doit pas rendre ce test rouge.
         XCTAssertGreaterThan(replayedSteps, 100,
                              "\(replayedSteps) pas de trace rejoués : le rejeu n'a pas eu lieu")
@@ -156,6 +156,15 @@ final class VectorsTests: XCTestCase {
                     fake.play(now)
                 case "userSeek":
                     fake.seek(JSON.number(data, "positionSec", 0), now)
+                case "openFile":
+                    // Changement de média en cours de séance (VS-039).
+                    // `fake.load` reproduit ce que le driver garantit au
+                    // moteur : nouveau fichier chargé, EN PAUSE À 0
+                    // (docs/protocol.md §Chargement de fichier) ; les commandes
+                    // de préparation sont au driver, pas au moteur.
+                    let opened = JSON.string(data, "fileName")
+                    fake.load(name: opened, length: JSON.number(data, "durationSec", 0), now: now)
+                    pending += engine.openFile(name: opened, sizeBytes: vectorFileSize)
                 default:
                     // Depuis VS-033 le décodage EST celui du C : l'événement du
                     // vecteur est ré-enveloppé en {type, data} et repasse par

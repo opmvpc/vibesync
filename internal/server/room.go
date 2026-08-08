@@ -416,6 +416,13 @@ func (r *Room) handleSetFile(m *member, msg protocol.SetFile) {
 	if name == "" {
 		return
 	}
+	// Changement de média (§Comportements serveur 5bis) : seule une
+	// re-déclaration par un membre qui avait DÉJÀ un fichier, et sous un autre
+	// nom, remet la salle à zéro. La première déclaration ne compte pas (un
+	// arrivant qui ouvre sa copie au milieu du film ne ramène personne au
+	// début), la re-déclaration à l'identique non plus (chaque welcome en
+	// produit une).
+	changed := m.file != nil && !strings.EqualFold(m.file.Name, truncate(name, 200))
 	m.file = &protocol.FileInfo{
 		Name:        truncate(name, 200),
 		DurationSec: sanitizeFloat(msg.DurationSec),
@@ -423,6 +430,9 @@ func (r *Room) handleSetFile(m *member, msg protocol.SetFile) {
 	}
 	now := r.clock.Now()
 	r.broadcastUsersLocked(now)
+	if changed {
+		r.resetForMediaLocked(now, m)
+	}
 
 	// Avertissement (non bloquant) si un autre membre a une durée trop
 	// différente. On n'avertit qu'au moment où un fichier est (re)déclaré.
@@ -439,6 +449,40 @@ func (r *Room) handleSetFile(m *member, msg protocol.SetFile) {
 			break
 		}
 	}
+}
+
+// resetForMediaLocked remet la salle à une position vierge parce qu'un membre
+// vient de changer de média (§Comportements serveur 5bis, VS-039).
+//
+// Pourquoi c'est le serveur qui tranche : la position de salle n'a de sens que
+// rapportée à un média. Sans ce reset, celle de l'ancien survivait au
+// changement — le client fraîchement ouvert se voyait réclamer une position qui
+// n'existe pas chez lui (rabotée à sa durée, donc sa fin), il était jugé « en
+// retard » et la salle enchaînait les pauses automatiques. Mesuré sur une vraie
+// séance à deux clients : « Pause auto : alice a 125,6 s de retard » sur un
+// média de 42 s, séance morte ensuite.
+//
+// La salle repart en pause : personne ne peut jouer un média que les autres
+// n'ont pas encore ouvert, et le premier `control play` la relancera.
+// Le ready-gate n'est PAS rejoué (`started` reste levé) : changer d'épisode ne
+// redemande pas à toute la salle de se déclarer prête.
+func (r *Room) resetForMediaLocked(now time.Time, m *member) {
+	nowMs := msOf(now)
+	r.state = protocol.RoomState{
+		Paused:      true,
+		PositionSec: 0,
+		Rate:        1,
+		RefServerMs: nowMs,
+		SetBy:       setByServer,
+	}
+	r.resetLatenessLocked()
+	r.broadcastLocked(protocol.TypeRoomState, r.state)
+	r.broadcastLocked(protocol.TypeToast, protocol.Toast{
+		Level: protocol.LevelInfo,
+		Text: fmt.Sprintf("%s a changé de fichier : %s — la salle repart du début",
+			m.name, m.file.Name),
+	})
+	r.log.Info("changement de média", "room", r.name, "user", m.id, "fichier", m.file.Name)
 }
 
 // handleControl applique une action volontaire de l'utilisateur à l'état

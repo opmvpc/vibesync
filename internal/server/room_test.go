@@ -538,6 +538,111 @@ func TestSetFileDureeInconnueNAvertitPas(t *testing.T) {
 	}
 }
 
+// lanceLecture met tout le monde prêt et lance la salle à `pos`.
+func lanceLecture(t *testing.T, room *Room, m *member, pos float64) {
+	t.Helper()
+	for _, autre := range room.members {
+		room.handleSetReady(autre, protocol.SetReady{Ready: true})
+	}
+	room.handleControl(m, protocol.Control{Action: protocol.ActionPlay, PositionSec: pos})
+	if room.State().Paused {
+		t.Fatal("la salle devait partir en lecture")
+	}
+}
+
+// Spec §Comportements serveur 5bis (VS-039) : un membre qui change de média
+// remet la salle à une position vierge. Sans ça, la position de l'ancien média
+// survivait au changement et la salle réclamait à tous une position qui
+// n'existe pas dans le nouveau — mesuré en séance réelle : « Pause auto : alice
+// a 125,6 s de retard » sur un média de 42 s.
+func TestSetFileChangementDeMediaRemetLaSalleAZero(t *testing.T) {
+	room, clk := newTestRoom()
+	alice, recA := joinTest(t, room, "Alice")
+	_, recB := joinTest(t, room, "Bob")
+	room.handleSetFile(alice, protocol.SetFile{Name: "ep1.mkv", DurationSec: 3600})
+	lanceLecture(t, room, alice, 0)
+	clk.Advance(120 * time.Second)
+	if got := room.positionAtLocked(msOf(clk.Now())); got < 119 {
+		t.Fatalf("la salle devait avoir avancé, position %v", got)
+	}
+	recA.reset()
+	recB.reset()
+
+	room.handleSetFile(alice, protocol.SetFile{Name: "ep2.mkv", DurationSec: 42})
+
+	st := room.State()
+	if !st.Paused || st.PositionSec != 0 || st.Rate != 1 ||
+		st.SetBy != setByServer || st.RefServerMs != msOf(clk.Now()) {
+		t.Fatalf("la salle devait repartir d'une position vierge, obtenu %+v", st)
+	}
+	for name, rec := range map[string]*recorder{"Alice": recA, "Bob": recB} {
+		if got := rec.lastState(t); !got.Paused || got.PositionSec != 0 || got.SetBy != setByServer {
+			t.Fatalf("%s : roomState diffusé inattendu %+v", name, got)
+		}
+		toast := rec.lastToast(t)
+		if toast.Level != protocol.LevelInfo ||
+			!strings.Contains(toast.Text, "a changé de fichier") ||
+			!strings.Contains(toast.Text, "ep2.mkv") {
+			t.Fatalf("%s : toast de changement de fichier attendu, obtenu %+v", name, toast)
+		}
+	}
+	// Le ready-gate n'est PAS rejoué : changer d'épisode ne redemande pas à
+	// toute la salle de se déclarer prête.
+	if !room.started {
+		t.Fatal("le ready-gate ne doit pas être rejoué par un changement de média")
+	}
+}
+
+// La PREMIÈRE déclaration d'un membre ne remet jamais la salle à zéro : c'est
+// l'arrivant qui ouvre sa copie au milieu du film, il ne doit ramener personne
+// au début — y compris quand son nom de fichier diffère de celui des autres.
+func TestSetFilePremiereDeclarationNeResetPas(t *testing.T) {
+	for _, nom := range []string{"ep1.mkv", "ep1-vf.mkv"} {
+		room, clk := newTestRoom()
+		alice, _ := joinTest(t, room, "Alice")
+		bob, _ := joinTest(t, room, "Bob")
+		room.handleSetFile(alice, protocol.SetFile{Name: "ep1.mkv", DurationSec: 3600})
+		lanceLecture(t, room, alice, 0)
+		clk.Advance(120 * time.Second)
+
+		room.handleSetFile(bob, protocol.SetFile{Name: nom, DurationSec: 3600})
+
+		st := room.State()
+		if st.Paused || st.PositionSec != 0 || st.SetBy == setByServer {
+			t.Fatalf("%s : la première déclaration de Bob ne doit rien remettre à zéro (%+v)", nom, st)
+		}
+		if got := room.positionAtLocked(msOf(clk.Now())); got < 119 {
+			t.Fatalf("%s : la séance devait continuer, position %v", nom, got)
+		}
+	}
+}
+
+// Re-déclaration à l'identique : chaque `welcome` en produit une (§File
+// d'attente hors ligne). Si elle remettait la salle à zéro, la moindre
+// reconnexion tuerait la séance — et deux copies aux noms différents se
+// chasseraient l'une l'autre à chaque fois.
+func TestSetFileRedeclarationNeResetPas(t *testing.T) {
+	room, clk := newTestRoom()
+	alice, _ := joinTest(t, room, "Alice")
+	bob, _ := joinTest(t, room, "Bob")
+	room.handleSetFile(alice, protocol.SetFile{Name: "film.mkv", DurationSec: 3600})
+	room.handleSetFile(bob, protocol.SetFile{Name: "film-vf.mkv", DurationSec: 3600})
+	lanceLecture(t, room, alice, 0)
+	clk.Advance(120 * time.Second)
+
+	// Le même nom, puis le même à la casse près : deux reconnexions.
+	room.handleSetFile(alice, protocol.SetFile{Name: "film.mkv", DurationSec: 3600})
+	room.handleSetFile(bob, protocol.SetFile{Name: "FILM-VF.MKV", DurationSec: 3600})
+	room.handleSetFile(alice, protocol.SetFile{Name: "  film.mkv  ", DurationSec: 3600})
+
+	if st := room.State(); st.Paused || st.SetBy == setByServer {
+		t.Fatalf("une re-déclaration ne doit pas remettre la salle à zéro (%+v)", st)
+	}
+	if got := room.positionAtLocked(msOf(clk.Now())); got < 119 {
+		t.Fatalf("la séance devait continuer, position %v", got)
+	}
+}
+
 func TestSetFileNomVideIgnore(t *testing.T) {
 	room, _ := newTestRoom()
 	alice, recA := joinTest(t, room, "Alice")

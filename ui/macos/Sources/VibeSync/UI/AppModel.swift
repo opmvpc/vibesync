@@ -102,6 +102,12 @@ public final class AppModel: ObservableObject {
     private var seekCmds = 0
     private var rateCmds = 0
 
+    /// Pauses automatiques annoncées par le serveur depuis le lancement (toasts
+    /// « Pause auto : … »). Publié dans l'état du mode auto : c'est ce compteur
+    /// qui prouve, sur une vraie séance, qu'un changement de fichier ne laisse
+    /// plus la salle réclamer une pause en boucle (VS-039).
+    private var autoPauseToasts = 0
+
     /// Le moteur de synchronisation : la couche C commune (VSCore) vue à
     /// travers CoreEngine.swift. Une classe, donc une référence — mais la même
     /// discipline qu'avant : tous les appels partent de la file principale.
@@ -437,15 +443,20 @@ public final class AppModel: ObservableObject {
 
     // MARK: - Dossiers médias (VS-026)
 
-    /// Propose d'ouvrir le média que les autres regardent déjà, tant que nous
-    /// n'en avons pas ouvert un. Le bandeau ne ressuscite pas une fois écarté
-    /// pour ce fichier.
+    /// Propose d'ouvrir le média qu'un autre membre a déclaré, dès qu'il diffère
+    /// du nôtre. Le bandeau ne ressuscite pas une fois écarté pour ce fichier.
+    ///
+    /// VS-039 : la version d'origine sortait dès que NOUS avions un fichier
+    /// ouvert, si bien que le cas « épisode suivant » — un participant change de
+    /// média en cours de séance — ne proposait jamais rien aux autres. La
+    /// comparaison au nôtre couvre les deux cas d'un coup : sans fichier, tout
+    /// nom déclaré diffère du nôtre (vide).
     private func refreshWatchBanner() {
-        if engine.haveFile {
-            showWatchBanner = false  // on a déjà notre copie ouverte
-            return
-        }
+        let mine = engine.haveFile ? engine.fileName : ""
         for u in users where !u.id.isEmpty && u.id != engine.selfId && u.hasFile && !u.fileName.isEmpty {
+            if u.fileName.compare(mine, options: .caseInsensitive) == .orderedSame {
+                continue  // il regarde la même chose que nous
+            }
             if u.fileName == dismissedWatchFile {
                 return
             }
@@ -709,6 +720,15 @@ public final class AppModel: ObservableObject {
             jw_kv_num(&w, "driftSec", driftSec)
             jw_kv_bool(&w, "buffering", buffering ? 1 : 0)
             jw_kv_i64(&w, "latencyMs", latencyMs)
+            // Bandeau « X regarde <fichier> » (VS-026, élargi au changement de
+            // fichier en cours de salle par VS-039) : le harnais doit pouvoir
+            // constater qu'un participant qui change de média le déclenche.
+            jw_kv_bool(&w, "watchShow", showWatchBanner ? 1 : 0)
+            AppModel.jwText(&w, "watchFile", watchFile)
+            // Pauses automatiques annoncées par le serveur depuis le lancement :
+            // c'est la face visible du symptôme 2 de VS-039 (« Pause auto : X a
+            // N s de retard » en boucle après un changement de fichier).
+            jw_kv_i64(&w, "autoPauseToasts", Int64(autoPauseToasts))
             // Commandes envoyées à VLC depuis le lancement, par nature :
             // `rateCmds` doit rester à 0 sur une séance normale (VS-038).
             jw_kv_i64(&w, "pauseCmds", Int64(pauseCmds))
@@ -956,6 +976,9 @@ public final class AppModel: ObservableObject {
     private func pushToast(level: String, text: String) {
         if text.isEmpty {
             return
+        }
+        if text.hasPrefix("Pause auto") {
+            autoPauseToasts += 1
         }
         toasts.append(ToastLine(level: level, text: text, until: Date().addingTimeInterval(6)))
         if toasts.count > 4 {

@@ -199,10 +199,16 @@ typedef struct {
     b32 media_searching;        // recherche en cours (hors thread UI)
     char media_notice[224];     // « … introuvable » : bandeau + raccourci Réglages
     b32 media_notice_show;
-    // Bandeau « X regarde <fichier> » à l'arrivée en salle.
+    // Bandeau « X regarde <fichier> » : à l'arrivée en salle, et dès qu'un autre
+    // membre déclare un fichier différent du nôtre (VS-039, « épisode suivant »).
     char watch_who[64];
     char watch_file[160];
     b32 watch_show;
+    // Fichier pour lequel l'utilisateur a fermé le bandeau : il ne ressuscite
+    // pas pour celui-là. Marqueur EXPLICITE, comme `dismissedWatchFile` côté
+    // macOS — déduire le refus de « bandeau caché sur ce nom » confondait un
+    // refus avec une simple égalité de fichiers.
+    char watch_dismissed[160];
 
     // ---- versions et mise à jour (VS-023) ----
     char version_client[24];

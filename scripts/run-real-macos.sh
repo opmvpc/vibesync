@@ -52,6 +52,11 @@ SEEK_TARGET=120
 # mieux serait exiger du moteur ce qu'il ne cherche plus à faire.
 DRIFT_MAX=1.5
 MEDIA_SECONDS=600
+# MEDIA2_SECONDS : durée du média du changement de fichier (VS-039). Volontairement
+# plus courte que la position atteinte dans le premier (SEEK_TARGET = 120 s) —
+# c'est le cas qui tuait la séance : la salle pointait à 120 s dans un fichier
+# qui n'en fait que 42.
+MEDIA2_SECONDS=42
 
 FAILURES=0
 PASSED=0
@@ -185,6 +190,18 @@ else
     cp "$MEDIA1" "$MEDIA2" || die "copie du média impossible"
     say "  WAV silencieux généré ($MEDIA_SECONDS s, une copie par client)"
 fi
+
+# Second média, pour le changement de fichier en cours de salle (VS-039). Il est
+# BEAUCOUP plus court que le premier : c'est ce qui rend le bug visible, la
+# position de salle de l'ancien média n'existe pas dans le nouveau. Il est
+# généré même quand un fichier a été fourni en argument (le scénario du
+# changement ne dépend pas du média de départ).
+mkdir -p "$WORK/media1b" "$WORK/media2b"
+MEDIA1B="$WORK/media1b/vibesync-test2.wav"
+MEDIA2B="$WORK/media2b/vibesync-test2.wav"
+make_silent_wav "$MEDIA1B" "$MEDIA2_SECONDS" || die "génération du second média impossible"
+cp "$MEDIA1B" "$MEDIA2B" || die "copie du second média impossible"
+say "  second WAV pour le changement de fichier ($MEDIA2_SECONDS s, une copie par client)"
 
 PID1=""; PID2=""
 
@@ -367,7 +384,82 @@ else
 fi
 say "  seeks de recalage : client1=$(num "$(jget "$ST1" seekCmds)") client2=$(num "$(jget "$ST2" seekCmds)")"
 
-step "(h) fermeture propre"
+step "(h) changement de fichier en cours de salle (VS-039)"
+# Le scénario du retour terrain de Thibault : la salle est en LECTURE à ~120 s
+# du premier média quand un participant ouvre un autre fichier — plus court que
+# cette position. Deux choses doivent se produire : l'autre reçoit la
+# proposition d'ouvrir le nouveau média (bandeau VS-026, jusqu'ici réservé à
+# ceux qui n'avaient AUCUN fichier), et la position de salle de l'ancien média
+# cesse de faire loi (sinon la salle réclame un rattrapage impossible et
+# enchaîne les « Pause auto : X a N s de retard »).
+AP1_BEFORE=$(num "$(jget "$ST1" autoPauseToasts)")
+AP2_BEFORE=$(num "$(jget "$ST2" autoPauseToasts)")
+say "  salle à $(jget "$ST1" roomPositionSec) s, bascule du client 1 vers un média de ${MEDIA2_SECONDS}s"
+echo "open $MEDIA1B" >> "$CMD1"
+
+if wait_for "$FILE_TIMEOUT" "le client 1 a déclaré le nouveau fichier" \
+    '[ "$(jget "$ST1" file)" = vibesync-test2.wav ] && [ "$(jget "$ST1" fileDeclared)" = true ]'; then
+    pass "le client 1 a basculé sur le nouveau média (durée $(jget "$ST1" durationSec) s)"
+else
+    fail "le client 1 n'a pas déclaré le nouveau fichier (file=$(jget "$ST1" file))"
+fi
+
+# (h.1) symptôme 1 : le bandeau de récupération chez l'AUTRE.
+if wait_for "$STEP_TIMEOUT" "bandeau de récupération chez le client 2" \
+    '[ "$(jget "$ST2" watchShow)" = true ] && [ "$(jget "$ST2" watchFile)" = vibesync-test2.wav ]'; then
+    pass "le client 2 reçoit la proposition d'ouvrir « vibesync-test2.wav »"
+else
+    fail "aucun bandeau chez le client 2 (watchShow=$(jget "$ST2" watchShow) watchFile=$(jget "$ST2" watchFile))"
+fi
+
+# (h.2) symptôme 2, à la racine : la position de salle de l'ancien média ne doit
+# plus faire loi. La salle repart d'une position vierge, en pause.
+if wait_for "$STEP_TIMEOUT" "la salle repart d'une position vierge" \
+    'lt "$(jget "$ST1" roomPositionSec)" 1 && lt "$(jget "$ST2" roomPositionSec)" 1 \
+     && [ "$(jget "$ST1" paused)" = true ] && [ "$(jget "$ST2" paused)" = true ]'; then
+    pass "la salle est repartie de zéro, en pause, chez les deux clients"
+else
+    fail "la position de l'ancien média contamine le nouveau (salle1=$(jget "$ST1" roomPositionSec) salle2=$(jget "$ST2" roomPositionSec) pause1=$(jget "$ST1" paused) pause2=$(jget "$ST2" paused))"
+fi
+snapshot
+
+# (h.3) le client 2 bascule à son tour, puis on rejoue une vraie lecture.
+echo "open $MEDIA2B" >> "$CMD2"
+if wait_for "$FILE_TIMEOUT" "le client 2 a déclaré le nouveau fichier" \
+    '[ "$(jget "$ST2" file)" = vibesync-test2.wav ] && [ "$(jget "$ST2" fileDeclared)" = true ]'; then
+    pass "les deux clients sont sur le nouveau média"
+else
+    fail "le client 2 n'a pas déclaré le nouveau fichier (file=$(jget "$ST2" file))"
+fi
+echo play >> "$CMD1"
+if wait_for "$STEP_TIMEOUT" "les deux VLC rejouent le nouveau média" \
+    '[ "$(jget "$ST1" vlcState)" = playing ] && [ "$(jget "$ST2" vlcState)" = playing ]'; then
+    pass "la lecture repart sur le nouveau média"
+else
+    fail "la lecture ne repart pas (vlc1=$(jget "$ST1" vlcState) vlc2=$(jget "$ST2" vlcState))"
+fi
+say "  maintien de la synchronisation sur le nouveau média pendant ${HOLD_SEC}s…"
+# Les positions doivent rester DANS le nouveau média : un client renvoyé à la
+# fin du fichier (position de l'ancien média rabotée à la durée du nouveau) est
+# exactement ce qu'on refuse. L'état `playing` fait partie de la condition —
+# sans lui, deux lecteurs arrêtés net à la fin du média passeraient pour
+# « parfaitement synchronisés » (écart 0, positions 0).
+if holds "$HOLD_SEC" '[ "$(jget "$ST1" vlcState)" = playing ] && [ "$(jget "$ST2" vlcState)" = playing ] \
+    && lt "$(pos1)" '"$MEDIA2_SECONDS"' && lt "$(pos2)" '"$MEDIA2_SECONDS"' && lt "$(gap)" '"$DRIFT_MAX"; then
+    pass "les deux lecteurs avancent ensemble dans le nouveau média (écart $(gap) s)"
+else
+    fail "synchronisation morte sur le nouveau média (pos1=$(pos1) pos2=$(pos2) écart $(gap) s)"
+fi
+AP1_AFTER=$(num "$(jget "$ST1" autoPauseToasts)")
+AP2_AFTER=$(num "$(jget "$ST2" autoPauseToasts)")
+if [ "$AP1_AFTER" = "$AP1_BEFORE" ] && [ "$AP2_AFTER" = "$AP2_BEFORE" ]; then
+    pass "aucune pause automatique déclenchée par le changement de fichier"
+else
+    fail "pauses automatiques fantômes : client1 $AP1_BEFORE→$AP1_AFTER, client2 $AP2_BEFORE→$AP2_AFTER"
+fi
+snapshot
+
+step "(i) fermeture propre"
 echo quit >> "$CMD1"
 echo quit >> "$CMD2"
 if wait_for 15 "arrêt des deux clients" \

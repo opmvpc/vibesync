@@ -466,6 +466,22 @@ void engine_open_file(VsEngine *e, Str8 name, i64 size_bytes, VsOutput *out) {
     e->buffering = 0;
     e->vlc_error = 0;
     e->applied_rate = 1;
+    // Média neuf : l'état de salle de référence appartenait au PRÉCÉDENT
+    // (docs/protocol.md §Chargement de fichier, VS-039). Le garder revenait à
+    // exiger du nouveau lecteur une position qui n'existe pas chez lui — rabotée
+    // à sa durée, c'est-à-dire sa fin. On oublie donc la référence, l'historique
+    // de dérive et la dernière position de salle connue (celle qu'une reprise
+    // « salle vierge » proposerait) : plus aucune correction jusqu'au roomState
+    // suivant, que le serveur diffuse immédiatement (règle serveur 5bis). C'est
+    // aussi ce qui ferme la course entre le premier statut du nouveau média et
+    // ce roomState.
+    e->have_state = 0;
+    e->have_pending_rs = 0;
+    e->drift_count = 0;
+    e->drift = 0;
+    e->correcting = VS_CORRECT_NONE;
+    e->have_last_room_pos = 0;
+    e->last_room_pos = 0;
     VsMsg *m = out_msg(out, VS_MSG_SET_FILE);
     m->name = e->file_name;
     m->duration_sec = 0;

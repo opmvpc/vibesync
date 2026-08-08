@@ -143,12 +143,12 @@ final class VSCoreVectorsTests: XCTestCase {
             .contentsOfDirectory(atPath: dir.path)
             .filter { $0.hasSuffix(".json") }
             .sorted()
-        XCTAssertGreaterThanOrEqual(names.count, 14,
-                                    "\(names.count) vecteur(s) dans \(dir.path), attendu au moins 14")
+        XCTAssertGreaterThanOrEqual(names.count, 15,
+                                    "\(names.count) vecteur(s) dans \(dir.path), attendu au moins 15")
         for name in names {
             replay(dir.appendingPathComponent(name))
         }
-        // Plancher, pas un compte exact : les 14 vecteurs totalisent 176 pas
+        // Plancher, pas un compte exact : les 15 vecteurs totalisent 202 pas
         // aujourd'hui, un vecteur ajouté ne doit pas rendre ce test rouge. Le
         // but est d'attraper le rejeu qui ne compare RIEN (trace vide, sortie
         // anticipée) — panne silencieuse, sinon.
@@ -229,6 +229,16 @@ final class VSCoreVectorsTests: XCTestCase {
                     fake.play(now)
                 case "userSeek":
                     fake.seek(JSON.number(data, "positionSec", 0), now)
+                case "openFile":
+                    // Changement de média en cours de séance (VS-039).
+                    // `fake.load` reproduit ce que le driver garantit au
+                    // moteur : nouveau fichier chargé, EN PAUSE À 0
+                    // (docs/protocol.md §Chargement de fichier). Les commandes
+                    // de préparation sont au driver, pas au moteur : elles ne
+                    // figurent pas dans la trace.
+                    let opened = JSON.string(data, "fileName")
+                    fake.load(name: opened, length: JSON.number(data, "durationSec", 0), now: now)
+                    withStr8(opened) { engine_open_file(&engine, $0, vectorFileSize, &out) }
                 case "welcome":
                     apply(welcome: data, now: now, engine: &engine, out: &out)
                 case "pong":

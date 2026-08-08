@@ -38,6 +38,11 @@ param(
     [string]$Media = "",
     [string]$Url = "ws://127.0.0.1:8080/ws",
     [int]$MediaSeconds = 600,
+    # Duree du media du changement de fichier (VS-039). Volontairement plus
+    # courte que la position atteinte dans le premier (le seek fait dans VLC va
+    # a 300 s) : c'est le cas qui tuait la seance, la salle pointant a 300 s
+    # dans un fichier qui n'en fait que 42.
+    [int]$Media2Seconds = 42,
     # Ne pas installer le vlcrc facon Syncplay (seance "environnement propre").
     [switch]$PlainVlcrc,
     # Ne pas ouvrir de VLC AVANT la seance (le piege one-instance).
@@ -267,6 +272,17 @@ if ($Media -ne "") {
     Copy-Item $media1 $media2
     Say "  WAV silencieux genere ($MediaSeconds s, une copie par client)"
 }
+
+# Second media, pour le changement de fichier en cours de salle (VS-039). Il est
+# BEAUCOUP plus court que le premier : c'est ce qui rend le bug visible, la
+# position de salle de l'ancien media n'existe pas dans le nouveau. Genere meme
+# quand un fichier a ete fourni en argument.
+New-Item -ItemType Directory -Force -Path (Join-Path $work "media1b"), (Join-Path $work "media2b") | Out-Null
+$media1b = Join-Path $work "media1b\vibesync-test2.wav"
+$media2b = Join-Path $work "media2b\vibesync-test2.wav"
+New-SilentWav $media1b $Media2Seconds
+Copy-Item $media1b $media2b
+Say "  second WAV pour le changement de fichier ($Media2Seconds s, une copie par client)"
 
 # --- vlcrc ------------------------------------------------------------------
 
@@ -538,7 +554,73 @@ if ($r1 -eq 0 -and $r2 -eq 0) {
 }
 Say ("  seeks de recalage : client1={0} client2={1}" -f [int](S1).seekCmds, [int](S2).seekCmds)
 
-Step "(k) fermeture propre"
+Step "(k) changement de fichier en cours de salle (VS-039)"
+# Le scenario du retour terrain de Thibault : la salle est en LECTURE loin dans
+# le premier media quand un participant ouvre un autre fichier, plus court que
+# cette position. L'autre doit recevoir la proposition d'ouvrir le nouveau media
+# (bandeau VS-026, jusqu'ici reserve a ceux qui n'avaient AUCUN fichier), et la
+# position de salle de l'ancien media doit cesser de faire loi -- sinon la salle
+# reclame un rattrapage impossible et enchaine les « Pause auto ».
+$ap1Before = [int](S1).autoPauseToasts
+$ap2Before = [int](S2).autoPauseToasts
+Say ("  salle a {0:F1} s, bascule du client 1 vers un media de $Media2Seconds s" -f (S1).roomPositionSec)
+Send-Cmd $cmd1 "open $media1b"
+if (Wait-For $FILE_TIMEOUT "le client 1 a declare le nouveau fichier" {
+        $a = S1; ($a.file -eq "vibesync-test2.wav" -and $a.fileDeclared) }) {
+    Pass "le client 1 a bascule sur le nouveau media (duree $((S1).durationSec) s)"
+} else {
+    Fail "le client 1 n'a pas declare le nouveau fichier (file=$((S1).file))"
+}
+if (Wait-For $STEP_TIMEOUT "bandeau de recuperation chez le client 2" {
+        $b = S2; ($b.watchShow -and $b.watchFile -eq "vibesync-test2.wav") }) {
+    Pass "le client 2 recoit la proposition d'ouvrir « vibesync-test2.wav »"
+} else {
+    Fail "aucun bandeau chez le client 2 (watchShow=$((S2).watchShow) watchFile=$((S2).watchFile))"
+}
+if (Wait-For $STEP_TIMEOUT "la salle repart d'une position vierge" {
+        $a = S1; $b = S2
+        ($a.roomPositionSec -lt 1 -and $b.roomPositionSec -lt 1 -and $a.paused -and $b.paused) }) {
+    Pass "la salle est repartie de zero, en pause, chez les deux clients"
+} else {
+    Fail ("la position de l'ancien media contamine le nouveau (salle1={0:F1} salle2={1:F1})" -f (S1).roomPositionSec, (S2).roomPositionSec)
+}
+Snapshot
+
+Send-Cmd $cmd2 "open $media2b"
+if (Wait-For $FILE_TIMEOUT "le client 2 a declare le nouveau fichier" {
+        $b = S2; ($b.file -eq "vibesync-test2.wav" -and $b.fileDeclared) }) {
+    Pass "les deux clients sont sur le nouveau media"
+} else {
+    Fail "le client 2 n'a pas declare le nouveau fichier (file=$((S2).file))"
+}
+Send-Cmd $cmd1 "play"
+if (Wait-For $STEP_TIMEOUT "les deux VLC rejouent le nouveau media" {
+        $a = S1; $b = S2; ($a.vlcState -eq "playing" -and $b.vlcState -eq "playing") }) {
+    Pass "la lecture repart sur le nouveau media"
+} else {
+    Fail "la lecture ne repart pas (vlc1=$((S1).vlcState) vlc2=$((S2).vlcState))"
+}
+Say "  maintien de la synchronisation sur le nouveau media pendant $HOLD_SEC s..."
+# L'etat playing fait partie de la condition : deux lecteurs arretes net a la
+# fin du media auraient un ecart de 0 s et passeraient pour synchronises.
+if (Holds $HOLD_SEC {
+        $a = S1; $b = S2
+        ($a.vlcState -eq "playing" -and $b.vlcState -eq "playing" -and
+         (Pos $a) -lt $Media2Seconds -and (Pos $b) -lt $Media2Seconds -and (Gap) -lt $DRIFT_MAX) }) {
+    Pass ("les deux lecteurs avancent ensemble dans le nouveau media (ecart {0:F3} s)" -f (Gap))
+} else {
+    Fail ("synchronisation morte sur le nouveau media (pos1={0:F1} pos2={1:F1} ecart {2:F3} s)" -f (Pos (S1)), (Pos (S2)), (Gap))
+}
+$ap1After = [int](S1).autoPauseToasts
+$ap2After = [int](S2).autoPauseToasts
+if ($ap1After -eq $ap1Before -and $ap2After -eq $ap2Before) {
+    Pass "aucune pause automatique declenchee par le changement de fichier"
+} else {
+    Fail "pauses automatiques fantomes : client1 $ap1Before->$ap1After, client2 $ap2Before->$ap2After"
+}
+Snapshot
+
+Step "(l) fermeture propre"
 Send-Cmd $cmd1 "quit"
 Send-Cmd $cmd2 "quit"
 if (Wait-For 20 "arret des deux clients" { $script:p1.HasExited -and $script:p2.HasExited }) {

@@ -522,6 +522,22 @@ func (e *Engine) OpenFile(ctx context.Context, path string) error {
 	e.vlcErr = ""
 	e.vlcOK = true
 	e.appliedRat = 1
+	// Média neuf : l'état de salle de référence appartenait au PRÉCÉDENT
+	// (docs/protocol.md §Chargement de fichier, VS-039). Le garder revenait à
+	// exiger du nouveau lecteur une position qui n'existe pas chez lui —
+	// rabotée à sa durée, c'est-à-dire sa fin. On oublie donc la référence,
+	// l'historique de dérive et la mémoire de séance (celle qu'une reprise
+	// « salle vierge » proposerait) : plus aucune correction jusqu'au roomState
+	// suivant, que le serveur diffuse immédiatement (règle serveur 5bis). C'est
+	// aussi ce qui ferme la course entre le premier statut du nouveau média et
+	// ce roomState.
+	e.haveState = false
+	e.pendingRS = nil
+	e.drifts = nil
+	e.drift = 0
+	e.correcting = ""
+	e.resumePos = 0
+	e.resumeKnown = false
 	e.queueLocked(protocol.TypeSetFile, protocol.SetFile{
 		Name:      e.fileInfo.Name,
 		SizeBytes: info.Size(),
