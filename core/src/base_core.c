@@ -247,7 +247,12 @@ b32 str_to_i64(Str8 s, i64 *out) {
         if (acc > (u64)0x8000000000000000ULL) return 0;
     }
     if (!neg && acc > (u64)0x7fffffffffffffffULL) return 0;
-    *out = neg ? -(i64)acc : (i64)acc;
+    // acc == 2^63 n'est atteignable que pour « -9223372036854775808 » (le cas
+    // positif vient d'être rejeté). Nier cette valeur en signé est un
+    // débordement — INT64_MIN n'a pas d'opposé représentable — donc un UB
+    // formel : on écrit la borne directement (VS-035).
+    if (acc == (u64)0x8000000000000000ULL) *out = INT64_MIN;
+    else *out = neg ? -(i64)acc : (i64)acc;
     return 1;
 }
 

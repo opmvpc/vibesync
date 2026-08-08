@@ -119,6 +119,33 @@ static void test_base(Arena *a) {
     CHECK(!str_to_i64(S("12a"), &v), "str_to_i64 déchet accepté");
     CHECK(!str_to_i64(S(""), &v), "str_to_i64 vide accepté");
 
+    // Bornes exactes et dépassements des deux côtés (VS-035). Contrat : hors
+    // de [INT64_MIN, INT64_MAX] la fonction REFUSE et laisse *out intact — pas
+    // de saturation, pas d'enroulement, et surtout aucune négation d'INT64_MIN.
+    CHECK(str_to_i64(S("9223372036854775807"), &v) && v == 9223372036854775807LL, "str_to_i64 max");
+    CHECK(str_to_i64(S("+9223372036854775807"), &v) && v == 9223372036854775807LL, "str_to_i64 max signé +");
+    CHECK(str_to_i64(S("-9223372036854775807"), &v) && v == -9223372036854775807LL, "str_to_i64 min+1");
+    CHECK(str_to_i64(S("  -9223372036854775808  "), &v) && v == (-9223372036854775807LL - 1),
+          "str_to_i64 min entouré d'espaces");
+    CHECK(str_to_i64(S("-0000000000009223372036854775808"), &v) && v == (-9223372036854775807LL - 1),
+          "str_to_i64 min avec zéros de tête");
+    CHECK(str_to_i64(S("-0"), &v) && v == 0, "str_to_i64 -0");
+    // Aller-retour sur les deux bornes : i64_to_str et str_to_i64 sont inverses.
+    i64_to_str(-9223372036854775807LL - 1, nb, sizeof(nb));
+    CHECK(str_to_i64(str8_from_cstr(nb), &v) && v == (-9223372036854775807LL - 1), "aller-retour i64 min");
+    i64_to_str(9223372036854775807LL, nb, sizeof(nb));
+    CHECK(str_to_i64(str8_from_cstr(nb), &v) && v == 9223372036854775807LL, "aller-retour i64 max");
+    // Dépassements : *out doit rester tel quel (sentinelle 424242).
+    v = 424242;
+    CHECK(!str_to_i64(S("-9223372036854775809"), &v) && v == 424242, "str_to_i64 sous-débordement accepté");
+    CHECK(!str_to_i64(S("+9223372036854775808"), &v) && v == 424242, "str_to_i64 débordement signé + accepté");
+    CHECK(!str_to_i64(S("99999999999999999999"), &v) && v == 424242, "str_to_i64 débordement large accepté");
+    CHECK(!str_to_i64(S("-99999999999999999999"), &v) && v == 424242, "str_to_i64 sous-débordement large accepté");
+    CHECK(!str_to_i64(S("18446744073709551616"), &v) && v == 424242, "str_to_i64 2^64 accepté");
+    CHECK(!str_to_i64(S("-"), &v) && v == 424242, "str_to_i64 signe seul accepté");
+    CHECK(!str_to_i64(S("+"), &v) && v == 424242, "str_to_i64 plus seul accepté");
+    CHECK(!str_to_i64(S("   "), &v) && v == 424242, "str_to_i64 espaces seuls acceptés");
+
     f64 nums[] = {0, 1, -1, 0.1, 100.2, 101.00000000000001, 1e-9, 1e300, -0.0, 3600, 0.95, 1.05};
     for (isize i = 0; i < VS_ARRAY_COUNT(nums); i++) {
         isize n = f64_to_str(nums[i], nb, sizeof(nb));

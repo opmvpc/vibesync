@@ -157,6 +157,11 @@ isize f64_to_str(f64 v, char *buf, isize cap);
 // str_to_f64 lit un flottant complet (toute la chaîne doit être consommée).
 b32 str_to_f64(Str8 s, f64 *out);
 isize i64_to_str(i64 v, char *buf, isize cap);
+// str_to_i64 lit un entier décimal complet, espaces de bord tolérés, signe
+// « + » ou « - » facultatif. Renvoie 1 et écrit `*out` en cas de succès.
+// Renvoie 0 SANS toucher `*out` si la chaîne est vide, contient autre chose
+// que des chiffres, ou sort de [INT64_MIN, INT64_MAX] : un dépassement est un
+// refus, jamais une saturation ni un enroulement.
 b32 str_to_i64(Str8 s, i64 *out);
 f64 f64_round(f64 v);
 f64 f64_abs(f64 v);

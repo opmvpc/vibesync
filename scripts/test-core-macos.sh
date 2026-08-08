@@ -52,8 +52,8 @@ clang $STD $WARN $OPT $SAN \
 
 echo "== exécution"
 # halt_on_error : un dépassement d'arène ou un UB doivent ARRÊTER la suite, pas
-# la teinter. La seule exception connue est listée dans core/tests/ubsan.supp
-# (VS-035) ; toute autre remontée fait échouer le script.
+# la teinter. core/tests/ubsan.supp est volontairement vide de règles depuis la
+# clôture de VS-035 : toute remontée fait échouer le script.
 ASAN_OPTIONS=detect_leaks=0:halt_on_error=1 \
 UBSAN_OPTIONS="suppressions=$CORE/tests/ubsan.supp:print_stacktrace=1:halt_on_error=1" \
     "$BIN" "$VECTORS"
