@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"os/exec"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -62,14 +63,7 @@ func Launch(ctx context.Context, opts LaunchOptions) (*Process, error) {
 	if err != nil {
 		return nil, err
 	}
-	args := []string{
-		"--extraintf=http",
-		"--http-host=127.0.0.1",
-		fmt.Sprintf("--http-port=%d", port),
-		"--http-password=" + password,
-		"--no-video-title-show",
-		"--no-one-instance",
-	}
+	args := launchArgs(runtime.GOOS, port, password)
 	args = append(args, opts.ExtraArgs...)
 	args = append(args, opts.FilePath)
 
@@ -100,6 +94,77 @@ func Launch(ctx context.Context, opts LaunchOptions) (*Process, error) {
 		return nil, err
 	}
 	return p, nil
+}
+
+// oneInstanceArgs : les trois drapeaux de la famille « instance unique »
+// (libvlc-module.c les déclare dans un bloc conditionnel : Windows, ou Linux
+// avec D-Bus). Le VLC macOS ne les connaît PAS et refuse de démarrer —
+// « unknown option or missing mandatory argument » — vérifié sur VLC 3.0.23 :
+// les douze autres drapeaux passent, ces trois-là sont rejetés un par un. Le
+// client Swift fait la même exclusion. On les réserve donc à Windows, seule
+// plateforme où le blindage VS-029 les a validés.
+var oneInstanceArgs = []string{
+	"--no-one-instance",
+	"--no-one-instance-when-started-from-file",
+	"--no-playlist-enqueue",
+}
+
+// launchArgs — TOUT ce dont on dépend est forcé explicitement (VS-029).
+//
+// Miroir du `vlc_build_command` du client C (core/src/vlc_core.c), qui porte
+// le raisonnement complet. En résumé : le vlcrc de l'utilisateur gagne sur les
+// défauts de VLC, jamais sur la ligne de commande, et un VLC configuré par
+// Syncplay faisait échouer l'attache HTTP en laissant un VLC orphelin en
+// lecture. Chaque drapeau neutralise un réglage qui peut venir du vlcrc :
+//
+//	--extraintf=http     l'interface de pilotage ; sur la ligne de commande
+//	                     elle REMPLACE l'`extraintf` du vlcrc.
+//	--lua-intf=http      filet si le vlcrc a fait de luaintf l'interface
+//	                     PRINCIPALE : au moins c'est notre script http qui
+//	                     s'exécute, pas syncplay.lua.
+//	--no-one-instance / --no-one-instance-when-started-from-file
+//	                     sinon le média part à l'instance VLC déjà ouverte —
+//	                     qui joue — et notre port n'est écouté par personne.
+//	                     Le second vaut vrai par défaut : cause racine la plus
+//	                     probable. Windows seulement (voir oneInstanceArgs).
+//	--no-playlist-enqueue    sinon le média est enfilé au lieu d'être ouvert.
+//	                         Windows seulement (même bloc VLC).
+//	--playlist-autostart     sinon rien ne démarre, le statut reste
+//	                         « stopped » et Prepare tourne dans le vide.
+//	--start-paused       l'autoplay est dompté AVANT l'attache : même si
+//	                     l'attache échoue, rien ne part en lecture sauvage.
+//	                     Prepare reste nécessaire (il constate l'état) mais
+//	                     converge immédiatement. Sur macOS le drapeau est
+//	                     accepté mais INOPÉRANT (VLC 3.0.23 démarre quand
+//	                     même la lecture) : seul Prepare tranche.
+//	--no-random --no-loop --no-repeat  le moteur de sync raisonne sur un média
+//	                     unique joué une fois.
+//	--no-play-and-exit   VLC ne doit pas disparaître en fin de média.
+//	--no-video-title-show  confort, déjà là avant VS-029.
+//
+// Volontairement ABSENT : `--intf=<module>`. Forcer l'interface principale
+// obligerait à parier sur son nom (qt/qt4/macosx selon version et OS) et un
+// nom inconnu empêche VLC de démarrer.
+func launchArgs(goos string, port int, password string) []string {
+	args := []string{
+		"--extraintf=http",
+		"--lua-intf=http",
+		"--http-host=127.0.0.1",
+		fmt.Sprintf("--http-port=%d", port),
+		"--http-password=" + password,
+	}
+	if goos == "windows" {
+		args = append(args, oneInstanceArgs...)
+	}
+	return append(args,
+		"--playlist-autostart",
+		"--start-paused",
+		"--no-random",
+		"--no-loop",
+		"--no-repeat",
+		"--no-play-and-exit",
+		"--no-video-title-show",
+	)
 }
 
 // Port est le port de l'interface HTTP de ce VLC.
