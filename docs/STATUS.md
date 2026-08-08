@@ -86,7 +86,8 @@ vitesse ne corrige plus jamais la dérive — zone morte 1,5 s, micro-seek
 conditionné à la médiane des 5 derniers polls, seek immédiat à 5 s. Les trois
 implémentations sont alignées, 14/14 vecteurs des deux côtés, et les deux
 séances réelles (mac PASS 11/11, VM 2 clients C PASS 14/14) affichent
-**0 commande rate**. À faire : tag d'une version portant ce changement.
+**0 commande rate**. **Publié en v0.2.3** (avec les deux boutons Parcourir…
+du chemin VLC — Windows et la nouvelle section VLC des Réglages mac).
 
 Il ne reste QUE ce qui exige un vrai PC Windows x86_64 : VS-020 (overlay OSD),
 revérification one-instance, asan du C Win32. Idée notée : un gel commun des
