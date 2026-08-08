@@ -57,7 +57,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Suite C portable (asan+ubsan, core/tests + 13 vecteurs)
         run: ./scripts/test-core-macos.sh
-      - name: swift test (moteur Swift wrapper + API C, 41 tests)
+      - name: swift test (moteur Swift wrapper + API C, 45 tests)
         run: swift test
       - name: Build release + budget taille (ADR-007/008, < 10 Mo)
         run: |

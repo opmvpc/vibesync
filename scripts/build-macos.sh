@@ -60,6 +60,16 @@ mkdir -p "$APP/Contents/Resources"
 cp "$BINARY" "$APP/Contents/MacOS/VibeSync"
 chmod +x "$APP/Contents/MacOS/VibeSync"
 
+# Icône du bundle : asset committé (comme assets/vibesync.ico côté Windows),
+# rastérisé depuis assets/icon.svg. Doit être copiée AVANT le codesign, sinon la
+# signature ne couvre pas la ressource et le bundle devient invalide.
+ICNS="$REPO_ROOT/ui/macos/Resources/VibeSync.icns"
+if [ -f "$ICNS" ]; then
+    cp "$ICNS" "$APP/Contents/Resources/VibeSync.icns"
+else
+    echo "icône absente : $ICNS (bundle sans icône)" >&2
+fi
+
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -71,6 +81,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <string>vibesync</string>
     <key>CFBundleExecutable</key>
     <string>VibeSync</string>
+    <key>CFBundleIconFile</key>
+    <string>VibeSync.icns</string>
     <key>CFBundleIdentifier</key>
     <string>org.vibesync.client</string>
     <key>CFBundleInfoDictionaryVersion</key>
