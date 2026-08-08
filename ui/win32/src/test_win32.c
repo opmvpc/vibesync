@@ -631,8 +631,9 @@ static void test_ini_file(Arena *a) {
         Str8 nowhere = str8_cat(a, dir, S("vibesync-dossier-absent\\sous\\vibesync.ini"));
         CHECK(!ini_save_file(a, nowhere, text), "répertoire inexistant : échec attendu");
         CHECK(!ini_save_file(a, S(""), text), "chemin vide : échec attendu");
-        // Un répertoire n'est pas ouvrable en écriture : le pendant le plus
-        // proche d'un « accès refusé » qu'on puisse provoquer sans droits.
+        // Un répertoire ne peut pas être remplacé par un fichier : le pendant
+        // le plus proche d'un « accès refusé » qu'on puisse provoquer sans
+        // droits (depuis VS-037 c'est la bascule qui refuse, plus l'ouverture).
         Str8 as_dir = str8_sub(dir, 0, dir.len > 0 ? dir.len - 1 : 0);  // sans le '\' final
         CHECK(!ini_save_file(a, as_dir, text), "répertoire en guise de fichier : échec attendu");
         Ini after;
@@ -641,6 +642,35 @@ static void test_ini_file(Arena *a) {
         CHECK(ini_load_file(a, path, &after) && str8_eq(ini_get(&after, "pseudo", S("")), S("Thibault Éloïse")),
               "contenu intact après un échec");
         DeleteFileW((LPCWSTR)utf8_to_utf16(a, path, NULL));
+
+        // Écriture ATOMIQUE (VS-037). Le contrat qui compte : quand l'écriture
+        // rate, le fichier DÉJÀ sur disque n'est pas touché — ni tronqué ni
+        // remplacé à moitié. On force l'échec au dernier moment, sur la
+        // bascule, en gardant la cible ouverte sans FILE_SHARE_DELETE : c'est
+        // exactement ce que fait un antivirus qui analyse %APPDATA% ou un
+        // Bloc-notes resté ouvert sur vibesync.ini.
+        u16 *wref = utf8_to_utf16(a, path, NULL);
+        CHECK(ini_save_file(a, path, text), "ini de référence écrit");
+        HANDLE lock = CreateFileW((LPCWSTR)wref, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                                  FILE_ATTRIBUTE_NORMAL, NULL);
+        CHECK(lock != INVALID_HANDLE_VALUE, "cible verrouillée pour le test");
+        Str8 doomed = S("pseudo=ce contenu ne doit jamais atterrir\r\n");
+        CHECK(!ini_save_file(a, path, doomed), "bascule impossible : échec attendu");
+        Str8 on_disk = auto_read_text(a, path);
+        CHECK(str8_eq(on_disk, text), "fichier d'origine abîmé malgré l'échec (%lld octets sur disque)",
+              (long long)on_disk.len);
+        // Et pas de déchet : un temporaire orphelin par échec finirait par
+        // joncher %APPDATA%. On cherche « <path>.tmp* », sans dépendre de la
+        // forme exacte du suffixe.
+        WIN32_FIND_DATAW fd;
+        HANDLE orphan = FindFirstFileW((LPCWSTR)utf8_to_utf16(a, str8_cat(a, path, S(".tmp*")), NULL), &fd);
+        CHECK(orphan == INVALID_HANDLE_VALUE, "temporaire orphelin laissé sur disque");
+        if (orphan != INVALID_HANDLE_VALUE) FindClose(orphan);
+        CloseHandle(lock);
+        // Verrou levé : l'écriture repasse, et c'est bien le nouveau contenu.
+        CHECK(ini_save_file(a, path, doomed), "écriture de nouveau possible après une bascule ratée");
+        CHECK(str8_eq(auto_read_text(a, path), doomed), "nouveau contenu effectivement basculé");
+        DeleteFileW((LPCWSTR)wref);
     }
 
     temp_end(top);

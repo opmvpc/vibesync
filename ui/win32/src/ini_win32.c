@@ -52,32 +52,96 @@ b32 ini_load_file(Arena *a, Str8 path, Ini *out) {
 // et jeton de session sans laisser de trace. Le code Win32 est journalisé ici,
 // au seul endroit qui le connaisse ; la décision de prévenir l'utilisateur
 // appartient à l'appelant (ini_flush_notify dans main.c).
+//
+// L'écriture est ATOMIQUE (VS-037) : temporaire du même répertoire, puis
+// bascule par MoveFileExW — même pattern que auto_write_atomic(). Un
+// CreateFileW(CREATE_ALWAYS) direct tronque le fichier AVANT d'écrire : une
+// coupure au milieu emportait réglages, jeton de session et mot de passe
+// chiffré d'un coup. Ici, tant que la bascule n'a pas eu lieu, l'ancien
+// vibesync.ini est intact ; c'est tout l'intérêt.
 b32 ini_save_file(Arena *scratch, Str8 path, Str8 content) {
     if (path.len == 0) {
         vs_log("ini: chemin de vibesync.ini inconnu (%%APPDATA%% introuvable), réglages non écrits");
         return 0;
     }
     TempArena t = temp_begin(scratch);
-    u16 *w = utf8_to_utf16(scratch, path, NULL);
-    HANDLE h = CreateFileW((LPCWSTR)w, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    DWORD err = GetLastError();  // lu AVANT temp_end : rien ne doit s'intercaler
-    temp_end(t);
+    // Le temporaire vit dans le MÊME répertoire que la cible : MoveFileExW
+    // n'est atomique qu'à l'intérieur d'un volume (entre volumes il copie).
+    // Suffixe = pid, pour que deux vibesync lancés en parallèle (ou un test qui
+    // tourne pendant que l'appli tourne) n'écrivent pas dans le même fichier.
+    Builder tmp;
+    builder_init(&tmp, scratch, path.len + 24);
+    builder_str(&tmp, path);
+    builder_cstr(&tmp, ".tmp-");
+    builder_i64(&tmp, (i64)GetCurrentProcessId());
+    Str8 tmp_path = builder_result(&tmp);
+    u16 *wtmp = utf8_to_utf16(scratch, tmp_path, NULL);
+    u16 *wdst = utf8_to_utf16(scratch, path, NULL);
+
+    HANDLE h = CreateFileW((LPCWSTR)wtmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE) {
-        vs_log("ini: ouverture en écriture refusée (erreur Win32 %lu) — \"%.*s\"", (unsigned long)err,
-               (int)path.len, (const char *)path.data);
+        DWORD err = GetLastError();  // lu AVANT tout autre appel : rien ne doit s'intercaler
+        vs_log("ini: création du fichier temporaire refusée (erreur Win32 %lu) — \"%.*s\"",
+               (unsigned long)err, (int)tmp_path.len, (const char *)tmp_path.data);
+        temp_end(t);
         return 0;
     }
     DWORD written = 0;
     BOOL ok = WriteFile(h, content.data, (DWORD)content.len, &written, NULL);
-    err = GetLastError();
-    CloseHandle(h);
+    DWORD err = GetLastError();
     if (!ok || written != (DWORD)content.len) {
-        // Écriture partielle : le CREATE_ALWAYS a déjà tronqué le fichier, donc
-        // ce cas laisse un vibesync.ini incomplet. Le dire est le minimum.
-        vs_log("ini: écriture incomplète (%lu/%lld octets, erreur Win32 %lu) — \"%.*s\"",
+        // Écriture partielle (disque plein) : elle ne concerne QUE le
+        // temporaire, l'ancien fichier n'a pas été touché. On jette le déchet.
+        CloseHandle(h);
+        DeleteFileW((LPCWSTR)wtmp);
+        vs_log("ini: écriture incomplète du temporaire (%lu/%lld octets, erreur Win32 %lu) — "
+               "\"%.*s\" laissé intact",
                (unsigned long)written, (long long)content.len, (unsigned long)err, (int)path.len,
                (const char *)path.data);
+        temp_end(t);
         return 0;
     }
-    return 1;
+    // FlushFileBuffers avant la bascule. Coût : un aller-retour disque (~ms) à
+    // chaque geste de l'utilisateur — négligeable pour un fichier de 2 Ko écrit
+    // à la connexion ou au changement de dossier, jamais en boucle. Gain : sans
+    // lui, le renommage peut être validé par le système de fichiers alors que
+    // le CONTENU du temporaire est encore en cache ; une coupure de courant
+    // laisse alors un vibesync.ini de zéros, exactement le désastre que ce
+    // ticket supprime. Un échec ici est traité comme un échec d'écriture (le
+    // disque plein se manifeste souvent à ce moment-là) : on ne bascule pas.
+    if (!FlushFileBuffers(h)) {
+        err = GetLastError();
+        CloseHandle(h);
+        DeleteFileW((LPCWSTR)wtmp);
+        vs_log("ini: vidage sur disque du temporaire refusé (erreur Win32 %lu) — \"%.*s\" laissé intact",
+               (unsigned long)err, (int)path.len, (const char *)path.data);
+        temp_end(t);
+        return 0;
+    }
+    CloseHandle(h);
+
+    // La bascule échoue si quelqu'un tient l'ancien fichier ouvert au même
+    // instant — antivirus qui l'analyse, Bloc-notes resté ouvert (Windows ne
+    // remplace pas un fichier ouvert sans FILE_SHARE_DELETE). Ce n'est pas
+    // forcément une erreur, c'est souvent une course : on réessaie brièvement,
+    // comme auto_write_atomic(), plutôt que de perdre l'écriture.
+    b32 moved = 0;
+    DWORD move_err = 0;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        if (MoveFileExW((LPCWSTR)wtmp, (LPCWSTR)wdst, MOVEFILE_REPLACE_EXISTING)) {
+            moved = 1;
+            break;
+        }
+        move_err = GetLastError();
+        if (attempt < 4) Sleep(20);
+    }
+    if (!moved) {
+        // Le temporaire orphelin ne doit pas s'accumuler dans %APPDATA%.
+        DeleteFileW((LPCWSTR)wtmp);
+        vs_log("ini: bascule du temporaire refusée (erreur Win32 %lu) — \"%.*s\" conservé intact",
+               (unsigned long)move_err, (int)path.len, (const char *)path.data);
+    }
+    temp_end(t);
+    return moved;
 }
