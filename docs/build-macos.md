@@ -92,8 +92,13 @@ sont décrits pour les amis dans `docs/guide-amis-macos.md`.
 Le job `client-macos` de `.github/workflows/ci.yml` archive le bundle avec
 `ditto -c -k --keepParent` (le seul outil qui préserve les xattrs, le bit
 d'exécution et la signature d'une `.app`) sous le nom
-**`VibeSync-macos-arm64.zip`**, et le job `release` l'attache à la même release
-GitHub que `vibesync.exe`. Aucune notarisation : c'est un choix assumé (pas de
+**`VibeSync-macos-arm64.zip`**. Le job `release` le renomme avec la version du
+tag avant publication — les assets téléchargeables s'appellent
+**`VibeSync-<version>-macos-arm64.zip`** et **`vibesync-<version>.exe`**
+(v0.2.3 → `VibeSync-0.2.3-macos-arm64.zip`), pour qu'on distingue deux
+téléchargements dans le dossier Téléchargements ; le nom interne de l'artefact
+inter-jobs, lui, ne bouge pas.
+Aucune notarisation : c'est un choix assumé (pas de
 compte Apple Developer), d'où la manœuvre Gatekeeper ci-dessus.
 
 ## 5. Utilisation

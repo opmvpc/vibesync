@@ -14,9 +14,10 @@ qui reste calé sur la même image chez tout le monde.
 
 ## Installation
 
-1. Télécharge `vibesync.exe` depuis les releases GitHub :
-   `https://github.com/opmvpc/vibesync/releases/latest` — prends le fichier
-   `vibesync.exe` de la dernière version.
+1. Va sur la page des versions :
+   `https://github.com/opmvpc/vibesync/releases/latest` — dans la section
+   **Assets**, prends le fichier `.exe`, du genre `vibesync-0.2.3.exe` (le
+   numéro de version est dans le nom, il change à chaque nouvelle version).
 2. Pas d'installateur : c'est un seul fichier `.exe` (moins de 500 Ko). Mets-le
    où tu veux (Bureau, Documents...) et double-clique dessus.
 
@@ -46,7 +47,7 @@ qui reste calé sur la même image chez tout le monde.
 
 **Windows affiche un avertissement au premier lancement** (SmartScreen,
 « Windows a protégé votre ordinateur », ou une demande du pare-feu) — normal,
-`vibesync.exe` n'est pas signé numériquement. Clique **Informations
+vibesync n'est pas signé numériquement. Clique **Informations
 complémentaires** puis **Exécuter quand même** (SmartScreen), et **Autoriser
 l'accès** si le pare-feu demande une confirmation réseau.
 
@@ -55,7 +56,7 @@ l'accès** si le pare-feu demande une confirmation réseau.
 - installer VLC normalement si ce n'est pas déjà fait ;
 - si VLC est ailleurs (installation portable, autre disque), définir la
   variable d'environnement `VIBESYNC_VLC` avec le chemin complet vers
-  `vlc.exe`, puis relancer `vibesync.exe`.
+  `vlc.exe`, puis relancer vibesync.
 
 **« Fichiers différents entre amis »** (toast d'avertissement) — le serveur
 compare la durée des fichiers déclarés par chacun. Si elles diffèrent de plus

@@ -118,7 +118,14 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          files="vibesync.exe VibeSync-macos-arm64.zip"
+          # Les artefacts inter-jobs gardent des noms fixes ; seuls les fichiers
+          # PUBLIÉS portent le numéro de version (comme VLC :
+          # vlc-3.0.23-win64.exe), sinon deux téléchargements successifs sont
+          # indistinguables dans le dossier Téléchargements.
+          version="${GITHUB_REF_NAME#v}"
+          mv vibesync.exe "vibesync-${version}.exe"
+          mv VibeSync-macos-arm64.zip "VibeSync-${version}-macos-arm64.zip"
+          files="vibesync-${version}.exe VibeSync-${version}-macos-arm64.zip"
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             # shellcheck disable=SC2086
             gh release upload "$GITHUB_REF_NAME" --clobber $files
@@ -129,7 +136,8 @@ jobs:
           fi
 
 # Le serveur est construit par Coolify depuis le Dockerfile du repo.
-# Les deux clients sont publiés sur la même release GitHub (tags v*) :
-# vibesync.exe (Windows, non signé) et VibeSync-macos-arm64.zip (macOS Apple
+# Les deux clients sont publiés sur la même release GitHub (tags v*), nommés
+# avec la version du tag : vibesync-<version>.exe (Windows, non signé) et
+# VibeSync-<version>-macos-arm64.zip (macOS Apple
 # Silicon, signature ad hoc, sans notarisation — les amis passent par
 # clic droit → Ouvrir la première fois, cf. docs/guide-amis-macos.md).

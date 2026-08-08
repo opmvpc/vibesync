@@ -18,9 +18,11 @@ qui reste calé sur la même image chez tout le monde.
 1. Va sur la page des versions :
    `https://github.com/opmvpc/vibesync/releases/latest`
    *(lien à confirmer par la personne qui t'a envoyé ce guide)*.
-2. Dans la section **Assets**, télécharge le fichier
-   **`VibeSync-macos-arm64.zip`** (celui pour Mac ; le `.exe` à côté, c'est la
-   version Windows, elle ne te sert à rien).
+2. Dans la section **Assets**, télécharge le fichier qui finit par
+   **`-macos-arm64.zip`**, du genre **`VibeSync-0.2.3-macos-arm64.zip`** (le
+   numéro de version est dans le nom, il change à chaque nouvelle version).
+   C'est celui pour Mac ; le `.exe` à côté, c'est la version Windows, elle ne
+   te sert à rien.
 3. Double-clique le `.zip` dans ton dossier **Téléchargements** : il se
    décompresse et te laisse **VibeSync.app**.
 4. Glisse **VibeSync.app** dans ton dossier **Applications** — pas
