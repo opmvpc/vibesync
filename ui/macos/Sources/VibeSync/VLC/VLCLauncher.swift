@@ -1,7 +1,9 @@
 // VLCLauncher.swift — localisation et lancement de VLC.
 //
-// Mêmes drapeaux que le driver Go (internal/vlc/launch.go) : interface HTTP sur
-// 127.0.0.1, port et mot de passe aléatoires, pas d'instance unique.
+// Drapeaux : la liste `darwin` du driver Go (internal/vlc/launch.go,
+// `launchArgs`), c'est-à-dire les 15 drapeaux du blindage VS-029 MOINS la
+// famille « instance unique » que le VLC macOS ne connaît pas. Voir
+// `VLCLauncher.launchArgs` ci-dessous.
 
 import Darwin
 import Foundation
@@ -82,20 +84,9 @@ public enum VLCLauncher {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: binary)
-        // Mêmes drapeaux que le driver Go, MOINS `--no-one-instance` : le VLC
-        // macOS ne connaît pas cette option et refuse purement et simplement de
-        // démarrer (« unknown option or missing mandatory argument »). Elle n'y
-        // sert de toute façon à rien — lancer deux fois le binaire du bundle
-        // donne bien deux processus indépendants, chacun avec son interface
-        // HTTP (vérifié : le harnais de test réel en fait tourner deux).
-        process.arguments = [
-            "--extraintf=http",
-            "--http-host=127.0.0.1",
-            "--http-port=\(port)",
-            "--http-password=" + password,
-            "--no-video-title-show",
-            filePath,
-        ]
+        // Le média vient en DERNIER, après toutes les options : VLC prendrait
+        // le reste pour des MRL.
+        process.arguments = launchArgs(port: port, password: password) + [filePath]
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         do {
@@ -129,6 +120,65 @@ public enum VLCLauncher {
                 }
             }
         }
+    }
+
+    /// Les drapeaux de lancement, sans le média — TOUT ce dont on dépend est
+    /// forcé explicitement (VS-029). Fonction pure : gelée par
+    /// `VLCLaunchArgsTests`, sur le modèle de `launchArgs` côté Go
+    /// (internal/vlc/launch.go) et du bloc `vlc_build_command` du harnais C
+    /// (core/tests/test_core.c). Les trois listes doivent rester identiques.
+    ///
+    /// Le raisonnement complet est dans `vlc_build_command` (core/src/vlc_core.c).
+    /// En résumé : le vlcrc de l'utilisateur gagne sur les défauts de VLC,
+    /// jamais sur la ligne de commande, et un VLC configuré par Syncplay
+    /// faisait échouer l'attache HTTP en laissant un VLC orphelin en lecture.
+    /// Chaque drapeau neutralise un réglage qui peut venir du vlcrc :
+    ///
+    ///   --extraintf=http     l'interface de pilotage ; sur la ligne de commande
+    ///                        elle REMPLACE l'`extraintf` du vlcrc.
+    ///   --lua-intf=http      filet si le vlcrc a fait de luaintf l'interface
+    ///                        PRINCIPALE : au moins c'est notre script http qui
+    ///                        s'exécute, pas syncplay.lua.
+    ///   --playlist-autostart sinon rien ne démarre, le statut reste
+    ///                        « stopped » et `prepare` tourne dans le vide.
+    ///   --start-paused       accepté mais INOPÉRANT sur macOS (VLC 3.0.23
+    ///                        démarre quand même la lecture, l'interface
+    ///                        `macosx` s'en charge de son côté). Gardé pour
+    ///                        l'alignement des trois implémentations ; ici
+    ///                        c'est `prepare` qui tranche, seule autorité
+    ///                        (docs/protocol.md §Chargement de fichier).
+    ///   --no-random --no-loop --no-repeat  le moteur de sync raisonne sur un
+    ///                        média unique joué une fois.
+    ///   --no-play-and-exit   VLC ne doit pas disparaître en fin de média.
+    ///   --no-video-title-show  confort, déjà là avant VS-029.
+    ///
+    /// ABSENTE : la famille « instance unique » (`--no-one-instance`,
+    /// `--no-one-instance-when-started-from-file`, `--no-playlist-enqueue`).
+    /// libvlc-module.c ne la déclare que sous Windows (ou Linux avec D-Bus) ;
+    /// le VLC macOS refuse de démarrer sur chacun des trois — « unknown option
+    /// or missing mandatory argument », vérifié un par un sur VLC 3.0.23. Elle
+    /// n'y sert de toute façon à rien : lancer deux fois le binaire du bundle
+    /// donne bien deux processus indépendants, chacun avec son interface HTTP
+    /// (le harnais de test réel en fait tourner deux).
+    ///
+    /// ABSENT aussi : `--intf=<module>`. Forcer l'interface principale
+    /// obligerait à parier sur son nom (qt/qt4/macosx selon version et OS) et
+    /// un nom inconnu empêche VLC de démarrer.
+    static func launchArgs(port: Int, password: String) -> [String] {
+        return [
+            "--extraintf=http",
+            "--lua-intf=http",
+            "--http-host=127.0.0.1",
+            "--http-port=\(port)",
+            "--http-password=" + password,
+            "--playlist-autostart",
+            "--start-paused",
+            "--no-random",
+            "--no-loop",
+            "--no-repeat",
+            "--no-play-and-exit",
+            "--no-video-title-show",
+        ]
     }
 
     private static func randomPassword() -> String {
