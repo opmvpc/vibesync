@@ -1144,6 +1144,7 @@ enum {
     ID_SET_NAME,
     ID_SET_ROOM,
     ID_SET_VLC,
+    ID_SET_BROWSE,
     ID_SET_DETECT,
     ID_SET_SAVE,
     ID_SET_CANCEL,
@@ -1892,13 +1893,21 @@ static void screen_settings(UiApp *a, HDC dc, i64 now_ms) {
         y += fh + gap;
     }
 
-    // Chemin de VLC : champ + bouton « Détecter » + état de la détection.
+    // Chemin de VLC : champ + « Parcourir… » + « Détecter » + état.
+    //
+    // « Détecter » se grise quand la détection automatique n'a rien trouvé —
+    // c'est-à-dire exactement le cas où l'utilisateur a besoin d'aide. D'où
+    // « Parcourir… », toujours actif, qui ouvre le sélecteur de Windows.
     label(a, dc, rect(x, y, w, S(a, 18)), "Chemin de VLC (vide = détection automatique)");
     y += S(a, 18);
-    i32 det_w = S(a, 96);
-    if (field(a, dc, rect(x, y, w - det_w - S(a, 8), fh), &a->f_set_vlc, a->settings_auto_vlc[0] ? a->settings_auto_vlc : "C:\\Program Files\\VideoLAN\\VLC\\vlc.exe",
+    i32 det_w = S(a, 92), brw_w = S(a, 100), bgap = S(a, 8);
+    if (field(a, dc, rect(x, y, w - det_w - brw_w - 2 * bgap, fh), &a->f_set_vlc, a->settings_auto_vlc[0] ? a->settings_auto_vlc : "C:\\Program Files\\VideoLAN\\VLC\\vlc.exe",
               ID_SET_VLC, 0, now_ms)) {
         submit = 1;
+    }
+    if (button(a, dc, rect(x + w - det_w - brw_w - bgap, y, brw_w, fh), "Parcourir…", ID_SET_BROWSE,
+               BTN_GHOST, 1)) {
+        a->act_settings_browse = 1;
     }
     if (button(a, dc, rect(x + w - det_w, y, det_w, fh), "Détecter", ID_SET_DETECT, BTN_GHOST,
                a->settings_auto_vlc[0] != 0)) {

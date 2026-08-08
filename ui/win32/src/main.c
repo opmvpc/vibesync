@@ -27,6 +27,9 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <windowsx.h>
+// commdlg.h : GetOpenFileNameW, la boîte « Ouvrir » du système. WIN32_LEAN_AND_MEAN
+// la retire de windows.h, il faut donc l'inclure explicitement.
+#include <commdlg.h>
 #include <shellapi.h>
 #include <shobjidl.h>
 
@@ -442,6 +445,20 @@ static b32 file_exists(Arena *scratch, Str8 path) {
     temp_end(t);
     return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
 }
+
+// dir_exists : pendant de file_exists pour les répertoires (sélecteur VLC).
+static b32 dir_exists(Arena *scratch, Str8 path) {
+    if (path.len == 0) return 0;
+    TempArena t = temp_begin(scratch);
+    u16 *w = utf8_to_utf16(scratch, path, NULL);
+    DWORD attr = GetFileAttributesW((LPCWSTR)w);
+    temp_end(t);
+    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+// browse_dir_exists : dir_exists derrière la signature attendue par
+// vlc_browse_initial_dir (`ctx` = l'arène de travail).
+static b32 browse_dir_exists(void *ctx, Str8 dir) { return dir_exists((Arena *)ctx, dir); }
 
 // env_str lit une variable d'environnement en UTF-8 (vide si absente).
 static Str8 env_str(Arena *a, const wchar_t *name) {
@@ -1259,6 +1276,78 @@ static b32 pick_folder(App *app, Str8 *out) {
     return got;
 }
 
+// BROWSE_PATH_CAP : capacité, en unités UTF-16, du tampon que remplit le
+// sélecteur. MAX_PATH (260) ne suffit plus : Windows accepte ~32 767
+// caractères, et un chemin plus long ferait échouer GetOpenFileNameW sur un
+// fichier pourtant valide. 64 Ko pris sur l'arène de travail, le temps de la
+// boîte de dialogue.
+#define BROWSE_PATH_CAP 32768
+
+// browse_vlc_path ouvre le sélecteur de fichiers standard de Windows sur
+// vlc.exe et écrit le chemin choisi (UTF-8, terminé par 0) dans `out`.
+// Renvoie 0 si l'utilisateur annule ou si le chemin ne tient pas dans `cap` —
+// dans ce dernier cas *too_long passe à 1. On refuse plutôt que de tronquer :
+// un chemin tronqué ne désigne rien et serait rejeté à l'enregistrement avec
+// un message incompréhensible.
+//
+// BLOQUANT : la boîte est modale et pompe sa propre boucle de messages. Elle
+// est donc appelée depuis le thread UI et lui seul, exactement comme
+// open_file_dialog et pick_folder.
+static b32 browse_vlc_path(App *app, char *out, isize cap, b32 *too_long) {
+    *too_long = 0;
+    out[0] = 0;
+    TempArena t = temp_begin(app->scratch);
+
+    Str8 current = str8_trim(ui_text_str(&app->ui.f_set_vlc));
+    Str8 pf = env_str(app->scratch, L"ProgramFiles");
+    Str8 initial =
+        vlc_browse_initial_dir(app->scratch, current, pf, browse_dir_exists, app->scratch);
+
+    u16 *file = arena_push_array(app->scratch, u16, BROWSE_PATH_CAP);
+    file[0] = 0;
+    // Pré-sélection : la boîte s'ouvre sur le fichier déjà configuré plutôt
+    // que sur un champ de nom vide.
+    if (current.len > 0) {
+        isize wlen = 0;
+        u16 *w = utf8_to_utf16(app->scratch, current, &wlen);
+        if (wlen > 0 && wlen < BROWSE_PATH_CAP) memcpy(file, w, (size_t)(wlen + 1) * sizeof(u16));
+    }
+    u16 *winitial = initial.len > 0 ? utf8_to_utf16(app->scratch, initial, NULL) : NULL;
+
+    OPENFILENAMEW ofn;
+    memset(&ofn, 0, sizeof(ofn));
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = app->hwnd;
+    // Filtre : paires <libellé>\0<motif>\0, la liste finissant par un \0 de
+    // plus. Le premier filtre ne montre que vlc.exe — c'est le seul fichier
+    // que ce champ accepte ; le second sert au VLC portable renommé.
+    ofn.lpstrFilter = L"vlc.exe\0vlc.exe\0Exécutables (*.exe)\0*.exe\0\0";
+    ofn.nFilterIndex = 1;
+    ofn.lpstrFile = (LPWSTR)file;
+    ofn.nMaxFile = BROWSE_PATH_CAP;
+    ofn.lpstrInitialDir = (LPCWSTR)winitial;
+    ofn.lpstrTitle = L"Choisir vlc.exe";
+    // OFN_NOCHANGEDIR n'est pas cosmétique : sans lui, la boîte laisse le
+    // répertoire COURANT du processus là où l'utilisateur a navigué. Tout
+    // chemin relatif manipulé ensuite (journal, fichier ini de secours,
+    // arguments passés à VLC) partirait alors ailleurs.
+    ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+
+    b32 got = 0;
+    if (GetOpenFileNameW(&ofn)) {
+        Str8 picked = utf16_to_utf8(app->scratch, file);
+        if (picked.len < cap) {
+            memcpy(out, picked.data, (size_t)picked.len);
+            out[picked.len] = 0;
+            got = 1;
+        } else {
+            *too_long = 1;
+        }
+    }
+    temp_end(t);
+    return got;
+}
+
 // request_media_open lance la recherche du fichier déclaré par un participant.
 static void request_media_open(App *app, Str8 name) {
     UiApp *ui = &app->ui;
@@ -1445,6 +1534,25 @@ static void handle_actions(App *app) {
     if (ui->act_settings_detect) {
         ui->act_settings_detect = 0;
         ui_text_set(&ui->f_set_vlc, app->vlc_auto);
+        redraw(app);
+    }
+    if (ui->act_settings_browse) {
+        ui->act_settings_browse = 0;
+        // Le champ est la seule destination : on remplace son contenu, et
+        // settings_validate() (plus bas, à chaque tour) rafraîchit le voyant
+        // « vlc.exe trouvé / Aucun VLC détecté » comme après une frappe.
+        char picked[UI_TEXT_CAP];
+        b32 too_long = 0;
+        if (browse_vlc_path(app, picked, (isize)sizeof(picked), &too_long)) {
+            ui_text_set(&ui->f_set_vlc, str8_from_cstr(picked));
+            ui->focus = 0;
+            ui->settings_msg[0] = 0;
+            ui->settings_msg_error = 0;
+        } else if (too_long) {
+            snprintf(ui->settings_msg, sizeof(ui->settings_msg),
+                     "Ce chemin est trop long pour le champ (%d octets au plus).", (int)(UI_TEXT_CAP - 1));
+            ui->settings_msg_error = 1;
+        }
         redraw(app);
     }
     if (ui->act_settings_cancel) {

@@ -65,6 +65,22 @@ isize base64_encode(const u8 *in, isize n, char *out, isize cap);
 // vlc_build_request fabrique la requête GET (chemin + query déjà formés).
 Str8 vlc_build_request(Arena *a, Str8 path, Str8 auth_b64, int port);
 
+// VlcDirExistsFn : prédicat « ce répertoire existe ». Il est INJECTÉ pour que
+// le choix du dossier d'ouverture du sélecteur reste une fonction pure, donc
+// testable sans toucher au disque ni ouvrir de boîte de dialogue.
+typedef b32 (*VlcDirExistsFn)(void *ctx, Str8 dir);
+
+// vlc_browse_initial_dir choisit le répertoire où ouvrir le sélecteur de
+// vlc.exe, du plus au moins pertinent :
+//   1. le chemin déjà saisi s'il désigne un répertoire existant,
+//   2. sinon le répertoire qui le contient s'il existe (cas normal : le champ
+//      contient « …\VLC\vlc.exe », on ouvre sur « …\VLC »),
+//   3. sinon <program_files>\VideoLAN\VLC s'il existe,
+//   4. sinon <program_files> s'il existe,
+//   5. sinon la chaîne vide : à Windows de décider (dernier dossier utilisé).
+// Le résultat vit dans `a`. `program_files` peut être vide.
+Str8 vlc_browse_initial_dir(Arena *a, Str8 current, Str8 program_files, VlcDirExistsFn exists, void *ctx);
+
 // vlc_build_command fabrique la ligne de commande de lancement. Séparée du
 // lancement pour être vérifiable sans process : ces drapeaux sont la partie
 // fragile de VS-029 (blindage contre le vlcrc de l'utilisateur), et une

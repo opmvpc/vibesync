@@ -239,6 +239,7 @@ typedef struct {
     b32 act_settings_save;
     b32 act_settings_cancel;
     b32 act_settings_detect;
+    b32 act_settings_browse;   // « Parcourir… » : sélecteur de fichiers natif
     b32 act_test_server;       // « Tester » ou sortie du champ Serveur
     b32 act_cancel_connect;    // interrompt une tentative / une attente
     b32 act_use_wss;           // accepte la bascule ws:// → wss://

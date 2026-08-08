@@ -1,5 +1,5 @@
 @echo off
-rem build.bat — construction du client Windows handmade (VS-014).
+rem build.bat : construction du client Windows handmade (VS-014).
 rem   build.bat        release  : build\vibesync.exe (GUI, -O2 -s, warnings stricts)
 rem   build.bat test   tests    : build\vibesync_tests.exe puis EXECUTION
 rem   build.bat asan   tests sous AddressSanitizer
@@ -25,7 +25,13 @@ set "CORE_DIR=%ROOT%..\..\core"
 set "STD=-std=c11 -ffp-contract=off -DVIBESYNC_VERSION_RAW=%VERSION%"
 set "WARN=-Wall -Wextra -Werror -Wshadow -Wvla -Wstrict-prototypes -Wmissing-prototypes"
 set "INC=-I "%CORE_DIR%\include" -I "%ROOT%src""
-set "LIBS=-lwinhttp -lws2_32 -lbcrypt -lgdi32 -luser32 -lole32 -luuid -lshell32 -lcrypt32"
+rem comdlg32 : GetOpenFileNameW, la boite "Ouvrir" du systeme (bouton
+rem "Parcourir..." du chemin VLC). API systeme livree avec Windows, pas une
+rem dependance tierce : meme famille que shell32/ole32 deja liees (ADR-008).
+rem NB : ce fichier est en LF et cmd.exe s'y repere par offset d'octet ; tout
+rem caractere non ASCII de plus l'y perd et casse la ligne SUIVANTE. On reste
+rem donc en ASCII pur, comme le reste du fichier.
+set "LIBS=-lwinhttp -lws2_32 -lbcrypt -lgdi32 -luser32 -lole32 -luuid -lshell32 -lcrypt32 -lcomdlg32"
 rem Chaque chemin est entre guillemets : un checkout dans un dossier contenant
 rem des espaces doit compiler sans bricolage.
 rem

@@ -228,6 +228,46 @@ Str8 vlc_build_request(Arena *a, Str8 path, Str8 auth_b64, int port) {
     return builder_result(&b);
 }
 
+// ------------------------------------------------ sélecteur de l'exécutable ---
+
+// path_parent rend le répertoire contenant `path`, chaîne vide s'il n'y en a
+// pas. Les deux séparateurs sont acceptés : un utilisateur qui colle un chemin
+// depuis ailleurs écrit parfois des barres obliques, et Windows les accepte.
+//
+// Les deux racines sont des cas à part. « \foo » → « \ » et « C:\vlc.exe » →
+// « C:\ » : couper à sec donnerait « C: », qui ne désigne PAS la racine du
+// lecteur sous Windows mais son répertoire courant — un dossier d'ouverture
+// imprévisible.
+static Str8 path_parent(Str8 path) {
+    isize i = path.len;
+    while (i > 0 && path.data[i - 1] != '\\' && path.data[i - 1] != '/') i--;
+    if (i == 0) return str8_lit("");
+    isize cut = i - 1;  // longueur sans le séparateur final
+    if (cut == 0) return str8_sub(path, 0, 1);
+    if (cut == 2 && path.data[1] == ':') return str8_sub(path, 0, 3);
+    return str8_sub(path, 0, cut);
+}
+
+Str8 vlc_browse_initial_dir(Arena *a, Str8 current, Str8 program_files, VlcDirExistsFn exists, void *ctx) {
+    Str8 cur = str8_trim(current);
+    // Ce que l'utilisateur a déjà saisi prime : même si le nom de fichier est
+    // faux, son dossier est presque toujours le bon endroit où chercher.
+    if (cur.len > 0) {
+        if (exists(ctx, cur)) return str8_copy(a, cur);
+        Str8 parent = path_parent(cur);
+        if (parent.len > 0 && exists(ctx, parent)) return str8_copy(a, parent);
+    }
+    Str8 pf = str8_trim(program_files);
+    if (pf.len > 0) {
+        // « C:\ » a déjà son séparateur : ne pas le doubler.
+        b32 sep = pf.data[pf.len - 1] == '\\' || pf.data[pf.len - 1] == '/';
+        Str8 dir = str8_cat(a, pf, sep ? str8_lit("VideoLAN\\VLC") : str8_lit("\\VideoLAN\\VLC"));
+        if (exists(ctx, dir)) return dir;
+        if (exists(ctx, pf)) return str8_copy(a, pf);
+    }
+    return str8_lit("");
+}
+
 // -------------------------------------------------------------- status.json ---
 
 static f64 clamp01(f64 v) {

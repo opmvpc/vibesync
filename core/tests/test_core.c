@@ -555,6 +555,18 @@ static void test_protocol(Arena *a) {
 
 // ------------------------------------------------------------ vlc / net ---
 
+// browse_fs_has_dir : faux système de fichiers pour vlc_browse_initial_dir.
+// `ctx` est une liste de répertoires terminée par NULL — rien d'autre n'existe.
+// C'est tout l'intérêt du prédicat injecté : le choix du dossier d'ouverture
+// du sélecteur se vérifie sans disque et sans boîte de dialogue.
+static b32 browse_fs_has_dir(void *ctx, Str8 dir) {
+    const char *const *dirs = (const char *const *)ctx;
+    for (isize i = 0; dirs[i]; i++) {
+        if (str8_eq_cstr(dir, dirs[i])) return 1;
+    }
+    return 0;
+}
+
 static void test_vlc(Arena *a) {
     section("vlc");
     TempArena top = temp_begin(a);
@@ -686,6 +698,69 @@ static void test_vlc(Arena *a) {
         CHECK(!http_parse_response(a, S("HTTP/1.1 200 OK\r\nsans fin d'en-tetes"), &code, &body),
               "en-têtes non terminés acceptés");
         CHECK(!http_parse_response(a, S(""), &code, &body), "réponse vide acceptée");
+    }
+
+    // --- dossier d'ouverture du sélecteur (bouton « Parcourir… », VS-032) ---
+    {
+        // Windows accepte les deux séparateurs sur le même dossier : le faux
+        // système de fichiers le reflète, sinon le cas « barres obliques »
+        // vérifierait le repli au lieu du chemin saisi.
+        static const char *const installed[] = {"C:\\Program Files",
+                                                "C:\\Program Files\\VideoLAN",
+                                                "C:\\Program Files\\VideoLAN\\VLC",
+                                                "C:/Program Files/VideoLAN/VLC",
+                                                "C:\\",
+                                                NULL};
+        static const char *const bare[] = {"C:\\Program Files", NULL};
+        static const char *const nothing[] = {NULL};
+        void *inst = (void *)installed, *pfonly = (void *)bare, *none = (void *)nothing;
+        Str8 pf = S("C:\\Program Files");
+
+        struct {
+            const char *current;
+            const char *program_files;
+            void *fs;
+            const char *want;
+            const char *why;
+        } dir_cases[] = {
+            // Cas normal : le champ contient l'exécutable, on ouvre sur son dossier.
+            {"C:\\Program Files\\VideoLAN\\VLC\\vlc.exe", "C:\\Program Files", inst,
+             "C:\\Program Files\\VideoLAN\\VLC", "chemin saisi → dossier parent"},
+            // Le champ contient déjà un répertoire : on l'ouvre tel quel.
+            {"C:\\Program Files\\VideoLAN\\VLC", "C:\\Program Files", inst,
+             "C:\\Program Files\\VideoLAN\\VLC", "champ = répertoire existant"},
+            // Espaces autour du chemin collé : ils ne doivent pas tout casser.
+            {"  C:\\Program Files\\VideoLAN\\VLC\\vlc.exe  ", "C:\\Program Files", inst,
+             "C:\\Program Files\\VideoLAN\\VLC", "chemin saisi entouré d'espaces"},
+            // Barres obliques : Windows les accepte, nous aussi.
+            {"C:/Program Files/VideoLAN/VLC/vlc.exe", "C:\\Program Files", inst,
+             "C:/Program Files/VideoLAN/VLC", "séparateurs '/'"},
+            // Champ vide : l'installation standard, sinon Program Files.
+            {"", "C:\\Program Files", inst, "C:\\Program Files\\VideoLAN\\VLC", "champ vide, VLC installé"},
+            {"", "C:\\Program Files", pfonly, "C:\\Program Files", "champ vide, VLC absent"},
+            // Chemin qui ne mène nulle part : on retombe sur le repli.
+            {"Z:\\ailleurs\\vlc.exe", "C:\\Program Files", pfonly, "C:\\Program Files",
+             "dossier saisi inexistant"},
+            // Nom nu, sans séparateur : aucun parent à en tirer.
+            {"vlc.exe", "C:\\Program Files", pfonly, "C:\\Program Files", "nom de fichier sans dossier"},
+            // Racine du lecteur : « C:\ », jamais « C: » (= dossier courant).
+            {"C:\\vlc.exe", "C:\\Program Files", inst, "C:\\", "racine du lecteur"},
+            // Program Files avec séparateur final : pas de « \\ » doublé.
+            {"", "C:\\", inst, "C:\\", "program_files avec séparateur final"},
+            // Rien de connu : à Windows de choisir, on ne force pas.
+            {"Z:\\ailleurs\\vlc.exe", "C:\\Program Files", none, "", "aucun candidat"},
+            {"", "", none, "", "tout est vide"},
+        };
+        for (isize i = 0; i < (isize)(sizeof(dir_cases) / sizeof(dir_cases[0])); i++) {
+            Str8 got = vlc_browse_initial_dir(a, S(dir_cases[i].current), S(dir_cases[i].program_files),
+                                              browse_fs_has_dir, dir_cases[i].fs);
+            CHECK(str8_eq_cstr(got, dir_cases[i].want), "%s : « %.*s » (attendu « %s »)", dir_cases[i].why,
+                  (int)got.len, got.data, dir_cases[i].want);
+        }
+        // Le résultat ne pointe jamais dans la chaîne d'entrée quand il est
+        // construit : il doit survivre au tampon de saisie de l'appelant.
+        Str8 built = vlc_browse_initial_dir(a, S(""), pf, browse_fs_has_dir, inst);
+        CHECK(built.data != pf.data, "résultat construit non copié dans l'arène");
     }
 
     temp_end(top);
