@@ -70,6 +70,71 @@ else
     echo "icône absente : $ICNS (bundle sans icône)" >&2
 fi
 
+# VS-042 — deuxième chemin d'icône, le moderne. `CFBundleIconFile` + .icns suffit
+# au Dock et au Finder, mais pas au Régisseur (Stage Manager) : celui-ci est rendu
+# par WindowManager, qui passe par IconServices et réclame la représentation
+# *empilée* de macOS 26 (Tahoe) — les couches Liquid Glass, `IconImageStack` dans
+# un `Assets.car`. Faute de quoi il affiche le gabarit blanc générique, exactement
+# ce que Thibault voit. Mesuré ici, et c'est le point contre-intuitif : déclarer
+# `CFBundleIconName` avec un `Assets.car` fabriqué depuis un `AppIcon.appiconset`
+# classique NE SUFFIT PAS (ce catalogue-là ne contient que des « Icon Image »,
+# aucune pile) — il faut passer par un paquet `.icon`, le format d'Icon Composer.
+#
+# `.icon` est un simple dossier : `icon.json` + `Assets/`. On l'écrit à la main
+# (aucun besoin de l'app Icon Composer), avec pour unique couche le PNG 1024 tiré
+# du .icns déjà committé — une seule source de vérité pour le dessin, zéro binaire
+# supplémentaire au dépôt. `actool` (outil Apple, livré avec Xcode) le compile en
+# `Assets.car` contenant les 3 `IconImageStack` que le système attend.
+#
+# `actool` vient avec Xcode, pas avec les seuls Command Line Tools : s'il manque,
+# on le dit et on livre le bundle en mode historique (Dock correct, Régisseur
+# générique) plutôt que d'échouer.
+ICON_NAME=""
+if [ -f "$ICNS" ] && command -v actool >/dev/null 2>&1; then
+    CARTMP=$(mktemp -d "${TMPDIR:-/tmp}/vibesync-appicon.XXXXXX")
+    DOTICON="$CARTMP/AppIcon.icon"
+    mkdir -p "$DOTICON/Assets" "$CARTMP/out"
+    # `icon_512x512@2x.png` est le 1024 du .icns (cf. docs/research/2026-08-08-icone-macos.md).
+    iconutil -c iconset "$ICNS" -o "$CARTMP/VibeSync.iconset"
+    cp "$CARTMP/VibeSync.iconset/icon_512x512@2x.png" "$DOTICON/Assets/icon.png"
+    # Une seule couche, opaque et pleine cadre : notre dessin porte déjà son fond
+    # et son squircle. `fill` n'est donc jamais visible, mais la clé est attendue.
+    cat > "$DOTICON/icon.json" <<'ICONJSON'
+{
+  "fill" : { "automatic-gradient" : "extended-srgb:0.10,0.09,0.13,1.00" },
+  "groups" : [
+    { "layers" : [ { "image-name" : "icon.png", "name" : "icon" } ] }
+  ],
+  "supported-platforms" : { "squares" : [ "macOS" ] }
+}
+ICONJSON
+
+    if actool --compile "$CARTMP/out" --app-icon AppIcon --platform macosx \
+              --minimum-deployment-target 13.0 \
+              --output-partial-info-plist "$CARTMP/partial.plist" \
+              --errors --warnings "$DOTICON" >/dev/null 2>&1 \
+       && [ -f "$CARTMP/out/Assets.car" ] \
+       && assetutil --info "$CARTMP/out/Assets.car" 2>/dev/null | grep -q IconImageStack; then
+        cp "$CARTMP/out/Assets.car" "$APP/Contents/Resources/Assets.car"
+        ICON_NAME=AppIcon
+    else
+        echo "actool n'a pas produit d'IconImageStack : bundle sans Assets.car" >&2
+        echo "  (Dock correct, icône générique en Régisseur)" >&2
+    fi
+    rm -rf "$CARTMP"
+else
+    echo "actool introuvable (Xcode complet requis) : bundle sans Assets.car," >&2
+    echo "  l'icône restera générique en Régisseur / Mission Control" >&2
+fi
+
+# La clé n'est écrite que si le catalogue a bien été produit : `CFBundleIconName`
+# pointant sur un asset absent est pire que pas de clé du tout.
+ICON_NAME_KEY=""
+if [ -n "$ICON_NAME" ]; then
+    ICON_NAME_KEY="    <key>CFBundleIconName</key>
+    <string>$ICON_NAME</string>"
+fi
+
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -83,6 +148,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <string>VibeSync</string>
     <key>CFBundleIconFile</key>
     <string>VibeSync.icns</string>
+$ICON_NAME_KEY
     <key>CFBundleIdentifier</key>
     <string>org.vibesync.client</string>
     <key>CFBundleInfoDictionaryVersion</key>
