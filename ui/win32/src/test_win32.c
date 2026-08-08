@@ -621,6 +621,26 @@ static void test_ini_file(Arena *a) {
         DeleteFileW((LPCWSTR)wpath);
         Ini none;
         CHECK(!ini_load_file(a, path, &none) && none.count == 0, "fichier absent");
+
+        // Écritures qui ÉCHOUENT : chez l'utilisateur ce sont le disque plein,
+        // une ACL héritée d'un profil bricolé ou un antivirus qui verrouille le
+        // fichier. On ne peut pas remplir un disque dans une suite de tests,
+        // mais on peut refuser l'ouverture — ce qui exerce exactement le même
+        // chemin de retour. Le contrat vérifié ici : 0 propagé, aucun crash, et
+        // l'écriture suivante repart normalement (aucun état collant).
+        Str8 nowhere = str8_cat(a, dir, S("vibesync-dossier-absent\\sous\\vibesync.ini"));
+        CHECK(!ini_save_file(a, nowhere, text), "répertoire inexistant : échec attendu");
+        CHECK(!ini_save_file(a, S(""), text), "chemin vide : échec attendu");
+        // Un répertoire n'est pas ouvrable en écriture : le pendant le plus
+        // proche d'un « accès refusé » qu'on puisse provoquer sans droits.
+        Str8 as_dir = str8_sub(dir, 0, dir.len > 0 ? dir.len - 1 : 0);  // sans le '\' final
+        CHECK(!ini_save_file(a, as_dir, text), "répertoire en guise de fichier : échec attendu");
+        Ini after;
+        CHECK(!ini_load_file(a, nowhere, &after) && after.count == 0, "rien n'a été créé au passage");
+        CHECK(ini_save_file(a, path, text), "écriture de nouveau possible après échec");
+        CHECK(ini_load_file(a, path, &after) && str8_eq(ini_get(&after, "pseudo", S("")), S("Thibault Éloïse")),
+              "contenu intact après un échec");
+        DeleteFileW((LPCWSTR)utf8_to_utf16(a, path, NULL));
     }
 
     temp_end(top);

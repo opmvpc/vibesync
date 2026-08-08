@@ -375,6 +375,12 @@ typedef struct {
     UiApp ui;
     VlcWorker vlc;
     Ini ini;
+    // Un échec d'écriture de vibesync.ini est journalisé À CHAQUE fois (c'est le
+    // seul témoin exploitable à distance) mais n'est signalé à l'écran qu'UNE
+    // fois par session : ini_flush part à chaque geste (connexion, dossier
+    // ajouté, case cochée, fermeture) et un disque plein les ferait tous
+    // échouer — l'utilisateur verrait le même toast en boucle.
+    b32 ini_write_toasted;
 
     HWND hwnd;
     HDC mem_dc;
@@ -551,13 +557,39 @@ static b32 ini_flush(App *app) {
     return ok;
 }
 
+// ini_flush_notify écrit et REND VISIBLE l'échec. Un disque plein, une ACL
+// héritée d'un profil bricolé ou un antivirus qui verrouille le fichier
+// faisaient perdre réglages et jeton de session en silence : ni l'utilisateur
+// ni le journal n'en savaient rien, et le symptôme remontait du terrain sous la
+// forme « il me redemande tout à chaque lancement ». `what` nomme ce qui est
+// perdu ; `toast` vaut 0 quand l'appelant affiche déjà le message lui-même
+// (panneau Réglages) ou quand la fenêtre est en train de disparaître (WM_CLOSE,
+// sortie) — un toast n'y serait jamais lu. Jamais bloquant : l'application
+// continue avec ses réglages en mémoire.
+static b32 ini_flush_notify(App *app, const char *what, b32 toast) {
+    if (ini_flush(app)) return 1;
+    vs_log("ini: %s non enregistré — vibesync.ini n'a pas pu être écrit "
+           "(disque plein, droits d'accès ou fichier verrouillé ?)",
+           what);
+    if (toast && !app->ini_write_toasted) {
+        app->ini_write_toasted = 1;
+        ui_toast(&app->ui,
+                 "Réglages non enregistrés : vibesync.ini n'a pas pu être écrit. "
+                 "Détail dans %APPDATA%\\vibesync.log.",
+                 1, now_ms());
+    }
+    return 0;
+}
+
 // settings_save réécrit le fichier en CONSERVANT les clés qu'on ne gère pas
 // ici (chemin VLC en particulier) : app->ini est la référence, pas un ini neuf.
-static void settings_save(App *app) {
+// `toast` est transmis tel quel à ini_flush_notify. Renvoie 0 si rien n'a pu
+// être écrit — le retour est ignorable, mais l'échec ne l'est plus.
+static b32 settings_save(App *app, b32 toast) {
     ini_set(app->perm, &app->ini, "serveur", ui_text_str(&app->ui.f_server));
     ini_set(app->perm, &app->ini, "pseudo", ui_text_str(&app->ui.f_name));
     ini_set(app->perm, &app->ini, "salle", ui_text_str(&app->ui.f_room));
-    ini_flush(app);
+    return ini_flush_notify(app, "réglages", toast);
 }
 
 // Clés que l'application gère. Tout le reste de vibesync.ini appartient à
@@ -619,7 +651,7 @@ static void session_load(App *app) {
             return;
         }
     }
-    if (!ini_flush(app)) vs_log("session: jeton non persisté (vibesync.ini non modifiable)");
+    ini_flush_notify(app, "jeton de session", 1);
 }
 
 // --- panneau Réglages ---
@@ -653,7 +685,10 @@ static b32 settings_apply(App *app) {
     ini_set(app->perm, &app->ini, "pseudo", str8_trim(ui_text_str(&ui->f_set_name)));
     ini_set(app->perm, &app->ini, "salle", str8_trim(ui_text_str(&ui->f_set_room)));
     ini_set(app->perm, &app->ini, "vlc", vlc);
-    b32 ok = ini_flush(app);  // même point d'écriture : mêmes règles de secret
+    // Même point d'écriture : mêmes règles de secret. Pas de toast — le panneau
+    // affiche son propre message juste en dessous, à l'endroit où l'utilisateur
+    // vient de cliquer.
+    b32 ok = ini_flush_notify(app, "réglages", 0);
     if (!ok) {
         snprintf(ui->settings_msg, sizeof(ui->settings_msg), "vibesync.ini non modifiable.");
         ui->settings_msg_error = 1;
@@ -1121,7 +1156,7 @@ static void do_connect(App *app) {
     app->name = str8_copy(app->perm, name);
     app->room = str8_copy(app->perm, room);
     strbuf_set(&app->password, ui_text_str(&ui->f_password));
-    settings_save(app);
+    settings_save(app, 1);
 
     conn_start(&app->conn, vs_now_ns());
     conn_attempt_started(&app->conn);
@@ -1348,7 +1383,7 @@ static void handle_actions(App *app) {
             }
             if (!dup) {
                 strbuf_set(&app->media_dirs[app->media_dir_count++], dir);
-                ini_flush(app);
+                ini_flush_notify(app, "liste des dossiers médias", 1);
             }
         }
         redraw(app);
@@ -1359,18 +1394,28 @@ static void handle_actions(App *app) {
         if (i >= 0 && i < app->media_dir_count) {
             for (isize j = i; j + 1 < app->media_dir_count; j++) app->media_dirs[j] = app->media_dirs[j + 1];
             app->media_dir_count--;
-            ini_flush(app);
+            ini_flush_notify(app, "liste des dossiers médias", 1);
         }
         redraw(app);
     }
     if (ui->act_remember_changed) {
         ui->act_remember_changed = 0;
         // Décocher doit effacer le secret TOUT DE SUITE, pas à la fermeture :
-        // l'utilisateur qui décoche veut que ce soit fait.
-        settings_save(app);
-        ui_toast(ui, ui->remember_password ? "Mot de passe mémorisé, chiffré par Windows."
-                                           : "Mot de passe oublié.",
-                 0, now_ms());
+        // l'utilisateur qui décoche veut que ce soit fait. Le toast de succès
+        // MENTIRAIT si l'écriture a échoué (« mot de passe oublié » alors que
+        // le chiffré est toujours sur le disque) : c'est le seul geste où on
+        // remplace le message plutôt que d'empiler celui d'ini_flush_notify.
+        if (settings_save(app, 0)) {
+            ui_toast(ui, ui->remember_password ? "Mot de passe mémorisé, chiffré par Windows."
+                                               : "Mot de passe oublié.",
+                     0, now_ms());
+        } else {
+            ui_toast(ui,
+                     ui->remember_password
+                         ? "Mot de passe NON mémorisé : vibesync.ini n'a pas pu être écrit."
+                         : "Mot de passe NON effacé du disque : vibesync.ini n'a pas pu être écrit.",
+                     1, now_ms());
+        }
         redraw(app);
     }
     if (ui->act_update_dismiss) {
@@ -1652,7 +1697,9 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_DESTROY: PostQuitMessage(0); return 0;
         case WM_CLOSE:
-            settings_save(app);
+            // La fenêtre disparaît : un toast ne serait jamais lu, seul le
+            // journal peut témoigner de la perte des réglages.
+            settings_save(app, 0);
             // Fermer la fenêtre est un départ volontaire au même titre que
             // « Quitter la salle » : la close 1000 part AVANT la destruction de
             // la socket (VS-028). Coût au pire NET_CLOSE_GRACE_MS, et zéro
@@ -2269,7 +2316,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show) {
         DispatchMessageW(&msg);
     }
 
-    settings_save(app);
+    settings_save(app, 0);  // plus d'écran à qui parler : journal seulement
     // Dernier geste d'hygiène : plus aucun clair en mémoire à la sortie.
     secret_wipe(app->password.data, (isize)sizeof(app->password.data));
     secret_wipe(app->ui.f_password.data, (isize)sizeof(app->ui.f_password.data));
