@@ -1,4 +1,5 @@
-/* Ressources du client Windows : manifeste (DPI Per-Monitor v2, UTF-8). */
+/* Ressources du client Windows : manifeste (DPI Per-Monitor v2, UTF-8),
+   icône, et métadonnées VERSIONINFO. */
 #define CREATEPROCESS_MANIFEST_RESOURCE_ID 1
 #define RT_MANIFEST 24
 
@@ -7,3 +8,65 @@ CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "vibesync.manifest"
 /* Icône de l'application (7 tailles dans le .ico). L'identifiant numérique le
    plus faible est celui que l'explorateur et la barre des tâches affichent. */
 1 ICON "../../assets/vibesync.ico"
+
+/* VERSIONINFO (VS-043). Un exe non signé, petit et qui fait du réseau coche
+   déjà plusieurs cases du profil que l'heuristique ML de Defender note comme
+   suspect (Trojan:Win32/Wacatac.C!ml) ; un bloc de métadonnées complet est le
+   seul levier gratuit qui abaisse ce score, et c'est aussi ce que l'onglet
+   Détails des propriétés du fichier affiche à l'utilisateur.
+
+   Version : même source unique que le code C, le fichier VERSION de la racine.
+   build.bat passe à windres le jeton brut (0.2.4) pour les chaînes ET les trois
+   nombres séparés, parce que FILEVERSION veut des entiers séparés par des
+   virgules — chose qu'aucune macro ne sait fabriquer depuis « 0.2.4 ».
+   Sans injection (appel manuel de windres), on assume « dev » / 0.0.0. */
+#ifndef VIBESYNC_VERSION_RAW
+#define VIBESYNC_VERSION_RAW dev
+#endif
+#ifndef VIBESYNC_VER_MAJOR
+#define VIBESYNC_VER_MAJOR 0
+#endif
+#ifndef VIBESYNC_VER_MINOR
+#define VIBESYNC_VER_MINOR 0
+#endif
+#ifndef VIBESYNC_VER_PATCH
+#define VIBESYNC_VER_PATCH 0
+#endif
+#define VS_RC_STRINGIFY_(x) #x
+#define VS_RC_STRINGIFY(x) VS_RC_STRINGIFY_(x)
+
+/* 1 == VS_VERSION_INFO ; on n'inclut pas windows.h juste pour trois constantes
+   (0x40004L = VOS_NT_WINDOWS32, 0x1L = VFT_APP). Le même identifiant 1 que
+   l'icône ci-dessus : types de ressource différents, aucune collision.
+   Les chaînes restent en ASCII pur : elles traversent le préprocesseur puis
+   windres, et la page de code d'un cmd.exe FR n'est pas de l'UTF-8. */
+1 VERSIONINFO
+FILEVERSION VIBESYNC_VER_MAJOR, VIBESYNC_VER_MINOR, VIBESYNC_VER_PATCH, 0
+PRODUCTVERSION VIBESYNC_VER_MAJOR, VIBESYNC_VER_MINOR, VIBESYNC_VER_PATCH, 0
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS 0x40004L
+FILETYPE 0x1L
+FILESUBTYPE 0x0L
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    /* 040c = francais (France), 04b0 = 1200 = Unicode. */
+    BLOCK "040c04b0"
+    BEGIN
+      VALUE "CompanyName", "opmvpc"
+      VALUE "FileDescription", "vibesync - visionnage synchronise de videos locales entre amis"
+      VALUE "FileVersion", VS_RC_STRINGIFY(VIBESYNC_VERSION_RAW)
+      VALUE "InternalName", "vibesync"
+      VALUE "LegalCopyright", "Copyright (c) 2026 opmvpc"
+      VALUE "OriginalFilename", "vibesync.exe"
+      VALUE "ProductName", "vibesync"
+      VALUE "ProductVersion", VS_RC_STRINGIFY(VIBESYNC_VERSION_RAW)
+      VALUE "Comments", "Client de visionnage synchronise : pilote VLC en local, ne lit ni ne diffuse aucun fichier. Source : https://github.com/opmvpc/vibesync"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x40c, 1200
+  END
+END

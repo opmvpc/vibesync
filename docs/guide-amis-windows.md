@@ -51,6 +51,54 @@ vibesync n'est pas signé numériquement. Clique **Informations
 complémentaires** puis **Exécuter quand même** (SmartScreen), et **Autoriser
 l'accès** si le pare-feu demande une confirmation réseau.
 
+### ⚠️ L'antivirus a supprimé le fichier ? C'est une fausse alerte
+
+Windows Defender fait parfois disparaître `vibesync.exe` juste après le
+téléchargement, avec un message du genre **« Menace trouvée »** ou
+**« Trojan:Win32/Wacatac.C!ml »**. Le fichier n'est pas infecté.
+
+**Pourquoi ça arrive** — vibesync n'est pas signé numériquement (un certificat
+d'éditeur coûte plusieurs centaines d'euros par an ; c'est un projet gratuit
+entre potes). Sans signature, Defender ne juge plus l'identité de l'éditeur
+mais le comportement, « à la tête du client » : un tout petit programme
+(260 Ko), fraîchement publié, téléchargé par peu de monde, et qui ouvre une
+connexion réseau — c'est exactement le portrait-robot statistique d'un logiciel
+malveillant. Le suffixe `!ml` dans le nom de la menace veut littéralement dire
+« détecté par apprentissage automatique », c'est-à-dire par ressemblance, pas
+par identification d'un virus connu.
+
+**Comment récupérer le fichier**
+
+1. Ouvre **Sécurité Windows** (menu Démarrer, tape « Sécurité Windows »).
+2. **Protection contre les virus et menaces** → **Historique de protection**.
+3. Repère la ligne `vibesync.exe` (la plus récente), clique dessus pour la
+   déplier.
+4. Menu **Actions** → **Restaurer** — ou **Autoriser sur l'appareil** si
+   l'entrée est encore en quarantaine sans avoir été supprimée.
+5. Si le fichier a été supprimé pour de bon plutôt que mis en quarantaine :
+   re-télécharge-le depuis la page des versions, puis refais **Actions** →
+   **Autoriser**.
+
+Si tu ne trouves pas l'entrée, tu peux aussi déclarer une exclusion :
+**Protection contre les virus et menaces** → **Gérer les paramètres** →
+**Ajouter ou supprimer des exclusions** → **Ajouter une exclusion** →
+**Fichier**, et désigne `vibesync.exe`.
+
+**À savoir : ça peut recommencer à chaque nouvelle version.** L'autorisation
+porte sur *ce* fichier précis, pas sur « vibesync » en général. Un nouveau
+`vibesync-0.2.5.exe` est un fichier différent aux yeux de Defender : il peut
+falloir refaire la manip. Chaque version est par ailleurs signalée à Microsoft
+comme faux positif, ce qui règle en général le problème sous quelques jours —
+mais la fenêtre entre la publication et la correction reste possible.
+
+**Dans le doute, vérifie par toi-même** : dépose le fichier sur
+[virustotal.com](https://www.virustotal.com/) — il est analysé par ~70 moteurs
+antivirus. Une poignée de détections heuristiques isolées face à une majorité
+de « clean », c'est la signature typique d'un faux positif. Le code source
+complet est public sur [github.com/opmvpc/vibesync](https://github.com/opmvpc/vibesync),
+et les `.exe` publiés sont construits par GitHub Actions directement depuis ce
+code.
+
 **« VLC introuvable »** — vibesync cherche VLC aux emplacements habituels
 (`Program Files`). Deux solutions :
 - installer VLC normalement si ce n'est pas déjà fait ;

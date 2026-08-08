@@ -17,12 +17,29 @@ rem chaine par le preprocesseur cote C : aucun echappement de guillemets a
 rem travers cmd.exe, donc rien qui casse selon le shell.
 set "VERSION=dev"
 if exist "%ROOT%..\..\VERSION" set /p VERSION=<"%ROOT%..\..\VERSION"
+rem La ressource VERSIONINFO (vibesync.rc) veut en plus la version en nombres
+rem SEPARES : FILEVERSION 0,2,4,0. Aucune macro du preprocesseur ne sait couper
+rem "0.2.4" en trois, donc c'est cmd qui le fait ici. On ne decoupe que si la
+rem version a bien la forme X.Y.Z ; sinon (VERSION=dev) on reste a 0.0.0 et
+rem seules les chaines FileVersion/ProductVersion disent "dev".
+set "VMAJ=0"
+set "VMIN=0"
+set "VPATCH=0"
+echo %VERSION%|findstr /r /c:"^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$" >nul
+if not errorlevel 1 for /f "tokens=1-3 delims=." %%a in ("%VERSION%") do (
+  set "VMAJ=%%a"
+  set "VMIN=%%b"
+  set "VPATCH=%%c"
+)
 rem CORE_DIR = la couche C COMMUNE aux deux clients natifs (ADR-010, VS-031).
 rem Elle a quitte ui\win32\src pour la racine du depot : c'est le meme
 rem repertoire que compile la cible SwiftPM VSCore du client macOS, sans
 rem duplication ni lien symbolique (cf. Package.swift a la racine).
 set "CORE_DIR=%ROOT%..\..\core"
 set "STD=-std=c11 -ffp-contract=off -DVIBESYNC_VERSION_RAW=%VERSION%"
+rem Memes definitions cote ressources : le bloc VERSIONINFO de l'exe et la
+rem chaine affichee par l'application ne peuvent pas diverger.
+set "RCDEF=-DVIBESYNC_VERSION_RAW=%VERSION% -DVIBESYNC_VER_MAJOR=%VMAJ% -DVIBESYNC_VER_MINOR=%VMIN% -DVIBESYNC_VER_PATCH=%VPATCH%"
 set "WARN=-Wall -Wextra -Werror -Wshadow -Wvla -Wstrict-prototypes -Wmissing-prototypes"
 set "INC=-I "%CORE_DIR%\include" -I "%ROOT%src""
 rem comdlg32 : GetOpenFileNameW, la boite "Ouvrir" du systeme (bouton
@@ -63,7 +80,7 @@ exit /b 2
 :release
 echo [release] version %VERSION%
 echo [release] ressources
-"%RC%" "%ROOT%vibesync.rc" -O coff -o "%ROOT%build\vibesync.res" -I "%ROOT%"
+"%RC%" %RCDEF% "%ROOT%vibesync.rc" -O coff -o "%ROOT%build\vibesync.res" -I "%ROOT%"
 if errorlevel 1 exit /b 1
 echo [release] vibesync.exe
 rem -mwindows : application graphique (pas de console) ; -municode : wWinMain.
