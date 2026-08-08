@@ -718,6 +718,29 @@ static void test_ui(void) {
         ui_text_set(&t, S("bonjour"));
         CHECK(str8_eq(ui_text_str(&t), S("bonjour")) && t.caret == 7, "contenu et caret");
     }
+    // VS-040 : quelles lignes de la liste des participants mènent quelque part
+    // au double-clic. Une seule règle, lue par l'affordance (ui.c) ET par
+    // l'action (main.c) — les trois cas limites du ticket sont ici.
+    {
+        UiUser u;
+        memset(&u, 0, sizeof(u));
+        snprintf(u.name, sizeof(u.name), "camille");
+        snprintf(u.file, sizeof(u.file), "ep2-vostfr.mkv");
+        u.has_file = 1;
+        CHECK(ui_user_openable(&u), "fichier d'un autre, différent du nôtre : doit être ouvrable");
+        u.is_self = 1;
+        CHECK(!ui_user_openable(&u), "double-clic sur soi-même");
+        u.is_self = 0;
+        u.same_file = 1;
+        CHECK(!ui_user_openable(&u), "fichier identique au nôtre");
+        u.same_file = 0;
+        u.has_file = 0;
+        CHECK(!ui_user_openable(&u), "participant sans fichier déclaré");
+        // Drapeau levé mais nom vide : la même impasse, par l'autre bout.
+        u.has_file = 1;
+        u.file[0] = 0;
+        CHECK(!ui_user_openable(&u), "fichier au nom vide");
+    }
 }
 
 // ------------------------------------------- édition de texte (VS-018) ---

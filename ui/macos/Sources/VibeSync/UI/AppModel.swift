@@ -452,10 +452,14 @@ public final class AppModel: ObservableObject {
     /// comparaison au nôtre couvre les deux cas d'un coup : sans fichier, tout
     /// nom déclaré diffère du nôtre (vide).
     private func refreshWatchBanner() {
-        let mine = engine.haveFile ? engine.fileName : ""
-        for u in users where !u.id.isEmpty && u.id != engine.selfId && u.hasFile && !u.fileName.isEmpty {
-            if u.fileName.compare(mine, options: .caseInsensitive) == .orderedSame {
-                continue  // il regarde la même chose que nous
+        // VS-040 : l'éligibilité d'un participant (ni nous, fichier déclaré,
+        // différent du nôtre) est désormais UNE fonction, partagée avec le
+        // double-clic sur sa ligne. Le bandeau n'ajoute que son propre refus.
+        for u in users {
+            guard AppModel.participantFileToOpen(user: u,
+                                                 selfId: engine.selfId,
+                                                 myFile: myFileName) != nil else {
+                continue
             }
             if u.fileName == dismissedWatchFile {
                 return
@@ -501,7 +505,62 @@ public final class AppModel: ObservableObject {
     /// Clic sur le bandeau « X regarde … » : recherche du fichier dans les
     /// dossiers configurés, hors thread principal, puis lancement de VLC.
     public func openWatchedFile() {
-        let name = watchFile
+        searchAndOpenMedia(named: watchFile)
+    }
+
+    /// Le fichier qu'un double-clic sur la ligne d'un participant doit aller
+    /// chercher, ou nil si la ligne ne mène nulle part (VS-040). Fonction pure,
+    /// donc testable : les trois cas limites sont ici et nulle part ailleurs.
+    ///
+    /// La comparaison au nôtre est la MÊME que celle du bandeau
+    /// (`refreshWatchBanner`) : insensible à la casse, sur le seul nom de
+    /// fichier — c'est tout ce que le protocole fait circuler.
+    public static func participantFileToOpen(user: ServerUser,
+                                             selfId: String,
+                                             myFile: String) -> String? {
+        if user.id.isEmpty || user.id == selfId {
+            return nil  // soi-même : rien à aller chercher
+        }
+        if !user.hasFile || user.fileName.isEmpty {
+            return nil  // participant sans fichier déclaré
+        }
+        if user.fileName.compare(myFile, options: .caseInsensitive) == .orderedSame {
+            return nil  // il regarde déjà la même chose que nous
+        }
+        return user.fileName
+    }
+
+    /// Notre fichier vu du moteur — pas du miroir de la vue, qui aurait un
+    /// broadcast de retard (la leçon de VS-039).
+    private var myFileName: String {
+        return engine.haveFile ? engine.fileName : ""
+    }
+
+    /// La ligne de ce participant est-elle actionnable ? Sert uniquement à
+    /// l'affordance (surbrillance, infobulle) ; la décision reste prise par
+    /// `openParticipantFile`.
+    public func canOpenFile(of user: ServerUser) -> Bool {
+        return AppModel.participantFileToOpen(user: user,
+                                              selfId: engine.selfId,
+                                              myFile: myFileName) != nil
+    }
+
+    /// Double-clic sur la ligne d'un participant (VS-040) : exactement le
+    /// chemin du bandeau « X regarde … », déclenché à la demande sur le fichier
+    /// désigné plutôt que sur celui que le bandeau a choisi.
+    public func openParticipantFile(_ user: ServerUser) {
+        guard let name = AppModel.participantFileToOpen(user: user,
+                                                        selfId: engine.selfId,
+                                                        myFile: myFileName) else {
+            return
+        }
+        searchAndOpenMedia(named: name)
+    }
+
+    /// Recherche d'un nom de fichier dans les dossiers configurés, hors thread
+    /// principal, puis lancement de VLC. Un seul corps pour les deux
+    /// déclencheurs : le bandeau et le double-clic.
+    private func searchAndOpenMedia(named name: String) {
         if name.isEmpty || mediaSearching {
             return
         }

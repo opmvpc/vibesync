@@ -172,25 +172,8 @@ struct RoomView: View {
                     .foregroundColor(Palette.secondary)
             }
             ForEach(model.users, id: \.id) { user in
-                HStack(spacing: 8) {
-                    Circle()
-                        .fill(user.ready ? Palette.good : Palette.tertiary)
-                        .frame(width: 7, height: 7)
-                    Text(user.name)
-                        .font(.system(size: 12, weight: .medium))
-                    if user.hasFile && !user.fileName.isEmpty {
-                        Text(user.fileName)
-                            .font(.system(size: 11))
-                            .foregroundColor(Palette.tertiary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
-                    Spacer()
-                    if user.latencyMs > 0 {
-                        Badge(text: "\(user.latencyMs) ms", color: Palette.secondary)
-                    }
-                    Badge(text: user.ready ? "prêt" : "pas prêt",
-                          color: user.ready ? Palette.good : Palette.tertiary)
+                ParticipantRow(user: user, openable: model.canOpenFile(of: user)) {
+                    model.openParticipantFile(user)
                 }
             }
         }
@@ -258,5 +241,63 @@ struct RoomView: View {
         }
         .padding(.top, 8)
         .allowsHitTesting(false)
+    }
+}
+
+/// Une ligne de la liste des participants. Double-cliquer celle de quelqu'un
+/// d'autre va chercher SON fichier dans nos dossiers médias et l'ouvrir
+/// (VS-040) — le même chemin que le bandeau « X regarde … », déclenché à la
+/// demande. La ligne n'est actionnable que si elle mène quelque part : c'est
+/// `AppModel.participantFileToOpen` qui tranche, pas la vue.
+///
+/// Une vue à part, et non un HStack inline, parce que la surbrillance au survol
+/// demande un `@State` par ligne — même affordance que le client Windows
+/// (`draw_users` dans ui/win32/src/ui.c).
+private struct ParticipantRow: View {
+    let user: ServerUser
+    let openable: Bool
+    let onOpen: () -> Void
+
+    @State private var hovering = false
+
+    private var highlighted: Bool {
+        return openable && hovering
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(user.ready ? Palette.good : Palette.tertiary)
+                .frame(width: 7, height: 7)
+            Text(user.name)
+                .font(.system(size: 12, weight: .medium))
+            if user.hasFile && !user.fileName.isEmpty {
+                Text(user.fileName)
+                    .font(.system(size: 11))
+                    .foregroundColor(highlighted ? Palette.accent : Palette.tertiary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer()
+            if user.latencyMs > 0 {
+                Badge(text: "\(user.latencyMs) ms", color: Palette.secondary)
+            }
+            Badge(text: user.ready ? "prêt" : "pas prêt",
+                  color: user.ready ? Palette.good : Palette.tertiary)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(highlighted ? Palette.accent.opacity(0.12) : Color.clear)
+        )
+        .contentShape(Rectangle())
+        .onHover { inside in
+            hovering = inside
+        }
+        .help(openable ? "Double-cliquer pour chercher « \(user.fileName) » dans vos dossiers et l'ouvrir" : "")
+        .onTapGesture(count: 2) {
+            onOpen()
+        }
     }
 }

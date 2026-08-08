@@ -840,6 +840,26 @@ static void dispatch_output(App *app, VsOutput *out) {
 
 // --- vue : recopie de l'état moteur vers l'UI (thread UI uniquement) ---
 
+// refresh_user_files marque les lignes de la liste dont le fichier est DÉJÀ le
+// nôtre (VS-040) : ce sont celles que le double-clic doit ignorer, et que le
+// survol ne doit pas allumer. Notre fichier se lit dans le moteur et non dans
+// le miroir de la vue, qui aurait un broadcast de retard (leçon de VS-039).
+static void refresh_user_files(App *app) {
+    UiApp *ui = &app->ui;
+    const VsDirOps *ops = vs_dir_ops();
+    Str8 mine = app->engine.have_file ? strbuf_str(&app->engine.file_name) : str8_lit("");
+    for (isize i = 0; i < ui->user_count; i++) {
+        UiUser *u = &ui->users[i];
+        if (!u->has_file || u->file[0] == 0) {
+            u->same_file = 0;
+            continue;
+        }
+        TempArena t = temp_begin(app->scratch);
+        u->same_file = ops->name_eq_ci(app->scratch, str8_from_cstr(u->file), mine);
+        temp_end(t);
+    }
+}
+
 static void refresh_view(App *app) {
     UiApp *ui = &app->ui;
     ui->phase = app->engine.phase;
@@ -877,6 +897,9 @@ static void refresh_view(App *app) {
         Str8 d = strbuf_str(&app->media_dirs[i]);
         snprintf(ui->media_dirs[i], sizeof(ui->media_dirs[i]), "%.*s", (int)d.len, d.data);
     }
+    // À chaque pas, pas seulement à l'arrivée d'un `users` : ouvrir NOTRE
+    // fichier doit éteindre tout de suite les lignes devenues identiques.
+    refresh_user_files(app);
 }
 
 // refresh_watch_banner propose d'ouvrir le média qu'un autre membre a déclaré,
@@ -891,18 +914,17 @@ static void refresh_view(App *app) {
 static void refresh_watch_banner(App *app) {
     UiApp *ui = &app->ui;
     const VsDirOps *ops = vs_dir_ops();
-    // Notre fichier se lit dans le moteur, pas dans le miroir de la vue : ce
-    // dernier n'est rafraîchi qu'en fin de pas, il aurait un broadcast de retard.
-    Str8 mine = app->engine.have_file ? strbuf_str(&app->engine.file_name) : str8_lit("");
+    // VS-040 : « ce participant a-t-il un fichier qui vaut d'être proposé ? »
+    // est UNE règle (ui_user_openable), partagée avec le double-clic sur sa
+    // ligne. Elle a besoin de same_file, recalculé juste avant depuis le moteur.
+    refresh_user_files(app);
     for (isize i = 0; i < ui->user_count; i++) {
         UiUser *u = &ui->users[i];
-        if (u->is_self || !u->has_file || u->file[0] == 0) continue;
+        if (!ui_user_openable(u)) continue;
         TempArena t = temp_begin(app->scratch);
-        Str8 theirs = str8_from_cstr(u->file);
-        b32 same = ops->name_eq_ci(app->scratch, theirs, mine);
-        b32 refused = ops->name_eq_ci(app->scratch, theirs, str8_from_cstr(ui->watch_dismissed));
+        b32 refused = ops->name_eq_ci(app->scratch, str8_from_cstr(u->file),
+                                      str8_from_cstr(ui->watch_dismissed));
         temp_end(t);
-        if (same) continue;  // il regarde la même chose que nous
         if (refused) return;  // bandeau fermé pour ce fichier : ne pas insister
         snprintf(ui->watch_who, sizeof(ui->watch_who), "%s", u->name);
         snprintf(ui->watch_file, sizeof(ui->watch_file), "%s", u->file);
@@ -1462,7 +1484,10 @@ static void handle_actions(App *app) {
     if (ui->act_open_user_file) {
         ui->act_open_user_file = 0;
         isize i = ui->act_open_user_index;
-        if (i >= 0 && i < ui->user_count && ui->users[i].has_file) {
+        // Même règle que l'affordance (VS-040) : soi-même, participant sans
+        // fichier ou fichier déjà le nôtre → rien. Revérifiée ici parce que la
+        // liste a pu changer entre le dessin de la frame et son traitement.
+        if (i >= 0 && i < ui->user_count && ui_user_openable(&ui->users[i])) {
             request_media_open(app, str8_from_cstr(ui->users[i].file));
         }
         redraw(app);
@@ -2270,6 +2295,7 @@ static void capture_screens(App *app, Str8 dir) {
     ui->users[1].has_file = 1;
     ui->users[1].latency_ms = 38;
     snprintf(ui->users[1].file, sizeof(ui->users[1].file), "ep1-vostfr.mkv");
+    ui->users[1].same_file = 1;  // même fichier que nous : ligne inerte (VS-040)
     snprintf(ui->users[2].name, sizeof(ui->users[2].name), "jean-mi");
     ui->users[2].latency_ms = 120;
     ui->ready = 1;

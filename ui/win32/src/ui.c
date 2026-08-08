@@ -1430,6 +1430,10 @@ static void screen_connect(UiApp *a, HDC dc, i64 now_ms) {
 
 // ---------------------------------------------------------------- écran salle ---
 
+b32 ui_user_openable(const UiUser *u) {
+    return !u->is_self && u->has_file && u->file[0] != 0 && !u->same_file;
+}
+
 static void draw_users(UiApp *a, HDC dc, Rect r) {
     panel(a, dc, r);
     i32 pad = S(a, 14);
@@ -1444,9 +1448,11 @@ static void draw_users(UiApp *a, HDC dc, Rect r) {
     for (isize i = 0; i < a->user_count && y + row_h < r.y + r.h - pad; i++) {
         UiUser *u = &a->users[i];
         Rect row = rect(x, y, w, row_h - S(a, 6));
-        // Double-clic sur la ligne d'un participant qui a déclaré un fichier :
-        // on va le chercher dans les dossiers médias et l'ouvrir.
-        b32 row_hover = !a->input_locked && !u->is_self && u->has_file && rect_hit(row, a->mouse_x, a->mouse_y);
+        // Double-clic sur la ligne d'un participant qui a déclaré un fichier
+        // AUTRE que le nôtre : on va le chercher dans les dossiers médias et on
+        // l'ouvre. Le survol ne s'allume que là où le double-clic mène quelque
+        // part — une surbrillance sur une ligne inerte serait un mensonge.
+        b32 row_hover = !a->input_locked && ui_user_openable(u) && rect_hit(row, a->mouse_x, a->mouse_y);
         if (row_hover) {
             a->hot = 5000 + (u64)i;
             if (a->mouse_pressed && a->mouse_double) {

@@ -130,8 +130,20 @@ typedef struct {
     b32 ready;
     b32 is_self;
     b32 has_file;
+    // same_file : ce participant regarde DÉJÀ le fichier que nous avons ouvert
+    // (comparaison insensible à la casse, calculée depuis le MOTEUR par
+    // main.c). Sa ligne est alors inerte au double-clic (VS-040) : aller
+    // chercher un fichier qu'on a déjà ouvert relancerait VLC pour rien.
+    b32 same_file;
     i64 latency_ms;
 } UiUser;
+
+// ui_user_openable : la ligne de ce participant mène-t-elle quelque part quand
+// on la double-clique ? Il faut que ce soit quelqu'un d'autre, qu'il ait
+// déclaré un fichier, et que ce fichier ne soit pas déjà le nôtre (VS-040).
+// Les trois cas limites tiennent ici : l'affordance (surbrillance, ui.c) et
+// l'action (main.c) lisent la même règle, jamais deux copies divergentes.
+b32 ui_user_openable(const UiUser *u);
 
 typedef struct {
     char from[48];
