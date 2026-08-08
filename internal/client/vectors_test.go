@@ -282,13 +282,15 @@ func (b *vecBuilder) userEvent(kind string, arg float64) {
 	}
 }
 
-// churn joue `polls` polls en plaçant VLC à « position attendue ± 0,15 s » par
+// noise joue `polls` polls en plaçant VLC à « position attendue ± 0,15 s » par
 // un userSeek sous le seuil de détection (3 s). C'est le bruit que rend le vrai
-// VLC (VS-029, mesuré dans la VM Win11) : à ce régime le nudge s'engage et se
-// relâche à presque chaque tour, et les `rate` défilent en continu. Le seul
-// vocabulaire employé est celui que tous les harnais de rejeu comprennent
-// (userSeek + poll) : aucun réglage caché du faux VLC.
-func (b *vecBuilder) churn(polls int) {
+// VLC (VS-029, mesuré dans la VM Win11). Avant VS-038 il faisait churner le
+// nudge ; il est désormais dix fois sous la zone morte et ne doit produire
+// AUCUNE commande — mais c'est toujours le régime dans lequel la détection
+// d'action utilisateur doit fonctionner. Le seul vocabulaire employé est celui
+// que tous les harnais de rejeu comprennent (userSeek + poll) : aucun réglage
+// caché du faux VLC.
+func (b *vecBuilder) noise(polls int) {
 	for i := 1; i <= polls; i++ {
 		jitter := 0.15
 		if i%2 == 0 {
@@ -412,22 +414,25 @@ func TestVectors(t *testing.T) {
 	b.run(10)
 	b.check()
 
-	// 2. Nudge : 0,6 s d'avance → 0,95× puis retour à 1 après convergence
-	// (hystérésis : le nudge ne se relâche qu'en dessous de 0,03 s).
+	// 2. Micro-seek : 2,5 s d'avance, au-dessus de la zone morte (1,5 s) et sous
+	// le seuil du seek immédiat (5 s). La vitesse n'est jamais touchée : le
+	// recalage se fait par UN seek, et seulement une fois la dérive avérée sur
+	// les 5 derniers polls (docs/protocol.md §Persistance de la dérive).
 	b = newVecBuilder(t, vecSetup{
-		name: "02-nudge-avance", file: "ep1.mkv", durationSec: 1200, positionSec: 100.6, playing: true,
-		description: "Drift de +0,6 s : rate-nudge à 0,95× jusqu'à l'hystérésis basse, puis retour à 1×.",
+		name: "02-micro-seek-avance", file: "ep1.mkv", durationSec: 1200, positionSec: 102.5, playing: true,
+		description: "Drift de +2,5 s : rien pendant les 4 premiers polls (historique de " +
+			"dérive incomplet), puis UN micro-seek de recalage au 5e. Aucune commande rate.",
 	})
 	b.welcome(b.h.playing(100))
-	b.run(4)
-	b.wait(11 * time.Second) // convergence simulée
-	b.run(6)
+	b.run(10)
 	b.check()
 
-	// 3. Seek dur : 180 s de retard.
+	// 3. Seek immédiat : 180 s de retard, très au-delà des 5 s — la médiane
+	// n'est pas consultée.
 	b = newVecBuilder(t, vecSetup{
 		name: "03-seek-dur", file: "ep1.mkv", durationSec: 3600, positionSec: 120, playing: true,
-		description: "Drift de -180 s : seek dur vers la position attendue puis affinage au rate.",
+		description: "Drift de -180 s : seek immédiat vers la position attendue (≥ 5 s, " +
+			"sans attendre la persistance), puis plus rien à corriger.",
 	})
 	b.welcome(b.h.playing(300))
 	b.run(8)
@@ -518,12 +523,21 @@ func TestVectors(t *testing.T) {
 	b.run(4)
 	b.check()
 
-	// 11. Hystérésis : un drift de 0,05 s n'engage pas le nudge.
+	// 11. Zone morte large puis micro-seek : 1,2 s de dérive ne déclenchent
+	// rien, même prolongés ; quand la référence bouge et porte la dérive à
+	// 2,2 s, le recalage ne part qu'après 5 polls de persistance.
 	b = newVecBuilder(t, vecSetup{
-		name: "11-hysteresis", file: "ep1.mkv", durationSec: 1200, positionSec: 100.05, playing: true,
-		description: "Drift de 0,05 s : sous le seuil d'engagement (0,1 s), aucun nudge n'est engagé.",
+		name: "11-zone-morte-micro-seek", file: "ep1.mkv", durationSec: 1200,
+		positionSec: 101.2, playing: true,
+		description: "Zone morte de 1,5 s : un drift de 1,2 s ne déclenche rien, même " +
+			"prolongé. La référence bouge alors d'une seconde (roomState) : la dérive " +
+			"passe à ≈2,2 s, et UN micro-seek part au 3e poll qui suit — l'instant où " +
+			"la MÉDIANE des 5 derniers polls dépasse enfin le seuil. Aucune commande rate.",
 	})
 	b.welcome(b.h.playing(100))
+	b.run(6)
+	// La salle recule d'une seconde : la dérive sort de la zone morte.
+	b.event(protocol.TypeRoomState, b.h.playing(round3(b.h.fake.Position())-2.2))
 	b.run(8)
 	b.check()
 
@@ -584,36 +598,35 @@ func TestVectors(t *testing.T) {
 	b.run(4)
 	b.check()
 
-	// 14. Action utilisateur sous le churn du nudge (VS-029). La position que
-	// rend VLC oscille de ±0,15 s autour de la référence : le nudge s'engage et
-	// se relâche à presque chaque poll, les `rate` défilent en continu. La
-	// fenêtre de grâce ne doit PAS être réarmée par ces `rate` — sinon elle
-	// reste ouverte en permanence, la détection d'action utilisateur ne tourne
-	// plus jamais en lecture, et une pause faite dans VLC est annulée par la
-	// correction du poll suivant au lieu de partir au serveur.
+	// 14. Action utilisateur sous le bruit de position (VS-029, redessiné par
+	// VS-038). La position que rend VLC oscille de ±0,15 s autour de la
+	// référence. Ce bruit ne doit produire AUCUNE commande (il est dix fois
+	// sous la zone morte) et la fenêtre de grâce ne doit pas rester ouverte :
+	// sinon la détection d'action utilisateur ne tourne plus jamais en lecture
+	// et une pause faite dans VLC est annulée au lieu de partir au serveur.
 	b = newVecBuilder(t, vecSetup{
-		name: "14-action-utilisateur-sous-churn", file: "ep1.mkv", durationSec: 7200,
+		name: "14-action-utilisateur-sous-bruit", file: "ep1.mkv", durationSec: 7200,
 		positionSec: 1000, playing: true,
-		description: "Régime de churn du nudge (position VLC bruitée de ±0,15 s) : " +
-			"pause puis reprise puis seek faits DANS VLC sont bien détectés et " +
-			"remontés en control — la grâce n'est pas réarmée par les rate.",
+		description: "Lecture bruitée (position VLC oscillant de ±0,15 s) : aucune " +
+			"commande n'est envoyée à VLC, et pause puis reprise puis seek faits " +
+			"DANS VLC sont bien détectés et remontés en control.",
 		scenario: "Préconditions du moteur au premier événement : session serveur " +
 			"déjà établie, aucun état de salle connu, aucune mesure d'offset " +
 			"d'horloge. Fichier ep1.mkv ouvert, durée 7200 s, taille 15 octets, " +
 			"position 1000 s, lecture en cours, rate 1. Les événements `userSeek` " +
 			"de ±0,15 s ne sont PAS des actions utilisateur (bien sous le seuil de " +
-			"3 s) : ils reproduisent le bruit de la position rendue par VLC, qui " +
-			"fait churner le nudge. Déroulé : (1) welcome + pong d'une salle en " +
-			"lecture à 1000 s, puis 10 polls de churn ; (2) l'utilisateur met VLC " +
-			"en pause lui-même — le control pause doit partir malgré le churn ; " +
-			"(3) le serveur renvoie la pause en écho (setBy = u1) et le hold " +
-			"tombe ; (4) l'utilisateur relance la lecture dans VLC — control play, " +
-			"écho du serveur ; (5) 8 polls de churn, puis l'utilisateur saute de " +
-			"300 s dans la barre de VLC — control seek.",
+			"3 s) : ils reproduisent le bruit de la position rendue par VLC — dix " +
+			"fois sous la zone morte de 1,5 s, donc aucune correction. Déroulé : " +
+			"(1) welcome + pong d'une salle en lecture à 1000 s, puis 10 polls " +
+			"bruités ; (2) l'utilisateur met VLC en pause lui-même — le control " +
+			"pause doit partir ; (3) le serveur renvoie la pause en écho " +
+			"(setBy = u1) et le hold tombe ; (4) l'utilisateur relance la lecture " +
+			"dans VLC — control play, écho du serveur ; (5) 8 polls bruités, puis " +
+			"l'utilisateur saute de 300 s dans la barre de VLC — control seek.",
 	})
 	b.welcome(b.h.playing(1000))
-	b.churn(10)
-	// L'utilisateur appuie sur Espace dans VLC, en plein régime de churn.
+	b.noise(10)
+	// L'utilisateur appuie sur Espace dans VLC, en pleine lecture bruitée.
 	b.userEvent("userPause", 0)
 	b.run(3)
 	echoPause := b.h.paused(b.lastControlPosition())
@@ -626,7 +639,7 @@ func TestVectors(t *testing.T) {
 	echoPlay := b.h.playing(b.lastControlPosition())
 	echoPlay.SetBy = "u1"
 	b.event(protocol.TypeRoomState, echoPlay)
-	b.churn(8)
+	b.noise(8)
 	// … et finit par un saut à la souris dans la barre de VLC.
 	b.userEvent("userSeek", round3(b.h.fake.Position())+300)
 	b.run(3)

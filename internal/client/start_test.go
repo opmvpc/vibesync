@@ -10,7 +10,8 @@ import (
 
 // docs/protocol.md §Départ et reprise de lecture : au passage pause → lecture,
 // le moteur cale d'abord la position (seek si l'écart ≥ 0,3 s) puis lance VLC.
-// Sans ça, un écart de départ de 0,5 s coûterait ~10 s de nudge à 5 %/s.
+// Sans ça, l'écart de départ resterait tel quel : il est sous la zone morte de
+// 1,5 s, plus aucune correction ne le résorbe (VS-038).
 
 func TestDepartDeLectureCaleLaPositionAvantDeLancer(t *testing.T) {
 	h := newHarness(t)
@@ -32,7 +33,7 @@ func TestDepartDeLectureCaleLaPositionAvantDeLancer(t *testing.T) {
 	h.ticks(1)
 
 	if h.fake.Seeks() == 0 {
-		t.Fatal("aucun seek de calage : le moteur compte sur le nudge au départ")
+		t.Fatal("aucun seek de calage : l'écart de départ resterait dans la zone morte")
 	}
 	if h.fake.State() != "playing" {
 		t.Fatalf("état = %q, la lecture aurait dû être lancée", h.fake.State())
@@ -69,7 +70,7 @@ func TestDepartSansEcartNeSeekPas(t *testing.T) {
 	}
 }
 
-func TestDepartConvergeSansAttendreLeNudge(t *testing.T) {
+func TestDepartConvergeParLeCalage(t *testing.T) {
 	h := newHarness(t)
 	h.openFile("ep1.mkv", 1200)
 	h.connect(h.paused(300))
@@ -77,12 +78,12 @@ func TestDepartConvergeSansAttendreLeNudge(t *testing.T) {
 	h.ticks(3)
 
 	h.server(protocol.TypeRoomState, h.playing(300))
-	// Convergence dans la zone morte en quelques ticks, pas en dizaines de
-	// secondes : le calage a fait l'essentiel du travail.
+	// Convergence en quelques ticks : c'est le calage qui fait tout le travail,
+	// aucune correction ne prend le relais sous la zone morte.
 	converged := false
 	for range 15 { // 3 s simulées
 		h.tick(PollInterval)
-		if math.Abs(h.e.Snapshot().DriftSec) <= DeadZoneSec {
+		if math.Abs(h.e.Snapshot().DriftSec) <= StartAlignSec {
 			converged = true
 			break
 		}

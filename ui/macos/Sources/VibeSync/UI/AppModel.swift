@@ -94,6 +94,14 @@ public final class AppModel: ObservableObject {
 
     // MARK: Interne
 
+    /// Commandes envoyées à VLC depuis le lancement, par nature. Publiées dans
+    /// l'état du mode auto (harnais de séance réelle) : `rateCmds` prouve que la
+    /// vitesse ne sert plus jamais à corriger la dérive (VS-038).
+    private var pauseCmds = 0
+    private var resumeCmds = 0
+    private var seekCmds = 0
+    private var rateCmds = 0
+
     /// Le moteur de synchronisation : la couche C commune (VSCore) vue à
     /// travers CoreEngine.swift. Une classe, donc une référence — mais la même
     /// discipline qu'avant : tous les appels partent de la file principale.
@@ -701,6 +709,12 @@ public final class AppModel: ObservableObject {
             jw_kv_num(&w, "driftSec", driftSec)
             jw_kv_bool(&w, "buffering", buffering ? 1 : 0)
             jw_kv_i64(&w, "latencyMs", latencyMs)
+            // Commandes envoyées à VLC depuis le lancement, par nature :
+            // `rateCmds` doit rester à 0 sur une séance normale (VS-038).
+            jw_kv_i64(&w, "pauseCmds", Int64(pauseCmds))
+            jw_kv_i64(&w, "resumeCmds", Int64(resumeCmds))
+            jw_kv_i64(&w, "seekCmds", Int64(seekCmds))
+            jw_kv_i64(&w, "rateCmds", Int64(rateCmds))
             AppModel.jwText(&w, "error", formError)
             // Libellés de l'interface : c'est là que se lisent la cause d'un
             // échec de connexion et l'état du lancement de VLC.
@@ -785,12 +799,26 @@ public final class AppModel: ObservableObject {
                 guard let player = vlc else {
                     continue
                 }
+                countVLCCommand(command)
                 player.client.apply(command) { [weak self] result in
                     if case .failure(let err) = result {
                         self?.mediaLabel = err.text
                     }
                 }
             }
+        }
+    }
+
+    /// Compteurs de commandes envoyées à VLC, par nature. Ils ne servent qu'au
+    /// harnais de séance réelle : depuis VS-038 la vitesse ne corrige plus
+    /// jamais la dérive, et `rateCmds` est ce qui le PROUVE sur une vraie
+    /// séance (zéro pendant une lecture stable).
+    private func countVLCCommand(_ command: VLCCommand) {
+        switch command.kind {
+        case .pause: pauseCmds += 1
+        case .resume: resumeCmds += 1
+        case .seek: seekCmds += 1
+        case .rate: rateCmds += 1
         }
     }
 
@@ -804,11 +832,11 @@ public final class AppModel: ObservableObject {
         vlcRunning = vlc != nil
         switch engine.correcting {
         case .none:
-            correctionLabel = engine.nudging ? "ajustement" : ""
-        case .nudge:
-            correctionLabel = "ajustement de vitesse"
+            correctionLabel = ""
         case .seek:
-            correctionLabel = "resynchronisation"
+            // Depuis VS-038, la seule correction visible est le recalage par
+            // seek : la vitesse ne sert plus jamais à rattraper la dérive.
+            correctionLabel = "recalage"
         }
         if engine.haveStatus {
             // Une seule lecture : chaque accès recopie l'instantané depuis

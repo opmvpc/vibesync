@@ -46,7 +46,11 @@ FILE_TIMEOUT=30
 STEP_TIMEOUT=20
 HOLD_SEC=5
 SEEK_TARGET=120
-DRIFT_MAX=0.5
+# DRIFT_MAX : écart toléré entre les deux lecteurs à la fin de la séance.
+# Aligné sur la ZONE MORTE du moteur (1,5 s, docs/protocol.md §Correction) :
+# depuis VS-038 rien ne rapproche deux lecteurs tant qu'ils sont dedans, exiger
+# mieux serait exiger du moteur ce qu'il ne cherche plus à faire.
+DRIFT_MAX=1.5
 MEDIA_SECONDS=600
 
 FAILURES=0
@@ -352,7 +356,18 @@ else
 fi
 snapshot
 
-step "(g) fermeture propre"
+step "(g) vitesse constante 1x (VS-038)"
+# Le critère de confort du ticket : sur une séance normale, le moteur ne doit
+# envoyer AUCUNE commande `rate` à VLC — la vitesse ne corrige plus la dérive.
+R1=$(jget "$ST1" rateCmds); R2=$(jget "$ST2" rateCmds)
+if [ "$(num "$R1")" = "0" ] && [ "$(num "$R2")" = "0" ]; then
+    pass "aucune commande rate envoyée à VLC (client1=$(num "$R1") client2=$(num "$R2"))"
+else
+    fail "commandes rate envoyées à VLC : client1=$(num "$R1") client2=$(num "$R2") — la vitesse ne doit plus corriger la dérive"
+fi
+say "  seeks de recalage : client1=$(num "$(jget "$ST1" seekCmds)") client2=$(num "$(jget "$ST2" seekCmds)")"
+
+step "(h) fermeture propre"
 echo quit >> "$CMD1"
 echo quit >> "$CMD2"
 if wait_for 15 "arrêt des deux clients" \

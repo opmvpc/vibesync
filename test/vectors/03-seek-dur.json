@@ -1,7 +1,7 @@
 {
   "_doc": "Vecteur de conformité du moteur de sync vibesync (golden file, régénéré par `go test ./internal/client -run TestVectors -update`). Horloge simulée : tous les temps sont en millisecondes depuis le début du scénario. `initialVLC` = état complet de VLC au départ ; `events` = entrées injectées (messages serveur, actions de l'utilisateur dans VLC, coupure de session) ; `trace` = une entrée par poll de 200 ms avec l'état observé de VLC, la position attendue calculée, le drift, les commandes envoyées à VLC et les messages envoyés au serveur. Une réimplémentation est conforme si, pour le même `initialVLC` et les mêmes `events`, elle produit les mêmes `vlcCommands` et `toServer` aux mêmes instants.",
   "name": "03-seek-dur",
-  "description": "Drift de -180 s : seek dur vers la position attendue puis affinage au rate.",
+  "description": "Drift de -180 s : seek immédiat vers la position attendue (≥ 5 s, sans attendre la persistance), puis plus rien à corriger.",
   "pollIntervalMs": 200,
   "initialVLC": {
     "fileName": "ep1.mkv",
@@ -95,32 +95,26 @@
       "vlcState": "playing",
       "vlcPositionSec": 300.6,
       "expectedPositionSec": 300.8,
-      "driftSec": -0.2,
-      "vlcCommands": [
-        {
-          "cmd": "rate",
-          "value": 1.05
-        }
-      ]
+      "driftSec": -0.2
     },
     {
       "atMs": 1000,
       "vlcState": "playing",
-      "vlcPositionSec": 300.81,
+      "vlcPositionSec": 300.8,
       "expectedPositionSec": 301,
-      "driftSec": -0.19
+      "driftSec": -0.2
     },
     {
       "atMs": 1200,
       "vlcState": "playing",
-      "vlcPositionSec": 301.02,
+      "vlcPositionSec": 301,
       "expectedPositionSec": 301.2,
-      "driftSec": -0.18,
+      "driftSec": -0.2,
       "toServer": [
         {
           "type": "report",
           "data": {
-            "positionSec": 301.0199999999999,
+            "positionSec": 300.99999999999994,
             "paused": false,
             "buffering": false
           }
@@ -130,16 +124,16 @@
     {
       "atMs": 1400,
       "vlcState": "playing",
-      "vlcPositionSec": 301.23,
+      "vlcPositionSec": 301.2,
       "expectedPositionSec": 301.4,
-      "driftSec": -0.17
+      "driftSec": -0.2
     },
     {
       "atMs": 1600,
       "vlcState": "playing",
-      "vlcPositionSec": 301.44,
+      "vlcPositionSec": 301.4,
       "expectedPositionSec": 301.6,
-      "driftSec": -0.16
+      "driftSec": -0.2
     }
   ]
 }

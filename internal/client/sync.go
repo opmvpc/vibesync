@@ -190,7 +190,7 @@ func (e *Engine) planLocked(now time.Time) []action {
 	}
 	if e.phase != PhaseConnected || !e.haveState {
 		e.drift = 0
-		e.nudging = false
+		e.drifts = nil
 		return nil
 	}
 	base := e.roomRateLocked()
@@ -208,6 +208,9 @@ func (e *Engine) planLocked(now time.Time) []action {
 	}
 
 	var acts []action
+	// rateAction ne sert QU'À RESTAURER la vitesse de référence de la salle
+	// quand celle de VLC en diverge (l'utilisateur l'a changée dans VLC). La
+	// vitesse n'est jamais utilisée pour corriger la dérive (VS-038).
 	rateAction := func(target float64) {
 		if math.Abs(e.appliedRat-target) > 1e-3 || math.Abs(e.status.Rate-target) > 1e-3 {
 			acts = append(acts, action{kind: actRate, val: target})
@@ -215,9 +218,10 @@ func (e *Engine) planLocked(now time.Time) []action {
 	}
 
 	if e.roomState.Paused {
-		// En pause : jamais de nudge, seek uniquement au-delà du seuil (le seek
-		// HTTP est arrondi à la seconde, il rapproche toujours sous ce seuil).
-		e.nudging = false
+		// En pause : seek uniquement au-delà du seuil (le seek HTTP est arrondi
+		// à la seconde, il rapproche toujours sous ce seuil). L'historique de
+		// dérive ne mesure que la lecture : la lecture s'arrête, il repart neuf.
+		e.drifts = nil
 		if e.status.State == vlc.StatePlaying {
 			acts = append(acts, action{kind: actPause})
 		}
@@ -231,39 +235,50 @@ func (e *Engine) planLocked(now time.Time) []action {
 
 	if e.status.State == vlc.StatePaused {
 		// Départ (ou reprise) de lecture : on cale la position AVANT de lancer
-		// VLC (docs/protocol.md §Départ et reprise de lecture). Compter sur le
-		// nudge coûterait ~10 s pour un demi-seconde d'écart au démarrage.
+		// VLC (docs/protocol.md §Départ et reprise de lecture) — un écart d'une
+		// demi-seconde est sous la zone morte, rien ne le résorberait ensuite.
 		if math.Abs(drift) >= StartAlignSec {
 			acts = append(acts, action{kind: actSeek, val: expected})
 			e.correcting = "seek"
 		}
 		acts = append(acts, action{kind: actResume})
-		e.nudging = false
+		e.drifts = nil // la lecture (re)commence : l'historique repart neuf
 		rateAction(base)
 		return e.armLocked(acts, now)
 	}
+	// Lecture des deux côtés : la vitesse n'est plus jamais un outil de
+	// correction (VS-038). Zone morte de 1,5 s, micro-seek seulement si la
+	// dérive persiste (médiane des 5 derniers polls), seek immédiat à 5 s.
 	abs := math.Abs(drift)
 	switch {
 	case abs >= HardSeekSec:
 		e.correcting = "seek"
-		e.nudging = false
+		e.drifts = nil
 		acts = append(acts, action{kind: actSeek, val: expected})
-		rateAction(base)
-	case (e.nudging && abs >= NudgeExitSec) || (!e.nudging && abs > DeadZoneSec):
-		// Hystérésis : on engage au-delà de 0,1 s, on ne lâche qu'en dessous
-		// de 0,03 s — sinon le rate oscillerait autour du seuil.
-		e.nudging = true
-		e.correcting = "nudge"
-		target := base * NudgeFast // en retard : accélérer
-		if drift > 0 {
-			target = base * NudgeSlow // en avance : ralentir
-		}
-		rateAction(target)
-	default:
-		e.nudging = false
-		rateAction(base)
+	case e.driftPersistsLocked(abs):
+		e.correcting = "seek"
+		e.drifts = nil
+		acts = append(acts, action{kind: actSeek, val: expected})
 	}
+	rateAction(base)
 	return e.armLocked(acts, now)
+}
+
+// driftPersistsLocked enregistre |drift| dans l'historique glissant des 5
+// derniers polls corrigeables et dit si la dérive est assez PERSISTANTE pour
+// justifier un micro-seek : historique plein ET médiane au-delà de la zone
+// morte (docs/protocol.md §Persistance de la dérive). Le bruit de la position
+// rendue par VLC (±0,15 s) ne peut donc pas déclencher de recalage, et un pic
+// isolé non plus.
+func (e *Engine) driftPersistsLocked(abs float64) bool {
+	e.drifts = append(e.drifts, abs)
+	if len(e.drifts) > driftSamples {
+		e.drifts = e.drifts[len(e.drifts)-driftSamples:]
+	}
+	if len(e.drifts) < driftSamples {
+		return false
+	}
+	return medianFloat(e.drifts) > DeadZoneSec
 }
 
 const (
@@ -311,13 +326,16 @@ func (e *Engine) armLocked(acts []action, now time.Time) []action {
 	// ni l'état lecture/pause ni la position (l'attendu absorbe le nouveau rate
 	// juste au-dessus, donc expect.predict reste juste).
 	//
-	// Pourquoi c'est vital (VS-029, mesuré dans la VM Win11) : la position que
-	// rend VLC oscille de ±0,15 s autour de la référence, donc le nudge
-	// s'engage et se relâche à presque chaque tour (rate 1 → 1,05 → 0,95 → 1,
-	// observé à 5 Hz). En armant la grâce à chaque rate, la fenêtre de 500 ms
-	// ne se refermait JAMAIS pendant la lecture : detectUserActionLocked n'était
-	// plus appelée du tout et une pause faite dans VLC était annulée par la
-	// correction 250 ms plus tard, sans jamais partir au serveur.
+	// D'où vient la règle (VS-029, mesuré dans la VM Win11) : à l'époque du
+	// nudge ±5 %, la position rendue par VLC oscillant de ±0,15 s faisait
+	// défiler le rate à presque chaque tour (1 → 1,05 → 0,95 → 1, observé à
+	// 5 Hz). En armant la grâce à chaque rate, la fenêtre de 500 ms ne se
+	// refermait JAMAIS pendant la lecture : detectUserActionLocked n'était plus
+	// appelée du tout et une pause faite dans VLC était annulée par la
+	// correction 250 ms plus tard, sans jamais partir au serveur. Le nudge a
+	// disparu avec VS-038 (la vitesse ne corrige plus rien, le `rate` ne sert
+	// qu'à restaurer celle de la salle), mais la règle reste : un rate ne
+	// change rien de ce que la détection compare.
 	if hold {
 		e.graceUntil = now.Add(GraceWindow)
 		e.holdUntil = now.Add(GraceWindow)

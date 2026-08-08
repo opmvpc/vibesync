@@ -1484,10 +1484,14 @@ static void test_buffering_suspend(void) {
 // Le trou historique du ticket : « pause faite dans VLC, non propagée ». La
 // cause, mesurée dans la VM Win11 avec un vrai VLC, n'était pas dans la
 // détection mais dans ce qui la GATE — la fenêtre de grâce. La position que
-// rend VLC oscille de ±0,15 s autour de la référence, le nudge s'engage et se
-// relâche donc à presque chaque poll, et chaque commande `rate` réarmait 500 ms
-// de grâce : la fenêtre ne se refermait jamais et detect_user_action n'était
-// plus jamais appelée en lecture. Ce test reproduit exactement ce régime.
+// rend VLC oscille de ±0,15 s autour de la référence ; à l'époque du nudge
+// ±5 %, le rate défilait à presque chaque poll et chaque commande `rate`
+// réarmait 500 ms de grâce : la fenêtre ne se refermait jamais et
+// detect_user_action n'était plus jamais appelée en lecture.
+//
+// VS-038 a supprimé le nudge : ce même bruit de ±0,15 s doit désormais ne
+// produire AUCUNE commande (dix fois sous la zone morte de 1,5 s), et la
+// détection doit continuer de fonctionner dessous. Ce test prouve les deux.
 
 static void test_user_action_in_vlc(void) {
     section("action utilisateur dans VLC");
@@ -1496,10 +1500,10 @@ static void test_user_action_in_vlc(void) {
     VsEngine e;
     VsOutput out;
 
-    // play_with_churn : `polls` polls de 200 ms en lecture, position oscillante.
-    // Rend le nombre de commandes rate émises (le régime doit bien churner,
-    // sinon le test ne prouverait rien) et la dernière position observée.
-    isize rate_cmds = 0;
+    // 20 polls de 200 ms en lecture, position bruitée de ±0,15 s comme le vrai
+    // VLC. Aucune commande ne doit sortir : ni rate (la vitesse ne corrige plus
+    // rien), ni seek (le bruit est dix fois sous la zone morte).
+    isize rate_cmds = 0, seek_cmds = 0;
     f64 pos = 0;
     i64 t = t0;
 
@@ -1515,10 +1519,13 @@ static void test_user_action_in_vlc(void) {
         engine_on_tick(&e, t, &out);
         for (isize k = 0; k < out.cmd_count; k++) {
             if (out.cmds[k].kind == VS_CMD_RATE) rate_cmds++;
+            if (out.cmds[k].kind == VS_CMD_SEEK) seek_cmds++;
         }
     }
-    CHECK(rate_cmds >= 5, "régime de churn attendu : %lld commandes rate sur 20 polls",
+    CHECK(rate_cmds == 0, "%lld commande(s) rate sous le bruit de position (VS-038 : zéro)",
           (long long)rate_cmds);
+    CHECK(seek_cmds == 0, "%lld seek(s) sous le bruit de position (zone morte 1,5 s)",
+          (long long)seek_cmds);
 
     // L'utilisateur appuie sur Espace dans VLC : un control pause doit partir.
     b32 seen_pause = 0;
@@ -1586,6 +1593,105 @@ static void test_user_action_in_vlc(void) {
     engine_on_vlc_status(&e, t, &st, &out);
     CHECK(count_msgs(&out, VS_MSG_CONTROL) == 0,
           "le saut que le moteur vient d'ordonner est remonté comme action utilisateur");
+}
+
+// ------------------------------------ correction 1x + micro-seek (VS-038) ---
+//
+// La vitesse n'est PLUS JAMAIS modifiée pour corriger la dérive. Zone morte de
+// 1,5 s ; au-delà, micro-seek seulement si la dérive dépasse le seuil en
+// MÉDIANE sur les 5 derniers polls ; seek immédiat à partir de 5 s. Miroir C
+// des tests Go de internal/client/engine_test.go.
+
+// play_drift joue `polls` polls de 200 ms en lecture avec un décalage constant
+// `offset` par rapport à la position attendue, et compte les commandes émises.
+static void play_drift(VsEngine *e, i64 *t, int polls, f64 offset, isize *seeks, isize *rates) {
+    const i64 MS = 1000000LL;
+    VsOutput out;
+    for (int i = 0; i < polls; i++) {
+        *t += 200 * MS;
+        VsStatus st = mk_status(VS_PLAY_PLAYING, engine_expected_position(e, *t) + offset, 7200);
+        vs_output_reset(&out);
+        engine_on_vlc_status(e, *t, &st, &out);
+        engine_on_tick(e, *t, &out);
+        for (isize k = 0; k < out.cmd_count; k++) {
+            if (out.cmds[k].kind == VS_CMD_SEEK && seeks) (*seeks)++;
+            if (out.cmds[k].kind == VS_CMD_RATE && rates) (*rates)++;
+        }
+    }
+}
+
+static void test_micro_seek(void) {
+    section("correction 1x + micro-seek");
+    const i64 MS = 1000000LL;
+    i64 t0 = 1785960000000LL * MS;
+    VsEngine e;
+    VsOutput out;
+    isize seeks, rates;
+
+    // 1,2 s de dérive : sous la zone morte, rien ne bouge, même prolongé.
+    engine_init(&e);
+    vs_output_reset(&out);
+    i64 t = t0;
+    join_room(&e, t, "salon", 100, &out);
+    seeks = rates = 0;
+    play_drift(&e, &t, 15, 1.2, &seeks, &rates);
+    CHECK(seeks == 0, "%lld seek(s) pour 1,2 s de dérive (zone morte 1,5 s)", (long long)seeks);
+    CHECK(rates == 0, "%lld commande(s) rate dans la zone morte", (long long)rates);
+    CHECK(e.drift_count == VS_DRIFT_SAMPLES, "historique de dérive = %lld échantillon(s), attendu %d",
+          (long long)e.drift_count, (int)VS_DRIFT_SAMPLES);
+
+    // 2,5 s de dérive : au-dessus de la zone morte, sous le seuil du seek
+    // immédiat. Rien tant que l'historique n'est pas plein, puis UN micro-seek.
+    engine_init(&e);
+    vs_output_reset(&out);
+    t = t0 + 60000 * MS;
+    join_room(&e, t, "salon", 100, &out);
+    seeks = rates = 0;
+    play_drift(&e, &t, 4, 2.5, &seeks, &rates);
+    CHECK(seeks == 0, "%lld seek(s) avant les 5 polls de persistance", (long long)seeks);
+    play_drift(&e, &t, 1, 2.5, &seeks, &rates);
+    CHECK(seeks == 1, "%lld seek(s) au 5e poll, attendu 1 micro-seek", (long long)seeks);
+    CHECK(rates == 0, "%lld commande(s) rate : la vitesse ne corrige plus rien", (long long)rates);
+    CHECK(e.drift_count == 0, "historique non vidé après le micro-seek (%lld)", (long long)e.drift_count);
+
+    // Un pic isolé de dérive ne déclenche rien : la médiane l'absorbe.
+    engine_init(&e);
+    vs_output_reset(&out);
+    t = t0 + 120000 * MS;
+    join_room(&e, t, "salon", 100, &out);
+    seeks = rates = 0;
+    play_drift(&e, &t, 4, 0.15, &seeks, &rates);
+    play_drift(&e, &t, 1, 4.0, &seeks, &rates);  // pic sous les 5 s
+    play_drift(&e, &t, 4, 0.15, &seeks, &rates);
+    CHECK(seeks == 0, "%lld seek(s) sur un pic isolé : la médiane doit l'absorber", (long long)seeks);
+
+    // 8 s de dérive : seek immédiat, sans attendre la médiane.
+    engine_init(&e);
+    vs_output_reset(&out);
+    t = t0 + 180000 * MS;
+    join_room(&e, t, "salon", 100, &out);
+    seeks = rates = 0;
+    play_drift(&e, &t, 1, 8.0, &seeks, &rates);
+    CHECK(seeks == 1, "%lld seek(s) au premier poll pour 8 s de dérive (seuil %g s)", (long long)seeks,
+          (double)VS_HARD_SEEK_SEC);
+
+    // Restauration de la vitesse de référence : seul usage restant du `rate`.
+    engine_init(&e);
+    vs_output_reset(&out);
+    t = t0 + 240000 * MS;
+    join_room(&e, t, "salon", 100, &out);
+    t += 200 * MS;
+    VsStatus st = mk_status(VS_PLAY_PLAYING, engine_expected_position(&e, t), 7200);
+    st.rate = 1.5;  // l'utilisateur est passé en 1,5x dans VLC
+    vs_output_reset(&out);
+    engine_on_vlc_status(&e, t, &st, &out);
+    engine_on_tick(&e, t, &out);
+    isize restored = 0;
+    for (isize k = 0; k < out.cmd_count; k++) {
+        if (out.cmds[k].kind == VS_CMD_RATE && approx(out.cmds[k].value, 1.0, 1e-6)) restored++;
+    }
+    CHECK(restored == 1, "vitesse de référence non restaurée (%lld commande(s) rate à 1x)",
+          (long long)restored);
 }
 
 // ------------------------------------------------------------ moteur : unités ---
@@ -2373,6 +2479,7 @@ void test_core_run(Arena *a) {
     test_offline_queue();
     test_virgin_resume();
     test_buffering_suspend();
+    test_micro_seek();
     test_user_action_in_vlc();
     test_media_core(a);
 }

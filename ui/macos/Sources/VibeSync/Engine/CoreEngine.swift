@@ -74,7 +74,6 @@ public final class CoreEngine {
 
     public enum Correction {
         case none
-        case nudge
         case seek
     }
 
@@ -179,10 +178,6 @@ public final class CoreEngine {
         return engine.buffering != 0
     }
 
-    public var nudging: Bool {
-        return engine.nudging != 0
-    }
-
     public var drift: Double {
         return engine.drift
     }
@@ -190,9 +185,6 @@ public final class CoreEngine {
     public var correcting: Correction {
         if engine.correcting == VS_CORRECT_SEEK {
             return .seek
-        }
-        if engine.correcting == VS_CORRECT_NUDGE {
-            return .nudge
         }
         return .none
     }

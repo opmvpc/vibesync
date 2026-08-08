@@ -37,13 +37,19 @@ const (
 	// waitTimeout borne chaque attente conditionnelle.
 	waitTimeout = 12 * time.Second
 	// convergeTimeout est plus large : après un seek, deux clients peuvent
-	// arrondir vers deux secondes entières différentes et ne se rejoindre
-	// qu'au rythme du nudge (5 %/s).
+	// arrondir vers deux secondes entières différentes, et il faut ensuite
+	// 1 s de dérive avérée avant qu'un micro-seek ne parte.
 	convergeTimeout = 25 * time.Second
 	// pollEvery est le pas de scrutation des conditions.
 	pollEvery = 10 * time.Millisecond
-	// driftMax est l'écart maximal toléré entre deux lecteurs synchronisés.
+	// driftMax est l'écart toléré là où le moteur corrige finement : en pause
+	// (le seek de recalage part dès 0,6 s) et sur les tolérances de position.
 	driftMax = 0.5
+	// playDriftMax est l'écart toléré EN LECTURE. Depuis VS-038, plus rien ne
+	// rapproche deux lecteurs tant qu'ils sont dans la zone morte : la borne
+	// honnête est celle de la zone morte, pas une convergence fine que le
+	// moteur ne cherche plus (docs/protocol.md §Correction).
+	playDriftMax = client.DeadZoneSec
 	// filmDuration est la durée du média de référence.
 	filmDuration = 3600.0
 )
@@ -566,15 +572,16 @@ func TestE2E(t *testing.T) {
 		f.waitFor("la lecture progresse réellement des deux côtés", func() bool {
 			return a.pos() > 1 && b.pos() > 1
 		})
-		f.waitFor("drift < 0,5 s", func() bool { return pairDrift(a, b) < driftMax })
+		f.waitFor("drift dans la zone morte", func() bool { return pairDrift(a, b) < playDriftMax })
 		// Chaque moteur doit se savoir dans la zone morte par rapport à la
 		// position de référence de la salle (et pas simplement « les deux
 		// lecteurs avancent en parallèle »).
 		f.waitFor("chaque moteur est aligné sur la salle", func() bool {
-			return math.Abs(a.snap().DriftSec) < 0.2 && math.Abs(b.snap().DriftSec) < 0.2
+			return math.Abs(a.snap().DriftSec) < playDriftMax &&
+				math.Abs(b.snap().DriftSec) < playDriftMax
 		})
 		f.holds(2*time.Second, "la synchronisation tient dans la durée", func() bool {
-			return pairDrift(a, b) < driftMax &&
+			return pairDrift(a, b) < playDriftMax &&
 				a.vlcState() == "playing" && b.vlcState() == "playing"
 		})
 	})
@@ -601,8 +608,8 @@ func TestE2E(t *testing.T) {
 		b.eng.Play()
 		f.waitFor("le VLC de A repart", func() bool { return a.vlcState() == "playing" })
 		f.waitFor("le VLC de B joue aussi", func() bool { return b.vlcState() == "playing" })
-		f.waitUpTo(convergeTimeout, "drift < 0,5 s après la reprise", func() bool {
-			return pairDrift(a, b) < driftMax
+		f.waitUpTo(convergeTimeout, "drift dans la zone morte après la reprise", func() bool {
+			return pairDrift(a, b) < playDriftMax
 		})
 	})
 
@@ -624,11 +631,12 @@ func TestE2E(t *testing.T) {
 		f.waitFor("A a sauté d'environ +300 s", func() bool {
 			return a.pos() > beforeA+250
 		})
-		f.waitUpTo(convergeTimeout, "affinage : drift A/B < 0,5 s", func() bool {
-			return pairDrift(a, b) < driftMax
+		f.waitUpTo(convergeTimeout, "drift A/B dans la zone morte", func() bool {
+			return pairDrift(a, b) < playDriftMax
 		})
 		f.waitUpTo(convergeTimeout, "chacun est aligné sur la salle", func() bool {
-			return math.Abs(a.snap().DriftSec) < driftMax && math.Abs(b.snap().DriftSec) < driftMax
+			return math.Abs(a.snap().DriftSec) < playDriftMax &&
+				math.Abs(b.snap().DriftSec) < playDriftMax
 		})
 		if a.vlcState() != "playing" || b.vlcState() != "playing" {
 			t.Fatalf("la lecture ne s'est pas poursuivie après le seek\n%s", f.dump())
@@ -654,7 +662,7 @@ func TestE2E(t *testing.T) {
 		f.waitFor("la lecture démarre une fois tout le monde prêt", func() bool {
 			return a.vlcState() == "playing" && b.vlcState() == "playing"
 		})
-		f.waitFor("drift < 0,5 s", func() bool { return pairDrift(a, b) < driftMax })
+		f.waitFor("drift dans la zone morte", func() bool { return pairDrift(a, b) < playDriftMax })
 	})
 
 	t.Run("05-buffering-pause-auto", func(t *testing.T) {
@@ -715,9 +723,9 @@ func TestE2E(t *testing.T) {
 
 	// Le faux VLC démarre en lecture à l'ouverture, comme le vrai : les deux
 	// médias ne s'ouvrent jamais exactement au même instant, et un écart de
-	// départ de l'ordre de la demi-seconde est la norme. Il doit être résorbé
-	// par le calage au départ (seek), pas par le nudge — qui mettrait ~11 s
-	// pour 0,55 s à 5 %/s (docs/protocol.md §Départ et reprise de lecture).
+	// départ de l'ordre de la demi-seconde est la norme. Seul le calage au
+	// départ (seek) le résorbe : depuis VS-038 rien ne corrige un écart aussi
+	// petit, il est sous la zone morte (docs/protocol.md §Départ et reprise).
 	t.Run("08-depart-avec-autoplay", func(t *testing.T) {
 		f := newFixture(t)
 		a, b := joinBoth(f, filmDuration, filmDuration)
@@ -740,8 +748,8 @@ func TestE2E(t *testing.T) {
 		start := time.Now()
 		startPlayback(f, a, a, b)
 		// Discriminant : chaque moteur doit être calé sur la salle presque tout
-		// de suite. Sans le seek de calage, bob resterait à ~0,55 s et mettrait
-		// plus de 5 s à repasser sous 0,3 s au rythme du nudge.
+		// de suite. Sans le seek de calage, bob resterait indéfiniment à
+		// ~0,55 s — c'est sous la zone morte, plus rien ne l'en sortirait.
 		f.waitUpTo(1500*time.Millisecond, "chaque moteur est calé sur la salle dès le départ",
 			func() bool {
 				return math.Abs(a.snap().DriftSec) < client.StartAlignSec &&
@@ -749,10 +757,11 @@ func TestE2E(t *testing.T) {
 			})
 		f.waitUpTo(2*time.Second, "les deux lecteurs sont synchronisés",
 			func() bool { return pairDrift(a, b) < driftMax })
-		t.Logf("synchronisation atteinte en %s (le nudge seul aurait mis ~11 s pour 0,55 s)",
+		t.Logf("synchronisation atteinte en %s (sans le calage de départ, l'écart de 0,55 s "+
+			"resterait tel quel : il est sous la zone morte)",
 			time.Since(start).Round(time.Millisecond))
 		f.holds(2*time.Second, "la synchronisation tient après le départ décalé", func() bool {
-			return pairDrift(a, b) < driftMax && a.vlcState() == "playing" && b.vlcState() == "playing"
+			return pairDrift(a, b) < playDriftMax && a.vlcState() == "playing" && b.vlcState() == "playing"
 		})
 	})
 
@@ -802,7 +811,8 @@ func TestE2E(t *testing.T) {
 		// Deuxième temps : hors de toute fenêtre de seek, un vrai blocage doit
 		// toujours figer la salle — la suspension est bornée, pas définitive.
 		f.waitUpTo(convergeTimeout, "les deux lecteurs se sont recalés après la rafale", func() bool {
-			return math.Abs(a.snap().DriftSec) < 0.3 && math.Abs(b.snap().DriftSec) < 0.3
+			return math.Abs(a.snap().DriftSec) < playDriftMax &&
+				math.Abs(b.snap().DriftSec) < playDriftMax
 		})
 		f.holds(1500*time.Millisecond, "plus aucune correction en cours", func() bool {
 			return a.vlcState() == "playing" && b.vlcState() == "playing"

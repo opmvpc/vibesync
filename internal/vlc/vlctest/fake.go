@@ -28,6 +28,7 @@ type Fake struct {
 	password string
 	stalled  bool
 	seeks    int
+	rates    int
 	requests int
 	fail     int
 
@@ -154,6 +155,18 @@ func (f *Fake) SeekTo(sec float64) {
 	f.pos = clamp(sec, 0, f.length)
 }
 
+// SetRate change la vitesse de lecture COMME L'UTILISATEUR le ferait dans
+// l'interface de VLC (le compteur Rates, lui, ne compte que les commandes
+// reçues par l'interface HTTP, donc celles du moteur).
+func (f *Fake) SetRate(v float64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.advanceLocked()
+	if v > 0 {
+		f.rate = v
+	}
+}
+
 // SetStalled simule un buffering : la position n'avance plus.
 func (f *Fake) SetStalled(v bool) {
 	f.mu.Lock()
@@ -189,6 +202,15 @@ func (f *Fake) Seeks() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.seeks
+}
+
+// Rates compte les commandes `rate` reçues par l'interface HTTP. Depuis
+// VS-038, la vitesse ne sert plus jamais à corriger la dérive : ce compteur
+// est ce qui permet de le PROUVER (une lecture stable doit en produire zéro).
+func (f *Fake) Rates() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.rates
 }
 
 // Requests compte les requêtes servies.
@@ -265,6 +287,7 @@ func (f *Fake) handleStatus(w http.ResponseWriter, r *http.Request) {
 	case "rate":
 		if v, err := strconv.ParseFloat(q.Get("val"), 64); err == nil && v > 0 {
 			f.rate = v
+			f.rates++
 		}
 	}
 	// VLC expose `length` en secondes entières : la fraction `position` est

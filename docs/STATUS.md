@@ -1,7 +1,7 @@
 # STATUS — vibesync
 
-*Dernière mise à jour : 2026-08-08 — **reliquats apurés** (VS-035, ini, drapeaux
-Go+Swift, captures mac, icône .app)*
+*Dernière mise à jour : 2026-08-08 (soir) — **VS-038 : 1× constant + micro-seek**
+(le nudge ±5 % est supprimé des 3 implémentations)*
 
 ## Où on en est
 
@@ -65,6 +65,7 @@ chemins Gatekeeper dont Sequoia). Publiée au prochain tag (v0.2.1).
 | VS-020 | Overlay OSD Windows (ADR-009) | en attente du PC Windows (demande de Thibault) |
 | VS-030..034, 036 | Couche C commune (ADR-010, 5 phases) + fix semver | **terminés, CI verte 3 jobs** |
 | VS-035 | UB str_to_i64 (préexistant) | ouvert, priorité basse |
+| VS-038 | Resync 1× constant + micro-seek (retour terrain nudge) | **terminé** — zone morte 1,5 s, médiane de persistance, seek immédiat 5 s ; 0 commande rate dans les 2 séances réelles |
 
 ## Prochaine action
 
@@ -80,13 +81,20 @@ anti-Syncplay), captures mac du guide faites sur une vraie séance prod, icône
 .icns de VibeSync.app livrée puis regénérée par genicon -iconset (357 Ko,
 bundle 1,4 Mio).
 
+**VS-038 livré le soir du 08** (retour terrain de Thibault sur le nudge) : la
+vitesse ne corrige plus jamais la dérive — zone morte 1,5 s, micro-seek
+conditionné à la médiane des 5 derniers polls, seek immédiat à 5 s. Les trois
+implémentations sont alignées, 14/14 vecteurs des deux côtés, et les deux
+séances réelles (mac PASS 11/11, VM 2 clients C PASS 14/14) affichent
+**0 commande rate**. À faire : tag d'une version portant ce changement.
+
 Il ne reste QUE ce qui exige un vrai PC Windows x86_64 : VS-020 (overlay OSD),
 revérification one-instance, asan du C Win32. Idée notée : un gel commun des
 3 listes de drapeaux (les gels actuels sont indépendants).
 
 ## Repères
 
-- Spec : `docs/protocol.md` (source de vérité) ; vecteurs : `test/vectors/` (13)
+- Spec : `docs/protocol.md` (source de vérité) ; vecteurs : `test/vectors/` (14)
 - Test réel mac : `VIBESYNC_PASSWORD=... ./scripts/run-real-macos.sh "" wss://vibesync.choboai.com/ws`
 - Sonde prod : `go run ./tools/probe wss://vibesync.choboai.com/ws [mdp]` (Go absent du Mac — passer par la CI ou la VM)
 - Rapports d'agents : `docs/research/` (analyse couche C commune : 2026-08-06)

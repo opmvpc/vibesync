@@ -181,8 +181,10 @@ type Engine struct {
 	// pendingRS mémorise le dernier roomState d'autrui reçu pendant le hold ;
 	// il ne s'applique qu'à l'expiration du hold, faute d'écho.
 	pendingRS *protocol.RoomState
-	// nudging porte l'hystérésis du rate-nudge (engage > 0,1 s, désengage < 0,03 s).
-	nudging bool
+	// drifts est l'historique des |drift| des 5 derniers polls corrigeables en
+	// lecture : le micro-seek exige que sa médiane dépasse la zone morte
+	// (docs/protocol.md §Persistance de la dérive).
+	drifts []float64
 	// lecteur
 	playerGen  uint64
 	player     vlc.Controller
@@ -466,7 +468,7 @@ func (e *Engine) invalidateReferenceLocked() {
 	e.pendingRS = nil
 	e.userHoldUntil = time.Time{}
 	e.holdUntil = time.Time{}
-	e.nudging = false
+	e.drifts = nil
 	e.correcting = ""
 	e.drift = 0
 	e.outbox = nil
@@ -746,6 +748,17 @@ func median(v []int64) int64 {
 	cp := make([]int64, len(v))
 	copy(cp, v)
 	sort.Slice(cp, func(i, j int) bool { return cp[i] < cp[j] })
+	return cp[len(cp)/2]
+}
+
+// medianFloat est la même médiane, pour l'historique de dérive.
+func medianFloat(v []float64) float64 {
+	if len(v) == 0 {
+		return 0
+	}
+	cp := make([]float64, len(v))
+	copy(cp, v)
+	sort.Float64s(cp)
 	return cp[len(cp)/2]
 }
 

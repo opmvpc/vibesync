@@ -1,8 +1,8 @@
 {
   "_doc": "Vecteur de conformité du moteur de sync vibesync (golden file, régénéré par `go test ./internal/client -run TestVectors -update`). Horloge simulée : tous les temps sont en millisecondes depuis le début du scénario. `initialVLC` = état complet de VLC au départ ; `events` = entrées injectées (messages serveur, actions de l'utilisateur dans VLC, coupure de session) ; `trace` = une entrée par poll de 200 ms avec l'état observé de VLC, la position attendue calculée, le drift, les commandes envoyées à VLC et les messages envoyés au serveur. Une réimplémentation est conforme si, pour le même `initialVLC` et les mêmes `events`, elle produit les mêmes `vlcCommands` et `toServer` aux mêmes instants.",
-  "name": "14-action-utilisateur-sous-churn",
-  "description": "Régime de churn du nudge (position VLC bruitée de ±0,15 s) : pause puis reprise puis seek faits DANS VLC sont bien détectés et remontés en control — la grâce n'est pas réarmée par les rate.",
-  "scenario": "Préconditions du moteur au premier événement : session serveur déjà établie, aucun état de salle connu, aucune mesure d'offset d'horloge. Fichier ep1.mkv ouvert, durée 7200 s, taille 15 octets, position 1000 s, lecture en cours, rate 1. Les événements `userSeek` de ±0,15 s ne sont PAS des actions utilisateur (bien sous le seuil de 3 s) : ils reproduisent le bruit de la position rendue par VLC, qui fait churner le nudge. Déroulé : (1) welcome + pong d'une salle en lecture à 1000 s, puis 10 polls de churn ; (2) l'utilisateur met VLC en pause lui-même — le control pause doit partir malgré le churn ; (3) le serveur renvoie la pause en écho (setBy = u1) et le hold tombe ; (4) l'utilisateur relance la lecture dans VLC — control play, écho du serveur ; (5) 8 polls de churn, puis l'utilisateur saute de 300 s dans la barre de VLC — control seek.",
+  "name": "14-action-utilisateur-sous-bruit",
+  "description": "Lecture bruitée (position VLC oscillant de ±0,15 s) : aucune commande n'est envoyée à VLC, et pause puis reprise puis seek faits DANS VLC sont bien détectés et remontés en control.",
+  "scenario": "Préconditions du moteur au premier événement : session serveur déjà établie, aucun état de salle connu, aucune mesure d'offset d'horloge. Fichier ep1.mkv ouvert, durée 7200 s, taille 15 octets, position 1000 s, lecture en cours, rate 1. Les événements `userSeek` de ±0,15 s ne sont PAS des actions utilisateur (bien sous le seuil de 3 s) : ils reproduisent le bruit de la position rendue par VLC — dix fois sous la zone morte de 1,5 s, donc aucune correction. Déroulé : (1) welcome + pong d'une salle en lecture à 1000 s, puis 10 polls bruités ; (2) l'utilisateur met VLC en pause lui-même — le control pause doit partir ; (3) le serveur renvoie la pause en écho (setBy = u1) et le hold tombe ; (4) l'utilisateur relance la lecture dans VLC — control play, écho du serveur ; (5) 8 polls bruités, puis l'utilisateur saute de 300 s dans la barre de VLC — control seek.",
   "pollIntervalMs": 200,
   "initialVLC": {
     "fileName": "ep1.mkv",
@@ -55,63 +55,63 @@
       "atMs": 200,
       "type": "userSeek",
       "data": {
-        "positionSec": 1000.06
+        "positionSec": 1000.05
       }
     },
     {
       "atMs": 400,
       "type": "userSeek",
       "data": {
-        "positionSec": 1000.54
+        "positionSec": 1000.55
       }
     },
     {
       "atMs": 600,
       "type": "userSeek",
       "data": {
-        "positionSec": 1000.46
+        "positionSec": 1000.45
       }
     },
     {
       "atMs": 800,
       "type": "userSeek",
       "data": {
-        "positionSec": 1000.94
+        "positionSec": 1000.95
       }
     },
     {
       "atMs": 1000,
       "type": "userSeek",
       "data": {
-        "positionSec": 1000.86
+        "positionSec": 1000.85
       }
     },
     {
       "atMs": 1200,
       "type": "userSeek",
       "data": {
-        "positionSec": 1001.34
+        "positionSec": 1001.35
       }
     },
     {
       "atMs": 1400,
       "type": "userSeek",
       "data": {
-        "positionSec": 1001.26
+        "positionSec": 1001.25
       }
     },
     {
       "atMs": 1600,
       "type": "userSeek",
       "data": {
-        "positionSec": 1001.74
+        "positionSec": 1001.75
       }
     },
     {
       "atMs": 1800,
       "type": "userSeek",
       "data": {
-        "positionSec": 1001.66
+        "positionSec": 1001.65
       }
     },
     {
@@ -155,49 +155,49 @@
       "atMs": 4000,
       "type": "userSeek",
       "data": {
-        "positionSec": 1002.11
+        "positionSec": 1002.1
       }
     },
     {
       "atMs": 4200,
       "type": "userSeek",
       "data": {
-        "positionSec": 1002.59
+        "positionSec": 1002.6
       }
     },
     {
       "atMs": 4400,
       "type": "userSeek",
       "data": {
-        "positionSec": 1002.51
+        "positionSec": 1002.5
       }
     },
     {
       "atMs": 4600,
       "type": "userSeek",
       "data": {
-        "positionSec": 1002.99
+        "positionSec": 1003
       }
     },
     {
       "atMs": 4800,
       "type": "userSeek",
       "data": {
-        "positionSec": 1002.91
+        "positionSec": 1002.9
       }
     },
     {
       "atMs": 5000,
       "type": "userSeek",
       "data": {
-        "positionSec": 1003.39
+        "positionSec": 1003.4
       }
     },
     {
       "atMs": 5200,
       "type": "userSeek",
       "data": {
-        "positionSec": 1003.31
+        "positionSec": 1003.3
       }
     },
     {
@@ -215,12 +215,6 @@
       "vlcPositionSec": 1000.35,
       "expectedPositionSec": 1000.2,
       "driftSec": 0.15,
-      "vlcCommands": [
-        {
-          "cmd": "rate",
-          "value": 0.95
-        }
-      ],
       "toServer": [
         {
           "type": "setFile",
@@ -245,52 +239,28 @@
       "vlcState": "playing",
       "vlcPositionSec": 1000.25,
       "expectedPositionSec": 1000.4,
-      "driftSec": -0.15,
-      "vlcCommands": [
-        {
-          "cmd": "rate",
-          "value": 1.05
-        }
-      ]
+      "driftSec": -0.15
     },
     {
       "atMs": 600,
       "vlcState": "playing",
       "vlcPositionSec": 1000.75,
       "expectedPositionSec": 1000.6,
-      "driftSec": 0.15,
-      "vlcCommands": [
-        {
-          "cmd": "rate",
-          "value": 0.95
-        }
-      ]
+      "driftSec": 0.15
     },
     {
       "atMs": 800,
       "vlcState": "playing",
       "vlcPositionSec": 1000.65,
       "expectedPositionSec": 1000.8,
-      "driftSec": -0.15,
-      "vlcCommands": [
-        {
-          "cmd": "rate",
-          "value": 1.05
-        }
-      ]
+      "driftSec": -0.15
     },
     {
       "atMs": 1000,
       "vlcState": "playing",
       "vlcPositionSec": 1001.15,
       "expectedPositionSec": 1001,
-      "driftSec": 0.15,
-      "vlcCommands": [
-        {
-          "cmd": "rate",
-          "value": 0.95
-        }
-      ]
+      "driftSec": 0.15
     },
     {
       "atMs": 1200,
@@ -298,12 +268,6 @@
       "vlcPositionSec": 1001.05,
       "expectedPositionSec": 1001.2,
       "driftSec": -0.15,
-      "vlcCommands": [
-        {
-          "cmd": "rate",
-          "value": 1.05
-        }
-      ],
       "toServer": [
         {
           "type": "report",
@@ -320,39 +284,21 @@
       "vlcState": "playing",
       "vlcPositionSec": 1001.55,
       "expectedPositionSec": 1001.4,
-      "driftSec": 0.15,
-      "vlcCommands": [
-        {
-          "cmd": "rate",
-          "value": 0.95
-        }
-      ]
+      "driftSec": 0.15
     },
     {
       "atMs": 1600,
       "vlcState": "playing",
       "vlcPositionSec": 1001.45,
       "expectedPositionSec": 1001.6,
-      "driftSec": -0.15,
-      "vlcCommands": [
-        {
-          "cmd": "rate",
-          "value": 1.05
-        }
-      ]
+      "driftSec": -0.15
     },
     {
       "atMs": 1800,
       "vlcState": "playing",
       "vlcPositionSec": 1001.95,
       "expectedPositionSec": 1001.8,
-      "driftSec": 0.15,
-      "vlcCommands": [
-        {
-          "cmd": "rate",
-          "value": 0.95
-        }
-      ]
+      "driftSec": 0.15
     },
     {
       "atMs": 2000,
@@ -360,12 +306,6 @@
       "vlcPositionSec": 1001.85,
       "expectedPositionSec": 1002,
       "driftSec": -0.15,
-      "vlcCommands": [
-        {
-          "cmd": "rate",
-          "value": 1.05
-        }
-      ],
       "toServer": [
         {
           "type": "ping",
@@ -418,13 +358,7 @@
       "vlcState": "paused",
       "vlcPositionSec": 1001.85,
       "expectedPositionSec": 1001.85,
-      "driftSec": 0,
-      "vlcCommands": [
-        {
-          "cmd": "rate",
-          "value": 1
-        }
-      ]
+      "driftSec": 0
     },
     {
       "atMs": 3000,
@@ -486,12 +420,6 @@
       "vlcPositionSec": 1002.4,
       "expectedPositionSec": 1002.25,
       "driftSec": 0.15,
-      "vlcCommands": [
-        {
-          "cmd": "rate",
-          "value": 0.95
-        }
-      ],
       "toServer": [
         {
           "type": "ping",
@@ -507,12 +435,6 @@
       "vlcPositionSec": 1002.3,
       "expectedPositionSec": 1002.45,
       "driftSec": -0.15,
-      "vlcCommands": [
-        {
-          "cmd": "rate",
-          "value": 1.05
-        }
-      ],
       "toServer": [
         {
           "type": "report",
@@ -529,52 +451,28 @@
       "vlcState": "playing",
       "vlcPositionSec": 1002.8,
       "expectedPositionSec": 1002.65,
-      "driftSec": 0.15,
-      "vlcCommands": [
-        {
-          "cmd": "rate",
-          "value": 0.95
-        }
-      ]
+      "driftSec": 0.15
     },
     {
       "atMs": 4600,
       "vlcState": "playing",
       "vlcPositionSec": 1002.7,
       "expectedPositionSec": 1002.85,
-      "driftSec": -0.15,
-      "vlcCommands": [
-        {
-          "cmd": "rate",
-          "value": 1.05
-        }
-      ]
+      "driftSec": -0.15
     },
     {
       "atMs": 4800,
       "vlcState": "playing",
       "vlcPositionSec": 1003.2,
       "expectedPositionSec": 1003.05,
-      "driftSec": 0.15,
-      "vlcCommands": [
-        {
-          "cmd": "rate",
-          "value": 0.95
-        }
-      ]
+      "driftSec": 0.15
     },
     {
       "atMs": 5000,
       "vlcState": "playing",
       "vlcPositionSec": 1003.1,
       "expectedPositionSec": 1003.25,
-      "driftSec": -0.15,
-      "vlcCommands": [
-        {
-          "cmd": "rate",
-          "value": 1.05
-        }
-      ]
+      "driftSec": -0.15
     },
     {
       "atMs": 5200,
@@ -582,12 +480,6 @@
       "vlcPositionSec": 1003.6,
       "expectedPositionSec": 1003.45,
       "driftSec": 0.15,
-      "vlcCommands": [
-        {
-          "cmd": "rate",
-          "value": 0.95
-        }
-      ],
       "toServer": [
         {
           "type": "report",
@@ -604,26 +496,20 @@
       "vlcState": "playing",
       "vlcPositionSec": 1003.5,
       "expectedPositionSec": 1003.65,
-      "driftSec": -0.15,
-      "vlcCommands": [
-        {
-          "cmd": "rate",
-          "value": 1.05
-        }
-      ]
+      "driftSec": -0.15
     },
     {
       "atMs": 5600,
       "vlcState": "playing",
-      "vlcPositionSec": 1303.71,
+      "vlcPositionSec": 1303.7,
       "expectedPositionSec": 1003.85,
-      "driftSec": 299.86,
+      "driftSec": 299.85,
       "toServer": [
         {
           "type": "control",
           "data": {
             "action": "seek",
-            "positionSec": 1303.71
+            "positionSec": 1303.7
           }
         }
       ]
@@ -631,16 +517,16 @@
     {
       "atMs": 5800,
       "vlcState": "playing",
-      "vlcPositionSec": 1303.92,
+      "vlcPositionSec": 1303.9,
       "expectedPositionSec": 1004.05,
-      "driftSec": 299.87
+      "driftSec": 299.85
     },
     {
       "atMs": 6000,
       "vlcState": "playing",
-      "vlcPositionSec": 1304.13,
+      "vlcPositionSec": 1304.1,
       "expectedPositionSec": 1004.25,
-      "driftSec": 299.88,
+      "driftSec": 299.85,
       "toServer": [
         {
           "type": "ping",

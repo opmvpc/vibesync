@@ -284,80 +284,84 @@ func TestDeadZoneAucuneCorrection(t *testing.T) {
 	}
 }
 
-func TestNudgePuisRetourARate1(t *testing.T) {
+// TestMicroSeekApresPersistance : au-delà de la zone morte (1,5 s), le moteur
+// recale par un MICRO-SEEK, jamais par la vitesse (VS-038) — et seulement une
+// fois la dérive avérée sur les 5 derniers polls.
+func TestMicroSeekApresPersistance(t *testing.T) {
 	h := newHarness(t)
 	h.openFile("ep1.mkv", 1200)
 	h.connect(h.playing(100))
-	// VLC est 0,6 s en avance : nudge à 0,95×.
-	h.fake.SeekTo(100.6)
+	// VLC est 2,5 s en avance : au-dessus de la zone morte, sous le seuil du
+	// seek immédiat (5 s). Rien ne doit partir avant l'historique plein.
+	h.fake.SeekTo(102.5)
 	h.fake.Play()
 	h.ticks(4)
-
-	if got := h.fake.Rate(); math.Abs(got-NudgeSlow) > 1e-6 {
-		t.Fatalf("rate = %v, attendu %v (en avance → ralentir)", got, NudgeSlow)
-	}
 	if h.fake.Seeks() != 0 {
-		t.Fatalf("un seek dur a été émis pour un drift < 2 s")
+		t.Fatalf("%d seek(s) avant la persistance (5 polls) : la médiane n'est pas attendue", h.fake.Seeks())
 	}
 
-	// Convergence : à 0,95× on rattrape 0,05 s par seconde. L'hystérésis
-	// maintient le nudge tant que |drift| ≥ 0,03 s.
-	converged := false
-	for range 400 {
-		h.tick(PollInterval)
-		d := math.Abs(h.e.Snapshot().DriftSec)
-		if d <= DeadZoneSec && d > NudgeExitSec && math.Abs(h.fake.Rate()-NudgeSlow) > 1e-6 {
-			t.Fatalf("nudge relâché trop tôt (drift %v, rate %v)", d, h.fake.Rate())
-		}
-		if d < NudgeExitSec {
-			converged = true
-			break
-		}
+	h.ticks(6)
+	if h.fake.Seeks() != 1 {
+		t.Fatalf("%d seek(s), attendu exactement 1 micro-seek de recalage", h.fake.Seeks())
 	}
-	if !converged {
-		t.Fatalf("pas de convergence, drift = %v", h.e.Snapshot().DriftSec)
+	if d := math.Abs(h.e.Snapshot().DriftSec); d > DeadZoneSec {
+		t.Fatalf("drift résiduel %v après le micro-seek", d)
 	}
-	h.ticks(3)
+	if n := h.fake.Rates(); n != 0 {
+		t.Fatalf("%d commande(s) rate : la vitesse ne corrige plus jamais la dérive", n)
+	}
 	if got := h.fake.Rate(); math.Abs(got-1) > 1e-6 {
-		t.Fatalf("rate = %v, attendu un retour à 1 après convergence", got)
-	}
-	if h.fake.Seeks() != 0 {
-		t.Fatalf("aucun seek dur ne devait être nécessaire")
+		t.Fatalf("rate = %v, attendu 1× constant", got)
 	}
 }
 
-func TestHysteresisDuNudge(t *testing.T) {
+// TestZoneMorteLargeAucuneCorrection : sous 1,5 s, on ne touche à rien — ni
+// vitesse, ni position. C'est le confort visé par VS-038.
+func TestZoneMorteLargeAucuneCorrection(t *testing.T) {
 	h := newHarness(t)
 	h.openFile("ep1.mkv", 1200)
 	h.connect(h.playing(100))
-	// Drift de 0,05 s : entre les deux seuils, le nudge ne doit PAS s'engager.
-	h.fake.SeekTo(100.05)
+	// Drift de 1,2 s : sous la zone morte, aucune correction même prolongée.
+	h.fake.SeekTo(101.2)
 	h.fake.Play()
-	h.ticks(4)
-	if got := h.fake.Rate(); math.Abs(got-1) > 1e-6 {
-		t.Fatalf("rate = %v : le nudge ne s'engage qu'au-delà de %v s", got, DeadZoneSec)
+	h.ticks(15)
+	if h.fake.Seeks() != 0 {
+		t.Fatalf("%d seek(s) pour un drift de 1,2 s (zone morte %v s)", h.fake.Seeks(), DeadZoneSec)
+	}
+	if n := h.fake.Rates(); n != 0 {
+		t.Fatalf("%d commande(s) rate dans la zone morte", n)
 	}
 	h.e.mu.Lock()
-	nudging := h.e.nudging
+	samples := len(h.e.drifts)
 	h.e.mu.Unlock()
-	if nudging {
-		t.Fatal("nudge engagé sous le seuil d'engagement")
+	if samples != driftSamples {
+		t.Fatalf("historique de dérive = %d échantillon(s), attendu %d", samples, driftSamples)
 	}
 }
 
-func TestNudgeAccelereSiEnRetard(t *testing.T) {
+// TestMicroSeekSiEnRetard : même règle dans l'autre sens, le recalage saute en
+// avant. La vitesse reste à 1×.
+func TestMicroSeekSiEnRetard(t *testing.T) {
 	h := newHarness(t)
 	h.openFile("ep1.mkv", 1200)
 	h.connect(h.playing(100))
-	h.fake.SeekTo(99.4) // 0,6 s de retard
+	h.fake.SeekTo(97.5) // 2,5 s de retard
 	h.fake.Play()
-	h.ticks(4)
-	if got := h.fake.Rate(); math.Abs(got-NudgeFast) > 1e-6 {
-		t.Fatalf("rate = %v, attendu %v (en retard → accélérer)", got, NudgeFast)
+	h.ticks(10)
+	if h.fake.Seeks() != 1 {
+		t.Fatalf("%d seek(s), attendu 1 micro-seek", h.fake.Seeks())
+	}
+	if got := h.fake.Position(); got < 99 {
+		t.Fatalf("position après recalage = %v, attendu ≈100", got)
+	}
+	if n := h.fake.Rates(); n != 0 {
+		t.Fatalf("%d commande(s) rate : on n'accélère plus jamais pour rattraper", n)
 	}
 }
 
-func TestSeekDurSiGrosDriftPuisAffinage(t *testing.T) {
+// TestSeekImmediatSiGrosDrift : au-delà de 5 s, on ne consulte pas la médiane
+// (réveil de veille) — un seul seek, puis plus rien à corriger.
+func TestSeekImmediatSiGrosDrift(t *testing.T) {
 	h := newHarness(t)
 	h.openFile("ep1.mkv", 1200)
 	h.connect(h.playing(300))
@@ -366,25 +370,43 @@ func TestSeekDurSiGrosDriftPuisAffinage(t *testing.T) {
 	h.ticks(2)
 
 	if h.fake.Seeks() != 1 {
-		t.Fatalf("%d seek(s), attendu exactement 1 seek dur", h.fake.Seeks())
+		t.Fatalf("%d seek(s), attendu exactement 1 seek immédiat", h.fake.Seeks())
 	}
 	if got := h.fake.Position(); math.Abs(got-300) > 1.5 {
 		t.Fatalf("position après seek = %v, attendu ≈300", got)
 	}
-	// Puis affinage par nudge jusqu'à la zone morte, sans nouveau seek.
-	converged := false
-	for range 400 {
-		h.tick(PollInterval)
-		if math.Abs(h.e.Snapshot().DriftSec) <= DeadZoneSec {
-			converged = true
-			break
-		}
-	}
-	if !converged {
-		t.Fatalf("pas d'affinage après le seek, drift = %v", h.e.Snapshot().DriftSec)
-	}
+	// Le résidu du seek (VLC arrondit à la seconde) est sous la zone morte :
+	// plus aucune correction ne doit partir.
+	h.ticks(20)
 	if h.fake.Seeks() != 1 {
-		t.Fatalf("%d seeks au total, l'affinage aurait dû se faire au rate", h.fake.Seeks())
+		t.Fatalf("%d seeks au total : le résidu du seek est dans la zone morte", h.fake.Seeks())
+	}
+	if n := h.fake.Rates(); n != 0 {
+		t.Fatalf("%d commande(s) rate après le seek : plus aucun affinage à la vitesse", n)
+	}
+}
+
+// TestVitesseDeReferenceRestauree : la seule raison qui reste de toucher au
+// `rate` — l'utilisateur a changé la vitesse dans VLC, le moteur la remet à
+// celle de la salle (docs/protocol.md §Correction).
+func TestVitesseDeReferenceRestauree(t *testing.T) {
+	h := newHarness(t)
+	h.openFile("ep1.mkv", 1200)
+	h.connect(h.playing(100))
+	h.fake.SeekTo(100)
+	h.fake.Play()
+	h.ticks(4)
+	if n := h.fake.Rates(); n != 0 {
+		t.Fatalf("%d commande(s) rate en lecture alignée", n)
+	}
+
+	h.fake.SetRate(1.5) // l'utilisateur passe VLC en 1,5× dans son interface
+	h.ticks(4)
+	if got := h.fake.Rate(); math.Abs(got-1) > 1e-6 {
+		t.Fatalf("rate = %v : la vitesse de référence n'a pas été restaurée", got)
+	}
+	if n := h.fake.Rates(); n == 0 {
+		t.Fatal("aucune commande rate : la restauration de la vitesse a disparu")
 	}
 }
 
@@ -421,7 +443,7 @@ func TestConvergenceApresSeekDistant(t *testing.T) {
 	}
 }
 
-func TestJamaisDeNudgeEnPause(t *testing.T) {
+func TestJamaisDeChangementDeVitesseEnPause(t *testing.T) {
 	h := newHarness(t)
 	h.openFile("ep1.mkv", 1200)
 	h.connect(h.paused(500))
@@ -429,7 +451,7 @@ func TestJamaisDeNudgeEnPause(t *testing.T) {
 	h.ticks(6)
 
 	if got := h.fake.Rate(); math.Abs(got-1) > 1e-6 {
-		t.Fatalf("rate = %v : on ne nudge jamais en pause", got)
+		t.Fatalf("rate = %v : en pause, seul le seek corrige", got)
 	}
 	if h.fake.Seeks() == 0 {
 		t.Fatal("aucun seek en pause alors que la position est fausse")
@@ -563,13 +585,13 @@ func TestFenetreDeGraceApresRoomState(t *testing.T) {
 	}
 }
 
-// churn place VLC à « position attendue + jitter » au poll suivant et rend le
-// nombre de changements de rate observés. C'est le régime réel mesuré dans la
-// VM Win11 (VS-029) : la position que rend VLC oscille de ±0,15 s autour de la
-// référence, donc le nudge s'engage et se relâche à presque chaque tour.
-func (h *harness) churn(polls int) int {
+// noisyPlayback place VLC à « position attendue ± 0,15 s » à chaque poll : le
+// bruit réel de la position rendue par VLC, mesuré dans la VM Win11 (VS-029).
+// Avant VS-038 ce régime faisait churner le nudge ; il ne doit désormais
+// produire AUCUNE commande (le bruit est dix fois sous la zone morte), tout en
+// restant le régime dans lequel la détection d'action utilisateur doit marcher.
+func (h *harness) noisyPlayback(polls int) {
 	h.t.Helper()
-	rates := 0
 	for i := 1; i <= polls; i++ {
 		jitter := 0.15
 		if i%2 == 0 {
@@ -581,24 +603,22 @@ func (h *harness) churn(polls int) int {
 		h.e.mu.Unlock()
 		// SeekTo place la position MAINTENANT : on retranche ce que VLC va
 		// lire d'ici au poll pour qu'il s'y présente à `want`.
-		rate := h.fake.Rate()
-		h.fake.SeekTo(want - PollInterval.Seconds()*rate)
+		h.fake.SeekTo(want - PollInterval.Seconds()*h.fake.Rate())
 		h.tick(PollInterval)
-		if math.Abs(h.fake.Rate()-rate) > 1e-3 {
-			rates++
-		}
 	}
-	return rates
 }
 
-// TestActionUtilisateurDansVLCSousChurnDeNudge est le miroir Go de
+// TestActionUtilisateurDansVLCSousBruitDePosition est le miroir Go de
 // core/tests/test_core.c::test_user_action_in_vlc — le trou terrain de VS-029 :
 // « pause faite dans VLC, jamais propagée ». La cause n'était pas la détection
 // mais ce qui la gate, la fenêtre de grâce : tant que celle-ci était réarmée par
 // chaque commande `rate`, le churn du nudge la maintenait ouverte en permanence
-// et detectUserActionLocked n'était plus jamais appelée en lecture.
-func TestActionUtilisateurDansVLCSousChurnDeNudge(t *testing.T) {
-	// 1. Pause faite dans VLC en pleine lecture, sous churn.
+// et detectUserActionLocked n'était plus jamais appelée en lecture. Le nudge a
+// disparu (VS-038) ; ce qui doit rester prouvé, c'est que sous le bruit de
+// position de ±0,15 s la détection tourne — et que ce bruit ne produit plus
+// aucune commande.
+func TestActionUtilisateurDansVLCSousBruitDePosition(t *testing.T) {
+	// 1. Pause faite dans VLC en pleine lecture, sous bruit de position.
 	h := newHarness(t)
 	h.openFile("ep1.mkv", 7200)
 	h.connect(h.playing(100))
@@ -607,8 +627,12 @@ func TestActionUtilisateurDansVLCSousChurnDeNudge(t *testing.T) {
 	h.ticks(2)
 	h.conn.take()
 
-	if n := h.churn(20); n < 5 {
-		t.Fatalf("régime de churn attendu : %d changement(s) de rate sur 20 polls", n)
+	h.noisyPlayback(20)
+	if n := h.fake.Rates(); n != 0 {
+		t.Fatalf("%d commande(s) rate sous le bruit de position : le churn est de retour", n)
+	}
+	if n := h.fake.Seeks(); n != 0 {
+		t.Fatalf("%d seek(s) : un bruit de ±0,15 s est dix fois sous la zone morte", n)
 	}
 	h.conn.take()
 
@@ -627,7 +651,7 @@ func TestActionUtilisateurDansVLCSousChurnDeNudge(t *testing.T) {
 	h.fake.Play()
 	h.ticks(2)
 	h.conn.take()
-	h.churn(20)
+	h.noisyPlayback(20)
 	h.conn.take()
 
 	target := h.fake.Position() + 300
@@ -649,7 +673,7 @@ func TestActionUtilisateurDansVLCSousChurnDeNudge(t *testing.T) {
 	h.fake.SeekTo(100)
 	h.fake.Play()
 	h.ticks(2)
-	h.churn(10)
+	h.noisyPlayback(10)
 	h.conn.take()
 
 	h.server(protocol.TypeRoomState, h.paused(400))

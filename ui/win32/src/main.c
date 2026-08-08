@@ -418,6 +418,10 @@ typedef struct {
 
     // Pilote du harnais de test réel (VS-029) : inactif hors mode auto.
     AutoPilot autop;
+    // Commandes envoyées à VLC depuis le lancement, par nature (index =
+    // VsCmdKind). Publiées dans l'état du mode auto : `rateCmds` prouve sur une
+    // vraie séance que la vitesse ne corrige plus jamais la dérive (VS-038).
+    i64 cmd_counts[4];
 
     // Réglages : chemin VLC détecté au démarrage, AVANT que %VIBESYNC_VLC% ne
     // soit forcé par le réglage — sinon la « détection automatique » affichée
@@ -822,6 +826,10 @@ static void dispatch_output(App *app, VsOutput *out) {
         }
     }
     out->msg_count = 0;
+    for (isize i = 0; i < out->cmd_count; i++) {
+        isize k = (isize)out->cmds[i].kind;
+        if (k >= 0 && k < VS_ARRAY_COUNT(app->cmd_counts)) app->cmd_counts[k]++;
+    }
     worker_push_cmds(&app->vlc, out->cmds, out->cmd_count);
     out->cmd_count = 0;
 }
@@ -1639,6 +1647,12 @@ static void auto_write_status(App *app) {
     jw_kv_bool(&w, "buffering", e->buffering);
     jw_kv_i64(&w, "latencyMs", e->latency_ms);
     jw_kv_bool(&w, "correcting", e->correcting != VS_CORRECT_NONE);
+    // Commandes envoyées à VLC depuis le lancement, par nature : `rateCmds`
+    // doit rester à 0 sur une séance normale (VS-038).
+    jw_kv_i64(&w, "pauseCmds", app->cmd_counts[VS_CMD_PAUSE]);
+    jw_kv_i64(&w, "resumeCmds", app->cmd_counts[VS_CMD_RESUME]);
+    jw_kv_i64(&w, "seekCmds", app->cmd_counts[VS_CMD_SEEK]);
+    jw_kv_i64(&w, "rateCmds", app->cmd_counts[VS_CMD_RATE]);
     // Libellés de l'interface : c'est là que se lisent la cause d'un échec de
     // connexion et l'état du lancement de VLC.
     jw_key(&w, "error");

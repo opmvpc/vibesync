@@ -14,11 +14,17 @@
 
 // --- constantes de synchronisation (docs/protocol.md) ---
 #define VS_POLL_INTERVAL_NS (200 * 1000000LL)
-#define VS_DEAD_ZONE_SEC 0.1
-#define VS_HARD_SEEK_SEC 2.0
-#define VS_NUDGE_FAST 1.05
-#define VS_NUDGE_SLOW 0.95
-#define VS_NUDGE_EXIT_SEC 0.03
+// Zone morte élargie à 1,5 s par VS-038 : au-dessus du bruit de la position
+// rendue par VLC (±0,15 s) et du perceptible. La vitesse n'est JAMAIS utilisée
+// pour corriger la dérive ; au-delà de la zone morte c'est un micro-seek, et
+// seulement si la dérive PERSISTE (médiane des VS_DRIFT_SAMPLES derniers polls).
+#define VS_DEAD_ZONE_SEC 1.5
+// Au-delà de ce seuil, seek immédiat : on ne consulte pas la médiane (réveil de
+// veille, lecteur qui décroche).
+#define VS_HARD_SEEK_SEC 5.0
+// Historique de dérive : 5 polls ≈ 1 s. Le micro-seek exige un historique PLEIN
+// dont la médiane dépasse la zone morte (docs/protocol.md §Persistance).
+#define VS_DRIFT_SAMPLES 5
 #define VS_USER_SEEK_SEC 3.0
 #define VS_GRACE_NS (500 * 1000000LL)
 #define VS_USER_HOLD_NS (2000 * 1000000LL)
@@ -31,7 +37,8 @@
 #define VS_BACKOFF_MIN_NS (1000 * 1000000LL)
 #define VS_BACKOFF_MAX_NS (10000 * 1000000LL)
 // Départ de lecture : au-delà de cet écart, on cale VLC par un seek AVANT de
-// jouer plutôt que de compter sur le nudge (5 %/s = 10 s pour 0,5 s).
+// jouer — un demi-seconde d'écart est sous la zone morte, plus rien ne le
+// résorberait ensuite.
 #define VS_START_SEEK_SEC 0.3
 // Détection de buffering neutralisée pendant 2 s après tout seek (commandé ou
 // utilisateur) et toute transition play/pause : ces actions figent
@@ -166,7 +173,6 @@ typedef enum {
 
 typedef enum {
     VS_CORRECT_NONE = 0,
-    VS_CORRECT_NUDGE,
     VS_CORRECT_SEEK,
 } VsCorrection;
 
@@ -226,8 +232,14 @@ typedef struct {
     VsBufferDetect buf;
     b32 buffering;
     f64 applied_rate;
-    b32 nudging;
     f64 drift;
+    // Historique des |drift| des derniers polls corrigeables EN LECTURE : le
+    // micro-seek exige que sa médiane dépasse la zone morte, ce qui interdit au
+    // bruit de mesure de déclencher un recalage (docs/protocol.md §Persistance
+    // de la dérive). Vidé à chaque seek émis, dès que la lecture s'interrompt
+    // et à toute invalidation de la référence.
+    f64 drifts[VS_DRIFT_SAMPLES];
+    isize drift_count;
     VsCorrection correcting;
 
     // fichier déclaré

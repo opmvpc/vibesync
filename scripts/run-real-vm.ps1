@@ -63,7 +63,10 @@ $STEP_TIMEOUT = 25
 $HOLD_SEC = 5
 $SEEK_TARGET = 120
 $VLC_SEEK_TARGET = 300
-$DRIFT_MAX = 0.5
+# DRIFT_MAX : ecart tolere entre les deux lecteurs a la fin de la seance.
+# Aligne sur la ZONE MORTE du moteur (1,5 s, docs/protocol.md §Correction) :
+# depuis VS-038 rien ne rapproche deux lecteurs tant qu'ils sont dedans.
+$DRIFT_MAX = 1.5
 
 $script:passed = 0
 $script:failed = 0
@@ -523,7 +526,19 @@ if (-not $reallyPlaying) {
 }
 Snapshot
 
-Step "(j) fermeture propre"
+Step "(j) vitesse constante 1x (VS-038)"
+# Critere de confort du ticket : sur une seance normale, le moteur n'envoie
+# AUCUNE commande rate a VLC -- la vitesse ne corrige plus la derive.
+$r1 = [int](S1).rateCmds
+$r2 = [int](S2).rateCmds
+if ($r1 -eq 0 -and $r2 -eq 0) {
+    Pass "aucune commande rate envoyee a VLC (client1=$r1 client2=$r2)"
+} else {
+    Fail "commandes rate envoyees a VLC : client1=$r1 client2=$r2 -- la vitesse ne doit plus corriger la derive"
+}
+Say ("  seeks de recalage : client1={0} client2={1}" -f [int](S1).seekCmds, [int](S2).seekCmds)
+
+Step "(k) fermeture propre"
 Send-Cmd $cmd1 "quit"
 Send-Cmd $cmd2 "quit"
 if (Wait-For 20 "arret des deux clients" { $script:p1.HasExited -and $script:p2.HasExited }) {

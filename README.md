@@ -34,7 +34,7 @@ même salle.
   CPU idle proche de 0 %. Pas de webview, pas de runtime managé.
 - Serveur conteneurisé minimal : image Docker finale **~18 Mo** (Alpine, non-root),
   se déploie sur Coolify en quelques clics.
-- Moteur de synchronisation (offset d'horloge, nudge, seek, hold post-action)
+- Moteur de synchronisation (offset d'horloge, micro-seek, hold post-action)
   spécifié une fois dans `docs/protocol.md` et **gelé par des vecteurs de test
   partagés** (`test/vectors/*.json`) rejoués par les trois implémentations
   (Go, C, Swift).
@@ -49,7 +49,7 @@ internal/
   protocol/          types du protocole client<->serveur (source: docs/protocol.md)
   server/            salles, hub, état autoritatif, anti-abus
   ws/                WebSocket maison (handshake + framing RFC 6455), stdlib pur
-  client/            moteur de sync (offset horloge, drift, nudge, seek, hold)
+  client/            moteur de sync (offset horloge, drift, micro-seek, hold)
   vlc/               pilotage VLC via son interface HTTP locale
   webui/             UI web de debug du client Go (pas un livrable)
 ui/

@@ -252,7 +252,7 @@ static void invalidate_reference(VsEngine *e) {
     e->have_pending_rs = 0;
     e->user_hold_until = VS_TIME_ZERO;
     e->hold_until = VS_TIME_ZERO;
-    e->nudging = 0;
+    e->drift_count = 0;
     e->correcting = VS_CORRECT_NONE;
     e->drift = 0;
 }
@@ -409,7 +409,7 @@ void engine_on_welcome(VsEngine *e, i64 now, Str8 self_id, const VsRoomState *st
     e->user_hold_until = VS_TIME_ZERO;
     e->have_pending_rs = 0;
     e->hold_until = VS_TIME_ZERO;
-    e->nudging = 0;
+    e->drift_count = 0;
     // La reprise se décide AVANT d'adopter l'état de la salle : l'état vierge
     // écraserait la dernière position connue, qui est justement ce qu'on veut
     // proposer.
@@ -590,18 +590,49 @@ static void arm(VsEngine *e, i64 now, const VsCmd *cmds, isize count) {
     // ni l'état lecture/pause ni la position (l'attendu absorbe le nouveau rate
     // juste au-dessus, donc expect_predict reste juste).
     //
-    // Pourquoi c'est vital (VS-029, mesuré dans la VM Win11) : la position que
-    // rend VLC oscille de ±0,15 s autour de la référence, donc le nudge
-    // s'engage et se relâche à presque chaque tour (rate 1 → 1,05 → 0,95 → 1,
-    // observé à 5 Hz). En armant la grâce à chaque rate, la fenêtre de 500 ms
-    // ne se refermait JAMAIS pendant la lecture : detect_user_action n'était
-    // plus appelée du tout et une pause faite dans VLC était annulée par la
-    // correction 250 ms plus tard, sans jamais partir au serveur. C'est très
-    // exactement le point 2 du retour terrain de VS-029.
+    // D'où vient la règle (VS-029, mesuré dans la VM Win11) : à l'époque du
+    // nudge ±5 %, la position rendue par VLC oscillant de ±0,15 s faisait
+    // défiler le rate à presque chaque tour (1 → 1,05 → 0,95 → 1, observé à
+    // 5 Hz). En armant la grâce à chaque rate, la fenêtre de 500 ms ne se
+    // refermait JAMAIS pendant la lecture : detect_user_action n'était plus
+    // appelée du tout et une pause faite dans VLC était annulée par la
+    // correction 250 ms plus tard, sans jamais partir au serveur. Le nudge a
+    // disparu avec VS-038 (la vitesse ne corrige plus rien, le `rate` ne sert
+    // qu'à restaurer celle de la salle), mais la règle reste : un rate ne
+    // change rien de ce que la détection compare, il n'a pas à armer la grâce.
     if (hold) {
         e->grace_until = now + VS_GRACE_NS;
         e->hold_until = now + VS_GRACE_NS;
     }
+}
+
+// drift_persists enregistre |drift| dans l'historique glissant des derniers
+// polls corrigeables et dit si la dérive est assez PERSISTANTE pour justifier
+// un micro-seek : historique PLEIN et médiane au-delà de la zone morte
+// (docs/protocol.md §Persistance de la dérive). Le bruit de la position rendue
+// par VLC (±0,15 s) ne peut donc pas déclencher de recalage, un pic isolé non
+// plus.
+static b32 drift_persists(VsEngine *e, f64 abs_drift) {
+    if (e->drift_count < VS_DRIFT_SAMPLES) {
+        e->drifts[e->drift_count++] = abs_drift;
+    } else {
+        for (isize i = 1; i < VS_DRIFT_SAMPLES; i++) e->drifts[i - 1] = e->drifts[i];
+        e->drifts[VS_DRIFT_SAMPLES - 1] = abs_drift;
+    }
+    if (e->drift_count < VS_DRIFT_SAMPLES) return 0;
+    // Médiane des échantillons (tri par insertion sur une copie, comme l'offset).
+    f64 tmp[VS_DRIFT_SAMPLES];
+    memcpy(tmp, e->drifts, sizeof(tmp));
+    for (isize i = 1; i < VS_DRIFT_SAMPLES; i++) {
+        f64 v = tmp[i];
+        isize j = i - 1;
+        while (j >= 0 && tmp[j] > v) {
+            tmp[j + 1] = tmp[j];
+            j--;
+        }
+        tmp[j + 1] = v;
+    }
+    return tmp[VS_DRIFT_SAMPLES / 2] > VS_DEAD_ZONE_SEC;
 }
 
 // plan décide des corrections à appliquer à VLC.
@@ -616,7 +647,7 @@ static void plan(VsEngine *e, i64 now, VsOutput *out) {
     }
     if (e->phase != VS_PHASE_CONNECTED || !e->have_state) {
         e->drift = 0;
-        e->nudging = 0;
+        e->drift_count = 0;
         return;
     }
     f64 base = engine_room_rate(e);
@@ -632,9 +663,10 @@ static void plan(VsEngine *e, i64 now, VsOutput *out) {
 
     f64 abs_drift = f64_abs(drift);
     if (e->room_state.paused) {
-        // En pause : jamais de nudge, seek uniquement au-delà du seuil (le seek
-        // HTTP est arrondi à la seconde, il rapproche toujours sous ce seuil).
-        e->nudging = 0;
+        // En pause : seek uniquement au-delà du seuil (le seek HTTP est arrondi
+        // à la seconde, il rapproche toujours sous ce seuil). L'historique de
+        // dérive ne mesure que la lecture : elle s'arrête, il repart neuf.
+        e->drift_count = 0;
         if (e->status.state == VS_PLAY_PLAYING) {
             acts[n].kind = VS_CMD_PAUSE;
             acts[n].value = 0;
@@ -653,50 +685,40 @@ static void plan(VsEngine *e, i64 now, VsOutput *out) {
         }
     } else if (e->status.state == VS_PLAY_PAUSED) {
         // Départ / reprise de lecture (docs/protocol.md §Départ et reprise) :
-        // on cale d'abord VLC sur la position de référence, PUIS on joue. Le
-        // nudge (5 %/s) mettrait 10 s à résorber 0,5 s d'écart de départ.
+        // on cale d'abord VLC sur la position de référence, PUIS on joue — un
+        // écart d'une demi-seconde est sous la zone morte, rien ne le
+        // résorberait ensuite.
         if (abs_drift >= VS_START_SEEK_SEC) {
             acts[n].kind = VS_CMD_SEEK;
             acts[n].value = expected;
             n++;
             e->correcting = VS_CORRECT_SEEK;
-            e->nudging = 0;
         }
         acts[n].kind = VS_CMD_RESUME;
         acts[n].value = 0;
         n++;
+        e->drift_count = 0;  // la lecture (re)commence : historique neuf
         if (f64_abs(e->applied_rate - base) > 1e-3 || f64_abs(e->status.rate - base) > 1e-3) {
             acts[n].kind = VS_CMD_RATE;
             acts[n].value = base;
             n++;
         }
     } else {
-        f64 target = base;
-        b32 want_rate = 0;
-        if (abs_drift >= VS_HARD_SEEK_SEC) {
+        // Lecture des deux côtés : la vitesse n'est plus jamais un outil de
+        // correction (VS-038). Zone morte de 1,5 s, micro-seek seulement si la
+        // dérive persiste (médiane des 5 derniers polls), seek immédiat à 5 s.
+        if (abs_drift >= VS_HARD_SEEK_SEC || drift_persists(e, abs_drift)) {
             e->correcting = VS_CORRECT_SEEK;
-            e->nudging = 0;
+            e->drift_count = 0;
             acts[n].kind = VS_CMD_SEEK;
             acts[n].value = expected;
             n++;
-            want_rate = 1;
-        } else if ((e->nudging && abs_drift >= VS_NUDGE_EXIT_SEC) ||
-                   (!e->nudging && abs_drift > VS_DEAD_ZONE_SEC)) {
-            // Hystérésis : on engage au-delà de 0,1 s, on ne lâche qu'en
-            // dessous de 0,03 s — sinon le rate oscillerait autour du seuil.
-            e->nudging = 1;
-            e->correcting = VS_CORRECT_NUDGE;
-            target = drift > 0 ? base * VS_NUDGE_SLOW   // en avance : ralentir
-                               : base * VS_NUDGE_FAST;  // en retard : accélérer
-            want_rate = 1;
-        } else {
-            e->nudging = 0;
-            want_rate = 1;
         }
-        if (want_rate &&
-            (f64_abs(e->applied_rate - target) > 1e-3 || f64_abs(e->status.rate - target) > 1e-3)) {
+        // Le seul usage restant du `rate` : RESTAURER la vitesse de la salle
+        // quand celle de VLC en diverge (l'utilisateur l'a changée).
+        if (f64_abs(e->applied_rate - base) > 1e-3 || f64_abs(e->status.rate - base) > 1e-3) {
             acts[n].kind = VS_CMD_RATE;
-            acts[n].value = target;
+            acts[n].value = base;
             n++;
         }
     }

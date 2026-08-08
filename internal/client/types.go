@@ -10,19 +10,17 @@ import (
 const (
 	// PollInterval est la période d'interrogation de VLC.
 	PollInterval = 200 * time.Millisecond
-	// DeadZoneSec : en deçà, on ne corrige rien.
-	DeadZoneSec = 0.1
-	// HardSeekSec : au-delà, seek dur (puis affinage par nudge).
-	HardSeekSec = 2.0
-	// NudgeFast / NudgeSlow sont les facteurs de rate-nudge.
-	NudgeFast = 1.05
-	NudgeSlow = 0.95
-	// NudgeExitSec : hystérésis du nudge — engagé au-delà de DeadZoneSec, il
-	// ne se désengage qu'en dessous de ce seuil.
-	NudgeExitSec = 0.03
+	// DeadZoneSec : en deçà, on ne corrige rien. Élargie à 1,5 s par VS-038 —
+	// au-dessus du bruit de la position rendue par VLC (±0,15 s) et du
+	// perceptible. La vitesse n'est JAMAIS utilisée pour corriger la dérive :
+	// au-delà de la zone morte, c'est un micro-seek (et lui seul).
+	DeadZoneSec = 1.5
+	// HardSeekSec : au-delà, seek immédiat sans attendre la persistance
+	// (réveil de veille, lecteur qui décroche).
+	HardSeekSec = 5.0
 	// StartAlignSec : au départ d'une lecture (pause → play), on cale d'abord
-	// la position par un seek si l'écart atteint ce seuil, au lieu de laisser
-	// le nudge le résorber à 5 %/s.
+	// la position par un seek si l'écart atteint ce seuil — aucune correction
+	// ultérieure ne le résorberait, il est sous la zone morte.
 	StartAlignSec = 0.3
 	// UserSeekSec : saut de position inexpliqué au-delà duquel on considère
 	// que l'utilisateur a manipulé VLC.
@@ -61,6 +59,11 @@ const (
 	reportEvery = time.Second
 
 	offsetSamples = 5
+	// driftSamples : taille de l'historique de dérive (5 polls ≈ 1 s). Le
+	// micro-seek exige un historique PLEIN dont la médiane dépasse la zone
+	// morte — c'est ce qui empêche un pic de bruit de déclencher un recalage
+	// (docs/protocol.md §Persistance de la dérive).
+	driftSamples = 5
 )
 
 // maxSessionTokenLen borne le jeton relu du fichier d'état : le serveur refuse
@@ -121,7 +124,7 @@ type Snapshot struct {
 	RoomPosition  float64         `json:"roomPositionSec"`
 	RoomRate      float64         `json:"roomRate"`
 	DriftSec      float64         `json:"driftSec"`
-	Correcting    string          `json:"correcting"` // "", "nudge", "seek"
+	Correcting    string          `json:"correcting"` // "", "seek"
 	LatencyMs     int64           `json:"latencyMs"`
 	ClockOffsetMs int64           `json:"clockOffsetMs"`
 	Retrying      bool            `json:"retrying"`

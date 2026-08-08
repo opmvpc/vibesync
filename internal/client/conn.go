@@ -176,7 +176,7 @@ func (e *Engine) handleRaw(raw []byte) (string, bool) {
 			e.userHoldUntil = time.Time{}
 			e.pendingRS = nil
 			e.holdUntil = time.Time{}
-			e.nudging = false
+			e.drifts = nil
 			e.applyRoomStateLocked(w.State, now)
 			// Volontairement pas de readyFromUsersLocked ici : le serveur vient
 			// de nous créer un membre neuf, donc « pas prêt ». C'est notre état

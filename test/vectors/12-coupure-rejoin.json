@@ -211,20 +211,14 @@
       "vlcState": "playing",
       "vlcPositionSec": 1500.6,
       "expectedPositionSec": 1500.8,
-      "driftSec": -0.2,
-      "vlcCommands": [
-        {
-          "cmd": "rate",
-          "value": 1.05
-        }
-      ]
+      "driftSec": -0.2
     },
     {
       "atMs": 22800,
       "vlcState": "playing",
-      "vlcPositionSec": 1500.81,
+      "vlcPositionSec": 1500.8,
       "expectedPositionSec": 1501,
-      "driftSec": -0.19
+      "driftSec": -0.2
     }
   ]
 }

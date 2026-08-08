@@ -95,32 +95,26 @@
       "vlcState": "playing",
       "vlcPositionSec": 1200.6,
       "expectedPositionSec": 1200.8,
-      "driftSec": -0.2,
-      "vlcCommands": [
-        {
-          "cmd": "rate",
-          "value": 1.05
-        }
-      ]
+      "driftSec": -0.2
     },
     {
       "atMs": 1000,
       "vlcState": "playing",
-      "vlcPositionSec": 1200.81,
+      "vlcPositionSec": 1200.8,
       "expectedPositionSec": 1201,
-      "driftSec": -0.19
+      "driftSec": -0.2
     },
     {
       "atMs": 1200,
       "vlcState": "playing",
-      "vlcPositionSec": 1201.02,
+      "vlcPositionSec": 1201,
       "expectedPositionSec": 1201.2,
-      "driftSec": -0.18,
+      "driftSec": -0.2,
       "toServer": [
         {
           "type": "report",
           "data": {
-            "positionSec": 1201.0200000000002,
+            "positionSec": 1201.0000000000002,
             "paused": false,
             "buffering": false
           }

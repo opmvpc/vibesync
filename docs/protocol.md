@@ -86,31 +86,49 @@ Source de vérité du protocole client↔serveur. Les types Go correspondants vi
   mesures. `nowServer() = now + offset`.
 - **Position attendue** = `roomState.positionSec + (nowServer() - refServerMs)/1000 × rate`
   (0 si `paused`). Drift = position VLC − position attendue.
-- **Correction** : `|drift| ≤ 0,1 s` → rien. `0,1 < |drift| < 2 s` → rate nudge
-  (jouer à 1,05× ou 0,95× jusqu'à convergence, puis rate 1). `≥ 2 s` → seek dur vers
-  la position attendue puis affinage par nudge. Jamais de nudge en pause : seek
-  uniquement, et seulement si `|drift| ≥ 0,6 s` (le seek HTTP de VLC est arrondi à
-  la seconde ; sous ce seuil il serait un no-op ou une oscillation).
+- **Correction (VS-038)** : la vitesse de lecture n'est **jamais** modifiée pour
+  corriger la dérive — une vidéo se regarde à 1×. Le moteur ne touche au `rate`
+  que pour **restaurer** la vitesse de référence de la salle quand celle de VLC
+  en diverge (l'utilisateur a changé la vitesse dans VLC). En lecture, trois
+  paliers : `|drift| ≤ 1,5 s` → rien (zone morte, franchement au-dessus du bruit
+  de la position rendue par VLC, ±0,15 s, et du perceptible) ;
+  `1,5 s < |drift| < 5 s` → **micro-seek** vers la position attendue, mais
+  seulement si la dérive est *persistante* (voir ci-dessous) ; `|drift| ≥ 5 s` →
+  seek **immédiat**, sans attendre la persistance (réveil de veille, lecteur qui
+  décroche). En pause : jamais de correction de vitesse, seek uniquement, et
+  seulement si `|drift| ≥ 0,6 s` (le seek HTTP de VLC est arrondi à la seconde ;
+  sous ce seuil il serait un no-op ou une oscillation).
+- **Persistance de la dérive (anti-bruit)** : `|drift|` est échantillonné à
+  chaque poll où une correction serait permise en lecture (salle en lecture ET
+  VLC en lecture) ; le moteur garde les **5 derniers échantillons** (1 s). Le
+  micro-seek n'est déclenché que si cet historique est **plein** et que sa
+  **médiane** dépasse la zone morte : un pic isolé dû au bruit de mesure ne
+  déclenche rien. L'historique est vidé à chaque seek émis, dès que la lecture
+  s'interrompt (salle en pause, VLC en pause) et à toute invalidation de la
+  référence — après une correction il faut donc de nouveau 1 s de dérive avérée
+  avant la suivante. Le palier des 5 s, lui, ne consulte jamais l'historique.
 - **Chargement de fichier** : au lancement de VLC sur un fichier, le driver force
   immédiatement pause + position 0 et ne déclare le fichier chargé (`setFile`)
   qu'une fois l'état « en pause » effectivement observé — VLC démarre la lecture
   automatiquement à l'ouverture, cette course est réelle.
 - **Départ et reprise de lecture** : quand un `roomState` fait passer de pause à
   lecture, le client cale d'abord VLC sur la position de référence (seek si
-  l'écart est ≥ 0,3 s) puis lance la lecture — on ne compte pas sur le nudge pour
-  résorber un écart de départ (5 %/s : 0,5 s coûterait 10 s de convergence).
+  l'écart est ≥ 0,3 s) puis lance la lecture — aucune correction ultérieure ne
+  résorberait un écart de départ d'une demi-seconde, il est sous la zone morte.
 - **Hold post-action** : après l'envoi d'un `control` issu d'une action utilisateur
-  locale, le moteur suspend toute correction (nudge/seek) pendant 2 s. Le hold n'est
+  locale, le moteur suspend toute correction (seek) pendant 2 s. Le hold n'est
   levé que par l'**écho** du serveur (`roomState` avec `setBy` = soi) ou par
   l'expiration des 2 s. Les `roomState` d'autrui reçus pendant le hold ne sont PAS
   appliqués immédiatement (le transport étant ordonné, ils précèdent forcément le
   traitement de notre `control` côté serveur) : le dernier est mémorisé et ne
   s'applique qu'à l'expiration du hold si aucun écho n'est arrivé (control perdu).
-- **Conditions de correction** : aucune correction (nudge ou seek) tant que le
-  premier `pong` n'a pas fourni une mesure d'offset, ni hors de l'état connecté —
-  pendant une reconnexion, toute correction est suspendue et l'état de référence
-  est invalidé jusqu'au `welcome` suivant. Hystérésis du nudge : engagé quand
-  `|drift| > 0,1 s`, il ne se désengage que quand `|drift| < 0,03 s`.
+- **Conditions de correction** : aucune correction (seek) tant que le premier
+  `pong` n'a pas fourni une mesure d'offset, ni hors de l'état connecté —
+  pendant une reconnexion, toute correction est suspendue, l'état de référence
+  est invalidé jusqu'au `welcome` suivant et l'historique de dérive est vidé.
+  Aucun échantillon de dérive n'est pris tant que ces conditions ne sont pas
+  réunies (ni pendant un hold) : l'historique ne mesure que des polls où une
+  correction aurait effectivement pu partir.
 - **Buffering** : la détection (position figée > 700 ms en lecture) est suspendue
   pendant 2 s après tout seek (commandé ou utilisateur) et après chaque transition
   play/pause — un seek fige mécaniquement la position le temps que VLC cherche.
@@ -128,10 +146,14 @@ Source de vérité du protocole client↔serveur. Les types Go correspondants vi
   lui (pause/play, saut de position > 3 s) = action utilisateur → `control` au serveur.
   Anti-boucle : fenêtre de grâce de 500 ms, armée par l'application d'un `roomState`
   et par les commandes qui changent ce que la détection compare — `pause`, reprise,
-  `seek`. Un ajustement de `rate` (nudge) ne l'arme **pas** : le nudge churne en
-  régime permanent (la position rendue par VLC oscille de ±0,15 s, le rate défile à
-  presque chaque poll), armer sur `rate` laisserait la fenêtre ouverte en continu et
-  rendrait la détection d'action utilisateur inopérante en lecture.
+  `seek`. Un ajustement de `rate` ne l'arme **pas** : il ne touche ni l'état
+  lecture/pause ni la position, donc rien de ce que la détection compare. La règle
+  vient de VS-029, où le rate défilait à presque chaque poll (le nudge ±5 %
+  churnait sur le bruit de ±0,15 s) : la fenêtre de grâce ne se refermait jamais,
+  la détection ne tournait plus en lecture, et une pause faite dans VLC était
+  annulée par la correction suivante au lieu de partir au serveur. Le nudge a
+  disparu avec VS-038, la règle reste — seules `pause`, reprise et `seek` arment
+  la grâce.
 - **Ready** : bouton dans l'UI ; un utilisateur qui met pause pendant la lecture ne
   perd pas son ready (le ready ne gate que le premier démarrage).
 
