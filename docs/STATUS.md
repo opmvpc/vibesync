@@ -72,12 +72,13 @@ chemins Gatekeeper dont Sequoia). Publiée au prochain tag (v0.2.1).
 258 Ko + VibeSync-macos-arm64.zip 311 Ko — la première .app). Serveur prod
 redéployé (Coolify healthy, sonde OK depuis la VM).
 
-**Sprint reliquats du 08 (journal du jour)** : VS-035 clos, ini_flush durci
-(+ ticket VS-037 écriture atomique, basse), les TROIS lanceurs VLC alignés et
-gelés par tests (launch.go 15/12 par OS, Swift 12 — il lui manquait
---lua-intf=http, le filet anti-Syncplay), captures mac du guide faites sur une
-vraie séance prod, icône .icns de VibeSync.app livrée (0,91 Mio, WebKit depuis
-assets/icon.svg). Tout committé, à publier dans une future v0.2.2.
+**Sprint reliquats du 08 (journal du jour), publié en v0.2.2** : VS-035 clos,
+ini_flush durci PUIS rendu atomique (VS-037 terminé le jour même à la demande
+de Thibault), les TROIS lanceurs VLC alignés et gelés par tests (launch.go
+15/12 par OS, Swift 12 — il lui manquait --lua-intf=http, le filet
+anti-Syncplay), captures mac du guide faites sur une vraie séance prod, icône
+.icns de VibeSync.app livrée puis regénérée par genicon -iconset (357 Ko,
+bundle 1,4 Mio).
 
 Il ne reste QUE ce qui exige un vrai PC Windows x86_64 : VS-020 (overlay OSD),
 revérification one-instance, asan du C Win32. Idée notée : un gel commun des
